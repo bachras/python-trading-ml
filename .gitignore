@@ -1,0 +1,60 @@
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Virtual environment ──────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Secrets & credentials ────────────────────────────────────
+.env
+# .env.template is intentionally NOT ignored (safe to commit)
+
+# ── Large data files ─────────────────────────────────────────
+data/
+tick_data/
+*.csv
+*.parquet
+
+# ── Trained models ───────────────────────────────────────────
+models/
+*.keras
+*.h5
+*.pkl
+*.joblib
+*.zip
+
+# ── Logs & trade records ─────────────────────────────────────
+logs/
+*.log
+trade_log.json
+
+# ── ML-discovered parameters (regenerated on each run) ───────
+params/
+
+# ── Jupyter / IPython ────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Optuna study databases ───────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── IDE & OS ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+desktop.ini
+.DS_Store

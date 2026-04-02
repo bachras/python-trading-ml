@@ -1,0 +1,280 @@
+
+COMPLETE GUIDE — Tick Data → Trained Model → Live MT5 Trading (US30)
+=====================================================================
+All 4 files work together as one system:
+  tick_pipeline.py          — streams CSV, builds Parquet files
+  institutional_features.py — VWAP, VP, delta, liquidity, regime
+  phase2_adaptive_engine.py — ML models, RL, GA, Optuna, risk gate
+  integration.py            — wires everything together (RUN THIS)
+
+=====================================================================
+STEP 1 — FOLDER SETUP
+=====================================================================
+
+Your C:\trading_ml\ folder must look like this:
+
+  C:\trading_ml\
+    venv\
+    .env
+    tick_pipeline.py
+    institutional_features.py
+    phase2_adaptive_engine.py
+    integration.py
+    tick_data\
+      US30_ticks.csv          ← your Dukascopy file goes here
+
+
+=====================================================================
+STEP 2 — INSTALL ONE EXTRA PACKAGE
+=====================================================================
+
+The institutional features module uses scipy.
+Open Command Prompt, activate venv, run:
+
+  venv\Scripts\activate
+  pip install scipy
+
+
+=====================================================================
+STEP 3 — EDIT tick_pipeline.py (2 lines only)
+=====================================================================
+
+Open tick_pipeline.py and find these two lines near the top:
+
+  TICK_FILE = Path(r"C:\trading_ml\tick_data\US30_ticks.csv")
+  SYMBOL    = "US30"
+
+Make sure the path matches where your CSV actually is.
+If your CSV has a different name, update it here.
+
+
+=====================================================================
+STEP 4 — EDIT integration.py (1 section only)
+=====================================================================
+
+Find this section near the top of integration.py:
+
+  TICK_DATA_SYMBOLS = {
+      "US30": Path(r"C:\trading_ml\tick_data\US30_ticks.csv"),
+  }
+
+Same path as Step 3. Also confirm your broker's symbol name for
+US30 matches the key "US30". Check in MT5 Market Watch.
+Common alternatives: US30.cash, DJIA, WS30, DJ30
+
+
+=====================================================================
+STEP 5 — BUILD PARQUET FROM TICK CSV (one time only)
+=====================================================================
+
+This only runs once. After this, data loads in seconds forever.
+
+  cd C:\trading_ml
+  venv\Scripts\activate
+  python tick_pipeline.py
+
+What happens:
+  - Streams your 10GB CSV in 500,000-row chunks (~150MB at a time)
+  - Builds OHLCV bars for timeframes: 1m, 3m, 5m, 10m, 15m, 30m, 1H
+  - Saves compressed Parquet files to C:\trading_ml\data\
+  - Prints a quality report when done
+
+Expected output:
+  Building tick-derived OHLCV for US30
+  Source: C:\trading_ml\tick_data\US30_ticks.csv
+  Size  : 10.34 GB
+  TFs   : [1, 3, 5, 10, 15, 30, 60]
+
+  Streaming tick data...
+  Chunk 10 | 5,000,000 ticks processed (12.3%) | rejected: 1,243
+  Chunk 20 | 10,000,000 ticks processed (24.6%) | ...
+  ...
+  Streaming complete: 81,432,112 clean ticks | 48,231 rejected
+
+  US30 1m:  2,847,000 bars | 2019-01-02 → 2025-04-02
+  US30 5m:    569,400 bars
+  US30 15m:   189,800 bars
+  ...
+
+  Saved: US30_1m_ticks.parquet  | 312.4 MB
+  Saved: US30_5m_ticks.parquet  |  82.1 MB
+  ...
+
+  DATA QUALITY REPORT — US30
+  TF    bars        from        to          coverage  microstructure
+  1m    2,847,000   2019-01-02  2025-04-02  97.3%     YES
+  5m    569,400     2019-01-02  2025-04-02  97.1%     YES
+  ...
+
+Duration: 30–60 minutes for 10GB. Get a coffee.
+
+
+=====================================================================
+STEP 6 — VERIFY MT5 IS READY
+=====================================================================
+
+Before running the main system:
+  1. Open MT5 terminal
+  2. Log in to your trading account
+  3. Tools > Options > Expert Advisors > tick "Allow algorithmic trading"
+  4. Confirm US30 (or your broker's name) is visible in Market Watch
+
+Check your .env file has correct credentials:
+  MT5_LOGIN=your_account_number
+  MT5_PASSWORD=your_password
+  MT5_SERVER=YourBroker-Server
+
+
+=====================================================================
+STEP 7 — RUN THE FULL SYSTEM
+=====================================================================
+
+  cd C:\trading_ml
+  venv\Scripts\activate
+  python integration.py
+
+What happens in order:
+
+  ── STAGE 1: DATA LOADING (~2 min) ────────────────────────────
+  US30     → loads from Parquet (seconds, 75 months tick data)
+  EURUSD   → fetches max history from MT5
+  GBPUSD   → fetches max history from MT5
+  ... (all other symbols from MT5)
+
+  ── STAGE 2: INSTITUTIONAL FEATURES (~5 min) ──────────────────
+  For each symbol × each timeframe:
+  Applies VWAP, volume profile (POC/VAH/VAL/HVN/LVN),
+  order flow delta, liquidity structure, market regime
+
+  US30 gets ~110 features (tick + institutional)
+  Others get ~85 features (MT5 + estimated microstructure)
+
+  ── STAGE 3: MODEL TRAINING (~20–40 min) ──────────────────────
+  For each symbol × each entry TF candidate (1m,3m,5m,10m,15m):
+    - LSTM neural network
+    - XGBoost + Random Forest ensemble
+  Then per symbol:
+    - PPO reinforcement learning agent
+  Prints feature importance report showing which institutional
+  features the ML values most
+
+  ── STAGE 4: PARAMETER DISCOVERY (~10–20 min) ─────────────────
+  Genetic algorithm (80 population × 40 generations)
+  Optuna Bayesian optimisation (150 trials)
+  Discovers per symbol:
+    - Best entry TF (from 1m/3m/5m/10m/15m)
+    - Best HTF (from 15m/30m/1H or NONE)
+    - SL ATR multiplier
+    - R:R ratio
+    - TP multiplier
+    - Confidence threshold
+    - HTF weight
+
+  Example output:
+    US30 OPTIMAL PARAMS:
+      Entry TF   : 5m
+      HTF        : 60m (active)
+      SL ATR×    : 1.743
+      R:R        : 1:2.61
+      TP mult    : 2.61x
+      Confidence : 0.64
+      HTF weight : 0.38
+      Data source: tick+institutional
+
+  ── STAGE 5: LIVE TRADING LOOP ────────────────────────────────
+  System enters live loop automatically after training.
+  On each closed candle of each symbol's entry TF:
+    1. Fetches fresh MT5 bars and merges with tick history
+    2. Applies institutional features to new bars
+    3. Runs all 4 ML models (LSTM + XGB + RF + PPO)
+    4. Checks HTF alignment using institutional composite score
+    5. Checks risk gate (daily loss, drawdown, max positions)
+    6. Places order if signal passes all gates
+    7. Logs trade to C:\trading_ml\logs\trade_log.json
+
+  Every 20 closed trades per symbol:
+    System re-runs Optuna (30 trials) and updates parameters
+
+To stop: press Ctrl+C (closes cleanly, disconnects MT5)
+
+
+=====================================================================
+WHAT GETS SAVED WHERE
+=====================================================================
+
+  C:\trading_ml\
+    data\
+      US30_1m_ticks.parquet    ← tick-derived 1m bars + all features
+      US30_5m_ticks.parquet    ← tick-derived 5m bars + all features
+      US30_15m_ticks.parquet   ← tick-derived 15m bars (HTF)
+      EURUSD_1m_ticks.parquet  ← MT5-derived (when built)
+      ...
+
+    models\
+      lstm_US30_5m.keras       ← LSTM trained on tick data
+      xgb_US30_5m.pkl          ← XGBoost trained on tick data
+      rf_US30_5m.pkl           ← Random Forest
+      ppo_US30.zip             ← RL agent (PPO)
+      lstm_US30_1m.keras       ← same models for each TF candidate
+      ...
+
+    params\
+      US30_params.json         ← current ML-discovered parameters
+      EURUSD_params.json       ← updates after every 20 live trades
+      ...
+
+    logs\
+      trading_20250402.log     ← full system log (daily)
+      trade_log.json           ← every trade placed with full context
+
+
+=====================================================================
+MONITORING YOUR SYSTEM
+=====================================================================
+
+Watch the log in real time (new Command Prompt window):
+  cd C:\trading_ml\logs
+  powershell Get-Content trading_20250402.log -Wait
+
+Check current parameters at any time:
+  type C:\trading_ml\params\US30_params.json
+
+See all trades placed:
+  type C:\trading_ml\logs\trade_log.json
+
+Check open positions in MT5:
+  MT5 terminal → Trade tab (bottom panel)
+
+
+=====================================================================
+TROUBLESHOOTING
+=====================================================================
+
+"ModuleNotFoundError: tick_pipeline"
+  → All 4 .py files must be in the same folder (C:\trading_ml\)
+
+"No data loaded for US30"
+  → Run tick_pipeline.py first (Step 5) before integration.py
+
+"MT5 symbol not found: US30"
+  → Your broker uses a different name. Check Market Watch.
+  → Edit INSTRUMENTS dict in phase2_adaptive_engine.py line ~60
+  → Also edit TICK_DATA_SYMBOLS key in integration.py
+
+"Parquet build failed mid-way"
+  → Delete partial files in C:\trading_ml\data\
+  → Re-run: python tick_pipeline.py
+
+"Training takes forever on 1m bars"
+  → 1m bars = millions of rows → slow LSTM training
+  → Temporarily remove 1m from PARAM_SEEDS entry_tf_options
+  → Add it back after confirming system works on 5m first
+
+"Order rejected by MT5 (retcode 10016)"
+  → Invalid volume. Check lot size limits for your broker's US30
+  → Set min lot size in .env: MIN_LOT_US30=0.1
+
+First run with real money?
+  → Test on demo first (same server, different login)
+  → Set MAX_DAILY_LOSS_PCT=1.0 and RISK_PER_TRADE_PCT=0.5 initially
+  → Monitor for 2–3 days before increasing risk

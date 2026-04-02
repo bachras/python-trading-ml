@@ -1,0 +1,125 @@
+INSTALL GUIDE — Python 3.12 on Windows 11
+==========================================
+Python 3.12 is fully supported. All packages work.
+The only change: use "ta_lib" not "ta-lib-binary".
+
+
+=====================================================================
+STEP 1 — CREATE AND ACTIVATE VENV ON F: DRIVE
+=====================================================================
+
+Open PowerShell or Command Prompt:
+
+    cd F:\trading_ml
+    python -m venv venv
+    venv\Scripts\activate
+
+You should see (venv) at the start of the prompt.
+
+
+=====================================================================
+STEP 2 — UPGRADE PIP FIRST
+=====================================================================
+
+    python.exe -m pip install --upgrade pip
+
+This avoids the "new release available" warning and ensures
+you get the latest wheel resolver.
+
+
+=====================================================================
+STEP 3 — INSTALL ALL PACKAGES (Python 3.12 compatible)
+=====================================================================
+
+Copy and paste this ENTIRE block. Run it as one command.
+
+    pip install MetaTrader5 pandas numpy scikit-learn xgboost lightgbm tensorflow stable-baselines3[extra] deap optuna ta_lib pyarrow scipy matplotlib seaborn joblib tqdm python-dotenv gymnasium shimmy
+
+KEY CHANGE from previous guide:
+  WRONG:  ta-lib-binary       ← does not exist on PyPI for cp312
+  WRONG:  ta-lib              ← old package, needs C++ compiler
+  CORRECT: ta_lib             ← official wheel, cp312 supported since Aug 2025
+
+Everything else is unchanged and works fine on Python 3.12.
+
+
+=====================================================================
+STEP 4 — IF TENSORFLOW FAILS
+=====================================================================
+
+tensorflow full package can be large and sometimes fails on some
+Windows setups. Try the CPU-only version instead:
+
+    pip install tensorflow-cpu
+
+This is fine for this system — we are not using GPU training.
+The models train on CPU which is perfectly adequate.
+
+
+=====================================================================
+STEP 5 — VERIFY INSTALL
+=====================================================================
+
+    python -c "import MetaTrader5; import tensorflow; import ta_lib; import stable_baselines3; import optuna; import deap; print('All packages OK')"
+
+Expected output:
+    All packages OK
+
+If you see an import error for one package, install it individually:
+    pip install <package_name>
+
+
+=====================================================================
+COMMON ERRORS AND FIXES
+=====================================================================
+
+ERROR: No matching distribution found for ta-lib-binary
+FIX:   pip install ta_lib
+       (note: underscore not hyphen, no "binary" suffix)
+
+ERROR: No matching distribution found for ta_lib
+FIX:   pip install --upgrade pip
+       then: pip install ta_lib
+
+ERROR: tensorflow install fails / times out
+FIX:   pip install tensorflow-cpu
+
+ERROR: stable-baselines3 import error about shimmy
+FIX:   pip install shimmy>=0.2.1
+
+ERROR: ModuleNotFoundError: No module named 'gymnasium'
+FIX:   pip install gymnasium>=0.29.0
+
+ERROR: Microsoft Visual C++ 14.0 or greater is required
+       (this means a package tried to compile from source)
+FIX:   This should NOT happen with the packages above.
+       If it does, make sure you are using the exact package
+       names from Step 3 (pre-built wheels, no compilation needed).
+
+
+=====================================================================
+FULL REQUIREMENTS LIST (for reference)
+=====================================================================
+
+These are all packages the system uses:
+
+  MetaTrader5       — MT5 Python API bridge
+  pandas            — data manipulation
+  numpy             — numerical computing
+  scikit-learn      — StandardScaler, RandomForest
+  xgboost           — gradient boosting model
+  lightgbm          — alternative gradient boosting
+  tensorflow        — LSTM neural network (or tensorflow-cpu)
+  stable-baselines3 — PPO reinforcement learning agent
+  deap              — genetic algorithm
+  optuna            — Bayesian parameter optimisation
+  ta_lib            — technical indicators (RSI, MACD, ATR, etc.)
+  pyarrow           — Parquet file format (fast storage)
+  scipy             — statistical functions (institutional features)
+  matplotlib        — charting (optional, for debugging)
+  seaborn           — charting (optional, for debugging)
+  joblib            — model serialisation (save/load sklearn models)
+  tqdm              — progress bars
+  python-dotenv     — reads .env configuration file
+  gymnasium         — RL environment base class
+  shimmy            — gymnasium compatibility layer
