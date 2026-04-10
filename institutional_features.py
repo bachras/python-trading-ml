@@ -107,7 +107,9 @@ def add_vwap_features(df: pd.DataFrame) -> pd.DataFrame:
     # ── Anchored VWAP from rolling 20-bar high/low ───────
     # Simulates "anchored from recent significant pivot"
     # Uses the highest-volume bar in past 20 as anchor
-    roll_maxvol_idx = v.rolling(20).apply(lambda x: x.argmax(), raw=True).astype(int)
+    # fillna(0) before astype(int): rolling(20) returns NaN for first 19 bars,
+    # and pandas 2.x raises if you cast NaN directly to int.
+    roll_maxvol_idx = v.rolling(20).apply(lambda x: x.argmax(), raw=True).fillna(0).astype(int)
 
     anchored_vwap = pd.Series(np.nan, index=d.index)
     for i in range(20, len(d)):
@@ -220,6 +222,9 @@ def compute_volume_profile(prices: np.ndarray, volumes: np.ndarray,
 
 def add_volume_profile_features(df: pd.DataFrame,
                                  session_bars: int = 390) -> pd.DataFrame:
+    # Need at least 20 bars for a meaningful profile (compute_volume_profile
+    # requires >= 10, but fewer than 20 gives unreliable results).
+    session_bars = max(session_bars, 20)
     """
     Rolling volume profile computed over `session_bars` lookback.
     For US30: 390 bars = ~1 trading day on 1m, ~78 bars on 5m.
@@ -371,9 +376,10 @@ def add_order_flow_features(df: pd.DataFrame) -> pd.DataFrame:
     d["delta_divergence"] = (price_dir != delta_dir).astype(float)
 
     # Delta momentum vs price momentum (key divergence signal)
-    d["delta_price_corr"] = (
-        d["delta"].rolling(20).corr(d["Close"].diff())
-    )
+    # If delta is near-zero everywhere (e.g. ask/bid estimated as 50/50),
+    # rolling corr returns NaN for all rows — fill with 0 (neutral) instead.
+    _corr = d["delta"].rolling(20).corr(d["Close"].diff())
+    d["delta_price_corr"] = _corr.fillna(0.0)
 
     # ── Stacked imbalance detection ───────────────────────
     # A "stacked imbalance" is 3+ consecutive bars where
@@ -491,13 +497,13 @@ def add_liquidity_features(df: pd.DataFrame) -> pd.DataFrame:
     tol = c * EQUAL_LEVEL_TOL
 
     # Rolling equal high: current high within tolerance of recent swing high
-    recent_sh = swing_high_prices.fillna(method="ffill")
+    recent_sh = swing_high_prices.ffill()
     d["equal_high"] = (
         (recent_sh.notna()) &
         ((h - recent_sh).abs() < tol)
     ).astype(float)
 
-    recent_sl = swing_low_prices.fillna(method="ffill")
+    recent_sl = swing_low_prices.ffill()
     d["equal_low"] = (
         (recent_sl.notna()) &
         ((l - recent_sl).abs() < tol)
@@ -581,7 +587,10 @@ def add_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     atr_ratio     = atr / (atr_sma + 1e-10)   # > 1 = expanding, < 1 = contracting
     atr_slope     = atr.diff(10) / (atr.shift(10) + 1e-10)
     hv20          = d.get("hv20", c.pct_change().rolling(20).std() * np.sqrt(252))
-    hv20_pct      = hv20.rank(pct=True)           # percentile of current vol
+    # Rolling percentile rank within a 252-bar window — no future leakage.
+    # The old rank(pct=True) ranked against the full series including test
+    # data, encoding future volatility context into training features.
+    hv20_pct      = hv20.rolling(252).rank(pct=True)
 
     # Trend strength: ADX proxy (directional movement index)
     high_diff = d["High"].diff()
@@ -646,9 +655,18 @@ def add_session_open_range(df: pd.DataFrame,
     """
     d = df.copy()
 
-    # US30 NYSE open: 13:30 UTC (during BST) or 14:30 UTC (GMT)
-    # We use 13:30 UTC as default — adjust if needed
-    is_open_bar = (d.index.hour == 13) & (d.index.minute >= 30)
+    # NYSE open is 9:30 AM US Eastern. Convert UTC index → ET so DST is
+    # handled automatically: open appears at 14:30 UTC in winter (EST) and
+    # 13:30 UTC in summer (EDT). The old hardcoded 13:30 UTC was wrong for
+    # ~4 months/year.
+    _us_idx = (d.index if d.index.tz is not None else d.index.tz_localize("UTC")
+               ).tz_convert("America/New_York")
+    # For 1m/5m: look for exact 9:30+ bars. For coarser TFs (10m, 15m, 60m)
+    # there may be no bar with minute==30, so fall back to any bar in the 9 AM
+    # ET hour that covers the open period.
+    is_open_bar = (_us_idx.hour == 9) & (_us_idx.minute >= 30)
+    if not is_open_bar.any():
+        is_open_bar = _us_idx.hour == 9  # e.g. 60m bars land at 9:00 ET
 
     # Mark the first N bars after open each day
     dates = d.index.date
@@ -659,16 +677,14 @@ def add_session_open_range(df: pd.DataFrame,
         day_mask = np.array(dates) == date
         day_df   = d[day_mask]
 
-        # Find open bars for this day
         open_bars = day_df[is_open_bar[day_mask]]
         if len(open_bars) == 0:
             continue
 
-        or_range   = open_bars.iloc[:open_range_bars]
-        or_high    = or_range["High"].max()
-        or_low     = or_range["Low"].min()
+        or_range = open_bars.iloc[:open_range_bars]
+        or_high  = or_range["High"].max()
+        or_low   = or_range["Low"].min()
 
-        # Assign to all bars in this day
         session_high[day_mask] = or_high
         session_low[day_mask]  = or_low
 
@@ -713,32 +729,59 @@ def add_institutional_features(df: pd.DataFrame,
 
     d = df.copy()
 
+    def _check_step(d_before, d_after, step_name):
+        """Log any columns added by this step that are entirely NaN."""
+        new_cols = [c for c in d_after.columns if c not in d_before.columns]
+        bad = [c for c in new_cols if d_after[c].isna().all()]
+        if bad:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"  institutional [{step_name}]: {len(bad)} all-NaN columns: {bad}"
+            )
+        return d_after
+
+    before_cols = set(d.columns)
+
     # 1. VWAP family
     if verbose: print("  [1/5] VWAP family...")
-    d = add_vwap_features(d)
+    d = _check_step(d, add_vwap_features(d), "VWAP")
 
     # 2. Volume profile (POC, VAH, VAL, HVN, LVN)
     if verbose: print("  [2/5] Volume profile (POC / VAH / VAL / HVN / LVN)...")
-    d = add_volume_profile_features(d, session_bars=session_bars)
+    d = _check_step(d, add_volume_profile_features(d, session_bars=session_bars), "VolumeProfile")
 
     # 3. Order flow / delta
     if verbose: print("  [3/5] Order flow & delta...")
-    d = add_order_flow_features(d)
+    d = _check_step(d, add_order_flow_features(d), "OrderFlow")
 
     # 4. Liquidity structure
     if verbose: print("  [4/5] Liquidity structure...")
-    d = add_liquidity_features(d)
+    d = _check_step(d, add_liquidity_features(d), "Liquidity")
 
     # 5. Market regime
     if verbose: print("  [5/5] Market regime classifier...")
-    d = add_regime_features(d)
+    d = _check_step(d, add_regime_features(d), "Regime")
 
     # 6. Session open range (US30)
     if verbose: print("  [6/6] Session open range (ORB)...")
-    d = add_session_open_range(d, open_range_bars=open_range_bars)
+    d = _check_step(d, add_session_open_range(d, open_range_bars=open_range_bars), "ORB")
 
-    # Drop NaN rows introduced by rolling lookbacks
-    d.dropna(inplace=True)
+    # Forward-fill NaNs introduced by rolling lookbacks (e.g. first N bars of
+    # anchored VWAP, ORB before market open) then back-fill any leading NaNs.
+    # Only hard-drop rows where core OHLCV columns are missing.
+    rows_before = len(d)
+    d.ffill(inplace=True)
+    d.bfill(inplace=True)
+    core_cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in d.columns]
+    d.dropna(subset=core_cols, inplace=True)
+    rows_after = len(d)
+    if rows_before > 0 and rows_after < rows_before * 0.95:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            f"  institutional dropna removed {rows_before - rows_after:,} rows "
+            f"({100*(rows_before-rows_after)/rows_before:.1f}%) — "
+            f"{rows_after:,} remain"
+        )
 
     if verbose:
         added = len(d.columns) - before

@@ -1,280 +1,968 @@
 
-COMPLETE GUIDE — Tick Data → Trained Model → Live MT5 Trading (US30)
-=====================================================================
-All 4 files work together as one system:
-  tick_pipeline.py          — streams CSV, builds Parquet files
-  institutional_features.py — VWAP, VP, delta, liquidity, regime
-  phase2_adaptive_engine.py — ML models, RL, GA, Optuna, risk gate
-  integration.py            — wires everything together (RUN THIS)
+COMPLETE GUIDE — ML Trading System
+From tick data to live MT5 trading
+====================================
+Last updated: 2026-04-08
+
+Files in this system:
+  tick_pipeline.py          — streams Dukascopy CSV, builds Parquet files
+  institutional_features.py — VWAP, volume profile, order flow, regime
+  phase2_adaptive_engine.py — ML models, RL agent, GA, Optuna, signal logic
+  pipeline.py               — shared data pipeline (used by train.py AND live.py)
+  train.py                  — TRAINING ONLY — run once to train or retrain
+  live.py                   — LIVE TRADING ONLY — run after training completes
+  db.py                     — SQLite database (strategies, equity curves, trades)
+  backtest_engine.py        — backtesting engine (used by train.py and report.py)
+  report.py                 — generates interactive HTML report on demand
+  .env                      — ALL configuration lives here (never edit .py files)
+  .env.template             — copy of .env with documentation
+
+NEVER edit the .py files for configuration. Everything is controlled via .env.
+
+KEY CHANGE: The system is now split into two separate scripts.
+  train.py  — heavy computation (training, optimisation, backtesting) — run once
+  live.py   — lightweight trading loop — runs continuously, never blocks on training
+
 
 =====================================================================
-STEP 1 — FOLDER SETUP
+PART 1 — FIRST-TIME SETUP (do once)
 =====================================================================
 
-Your C:\trading_ml\ folder must look like this:
+─────────────────────────────────────────────────────────────────────
+STEP 1 — FOLDER STRUCTURE
+─────────────────────────────────────────────────────────────────────
 
-  C:\trading_ml\
+Your folder must look like this:
+
+  F:\trading_ml\
     venv\
-    .env
+    .env                         ← your config (copy from .env.template)
+    .env.template                ← reference copy, safe to commit
     tick_pipeline.py
     institutional_features.py
     phase2_adaptive_engine.py
-    integration.py
+    pipeline.py
+    train.py
+    live.py
+    db.py
+    backtest_engine.py
+    report.py
+    FULL_GUIDE.txt
     tick_data\
-      US30_ticks.csv          ← your Dukascopy file goes here
+      US30_ticks.csv             ← your Dukascopy export goes here
+
+The system writes to these folders automatically (created on first run):
+    data\       ← Parquet files (built from tick CSV) + featured parquets
+    models\     ← trained ML models (LSTM, XGB, RF, PPO, scalers)
+    params\     ← ML-discovered trading parameters per symbol
+    logs\       ← training logs and live trading logs (separate files)
+    trading.db  ← SQLite database (strategies, equity curves, trades)
 
 
-=====================================================================
-STEP 2 — INSTALL ONE EXTRA PACKAGE
-=====================================================================
+─────────────────────────────────────────────────────────────────────
+STEP 2 — CONFIGURE .env
+─────────────────────────────────────────────────────────────────────
 
-The institutional features module uses scipy.
-Open Command Prompt, activate venv, run:
+Edit .env (it already exists with your settings). Key sections:
+
+  BASE_DIR=F:\trading_ml          ← change if you move the folder
+
+  TICK_FILE_US30=F:\trading_ml\tick_data\US30_ticks.csv
+  TICK_SYMBOLS=US30               ← symbols that have tick CSV files
+  TICK_SYMBOL=US30                ← default symbol for tick_pipeline.py
+
+  ACTIVE_SYMBOLS=US30             ← which symbols to train and trade
+                                     (add more here as you get data)
+
+  FORCE_RETRAIN=false             ← false = load saved models on restart
+                                     true  = retrain from scratch
+
+  MT5_LOGIN=your_account_number
+  MT5_PASSWORD=your_password
+  MT5_SERVER=YourBroker-Demo
+
+  SYMBOL_US30=US30                ← your broker's exact name for US30
+                                     check MT5 Market Watch if unsure
+
+  MAX_DAILY_LOSS_PCT=6.0          ← hard limits, never changed by ML
+  MAX_DRAWDOWN_PCT=25.0
+  MAX_OPEN_POSITIONS=5
+  RISK_PER_TRADE_PCT=1.0
+
+  RISK_MODE=percent               ← percent = risk % of balance per trade
+                                     fixed   = risk exact dollar amount
+  FIXED_RISK_AMOUNT=100           ← used when RISK_MODE=fixed
+
+  RISK_CAP_PCT=2.0                ← max total capital at risk across all
+  RISK_CAP_AMOUNT=200               open trades (see BE logic below)
+
+  TOP_N_STRATEGIES=5              ← top param sets saved per timeframe
+  PER_TF_TRIALS=150               ← Optuna trials per TF optimisation
+  BACKTEST_START_DATE=2020-01-02  ← backtest uses all data from this date
+  ER_MULTIPLIER=1.25              ← efficiency ratio bonus for low drawdown
+
+  EXTRA_STRATEGIES=               ← comma-separated strategy IDs to run
+                                     alongside the auto-selected best
+                                     Example: US30_3m_rank2,US30_5m_rank1
+
+Start with demo account credentials. Only switch to live after running
+demo for several days and verifying behaviour.
+
+
+─────────────────────────────────────────────────────────────────────
+STEP 3 — INSTALL PACKAGES
+─────────────────────────────────────────────────────────────────────
+
+Open a terminal, activate venv, install all dependencies:
 
   venv\Scripts\activate
-  pip install scipy
+  pip install MetaTrader5 pandas numpy scikit-learn tensorflow
+  pip install xgboost stable-baselines3 gymnasium deap optuna
+  pip install pyarrow joblib scipy python-dotenv plotly
 
 
-=====================================================================
-STEP 3 — EDIT tick_pipeline.py (2 lines only)
-=====================================================================
+─────────────────────────────────────────────────────────────────────
+STEP 4 — PREPARE MT5 TERMINAL
+─────────────────────────────────────────────────────────────────────
 
-Open tick_pipeline.py and find these two lines near the top:
-
-  TICK_FILE = Path(r"C:\trading_ml\tick_data\US30_ticks.csv")
-  SYMBOL    = "US30"
-
-Make sure the path matches where your CSV actually is.
-If your CSV has a different name, update it here.
-
-
-=====================================================================
-STEP 4 — EDIT integration.py (1 section only)
-=====================================================================
-
-Find this section near the top of integration.py:
-
-  TICK_DATA_SYMBOLS = {
-      "US30": Path(r"C:\trading_ml\tick_data\US30_ticks.csv"),
-  }
-
-Same path as Step 3. Also confirm your broker's symbol name for
-US30 matches the key "US30". Check in MT5 Market Watch.
-Common alternatives: US30.cash, DJIA, WS30, DJ30
+  1. Open MetaTrader 5 and log in to your account (demo or live)
+  2. Tools → Options → Expert Advisors → tick "Allow algorithmic trading"
+  3. Check Market Watch — find the exact name MT5 uses for US30
+     Common alternatives: US30.cash  DJIA  WS30  DJ30  US30
+  4. If the name differs from "US30", update .env:
+       SYMBOL_US30=US30.cash
 
 
-=====================================================================
-STEP 5 — BUILD PARQUET FROM TICK CSV (one time only)
-=====================================================================
+─────────────────────────────────────────────────────────────────────
+STEP 5 — BUILD PARQUET FROM TICK CSV (one time only, ~30-60 min)
+─────────────────────────────────────────────────────────────────────
 
-This only runs once. After this, data loads in seconds forever.
+This converts your raw Dukascopy CSV into compressed Parquet files.
+Only needs to run once. After that, data loads in seconds forever.
 
-  cd C:\trading_ml
+  cd F:\trading_ml
   venv\Scripts\activate
   python tick_pipeline.py
 
-What happens:
-  - Streams your 10GB CSV in 500,000-row chunks (~150MB at a time)
-  - Builds OHLCV bars for timeframes: 1m, 3m, 5m, 10m, 15m, 30m, 1H
-  - Saves compressed Parquet files to C:\trading_ml\data\
-  - Prints a quality report when done
+IMPORTANT — Dukascopy CSV format:
+  Export from JForex Historical Data Manager.
+  The system expects EET timezone (Dukascopy server time default).
+  Columns: time, ask, bid, ask_volume, bid_volume
+  The pipeline auto-detects separator and datetime format.
 
-Expected output:
+What happens:
+  - Streams your CSV in 500,000-row chunks (safe for 8GB+ RAM)
+  - Cleans and validates every tick (price bounds, spread, volume)
+  - Typical rejection rate: < 0.1% (only corrupt ticks)
+  - Builds OHLCV bars for: 1m, 3m, 5m, 10m, 15m, 30m, 1H
+  - Adds microstructure features (spread, delta, tick velocity, VWAP)
+  - Saves Parquet files to F:\trading_ml\data\
+
+Expected output (example for 16GB CSV):
   Building tick-derived OHLCV for US30
-  Source: C:\trading_ml\tick_data\US30_ticks.csv
-  Size  : 10.34 GB
-  TFs   : [1, 3, 5, 10, 15, 30, 60]
+  Source: F:\trading_ml\tick_data\US30_ticks.csv
+  Size  : 15.97 GB
 
   Streaming tick data...
-  Chunk 10 | 5,000,000 ticks processed (12.3%) | rejected: 1,243
-  Chunk 20 | 10,000,000 ticks processed (24.6%) | ...
+  Chunk 10 | 4,999,768 ticks processed (1.5%) | rejected: 232
   ...
-  Streaming complete: 81,432,112 clean ticks | 48,231 rejected
-
-  US30 1m:  2,847,000 bars | 2019-01-02 → 2025-04-02
-  US30 5m:    569,400 bars
-  US30 15m:   189,800 bars
-  ...
-
-  Saved: US30_1m_ticks.parquet  | 312.4 MB
-  Saved: US30_5m_ticks.parquet  |  82.1 MB
-  ...
+  Streaming complete: 320,000,000 clean ticks | 48,000 rejected (0.01%)
 
   DATA QUALITY REPORT — US30
   TF    bars        from        to          coverage  microstructure
-  1m    2,847,000   2019-01-02  2025-04-02  97.3%     YES
-  5m    569,400     2019-01-02  2025-04-02  97.1%     YES
+  1m    2,847,000   2020-01-02  2026-04-01  97.3%     YES
+  5m      569,400   2020-01-02  2026-04-01  97.1%     YES
   ...
 
-Duration: 30–60 minutes for 10GB. Get a coffee.
+What to check in the quality report:
+  - coverage should be > 90% on all timeframes
+  - microstructure should be YES on all rows
+  - rejection rate should be < 1% of total ticks
+
+If coverage is low (< 85%): the CSV may have gaps — that is normal
+for public tick data. The system handles gaps correctly.
 
 
 =====================================================================
-STEP 6 — VERIFY MT5 IS READY
+PART 2 — RUNNING THE SYSTEM
 =====================================================================
 
-Before running the main system:
-  1. Open MT5 terminal
-  2. Log in to your trading account
-  3. Tools > Options > Expert Advisors > tick "Allow algorithmic trading"
-  4. Confirm US30 (or your broker's name) is visible in Market Watch
+The system now runs as TWO separate processes in TWO terminals:
+  Terminal 1: python train.py    (training — run once, can be re-run any time)
+  Terminal 2: python live.py     (live trading — runs continuously)
 
-Check your .env file has correct credentials:
-  MT5_LOGIN=your_account_number
-  MT5_PASSWORD=your_password
-  MT5_SERVER=YourBroker-Server
+These two never need to run at the same time. Train first, then start live.
+If you want to retrain while live trading is running, see Part 3.
 
 
-=====================================================================
-STEP 7 — RUN THE FULL SYSTEM
-=====================================================================
+─────────────────────────────────────────────────────────────────────
+FIRST RUN — TERMINAL 1: Training
+─────────────────────────────────────────────────────────────────────
 
-  cd C:\trading_ml
+With MT5 open and logged in, run in the first terminal:
+
+  cd F:\trading_ml
   venv\Scripts\activate
-  python integration.py
+  python train.py
 
-What happens in order:
+Training runs through these stages automatically:
 
-  ── STAGE 1: DATA LOADING (~2 min) ────────────────────────────
-  US30     → loads from Parquet (seconds, 75 months tick data)
-  EURUSD   → fetches max history from MT5
-  GBPUSD   → fetches max history from MT5
-  ... (all other symbols from MT5)
+  ── STAGE 1: DATA LOADING (~2-5 min) ──────────────────────────────
+  Loads Parquet files and applies institutional features:
+    VWAP family (session, anchored, bands, slope)
+    Volume profile (POC, VAH, VAL, HVN, LVN)
+    Order flow delta (CVD, stacked imbalance, absorption)
+    Liquidity structure (swing levels, equal H/L, stop hunts)
+    Market regime (trend/range/expanding/contracting)
+  US30 ends up with ~161 features on full tick data.
+  Also saves "featured parquets" for each TF (used in accurate backtesting).
 
-  ── STAGE 2: INSTITUTIONAL FEATURES (~5 min) ──────────────────
-  For each symbol × each timeframe:
-  Applies VWAP, volume profile (POC/VAH/VAL/HVN/LVN),
-  order flow delta, liquidity structure, market regime
-
-  US30 gets ~110 features (tick + institutional)
-  Others get ~85 features (MT5 + estimated microstructure)
-
-  ── STAGE 3: MODEL TRAINING (~20–40 min) ──────────────────────
-  For each symbol × each entry TF candidate (1m,3m,5m,10m,15m):
-    - LSTM neural network
+  ── STAGE 2: MODEL TRAINING (~20-40 min) ──────────────────────────
+  For each entry TF candidate (1m, 3m, 5m, 10m, 15m):
+    - LSTM neural network (60-bar sequence input)
     - XGBoost + Random Forest ensemble
-  Then per symbol:
+    - Each TF trains with its own correct feature set (no cross-TF mismatch)
+  Then for the default TF:
     - PPO reinforcement learning agent
-  Prints feature importance report showing which institutional
-  features the ML values most
+  All models saved to F:\trading_ml\models\
 
-  ── STAGE 4: PARAMETER DISCOVERY (~10–20 min) ─────────────────
+  ── STAGE 3: GLOBAL PARAMETER DISCOVERY (~10-20 min) ──────────────
   Genetic algorithm (80 population × 40 generations)
-  Optuna Bayesian optimisation (150 trials)
-  Discovers per symbol:
-    - Best entry TF (from 1m/3m/5m/10m/15m)
-    - Best HTF (from 15m/30m/1H or NONE)
-    - SL ATR multiplier
-    - R:R ratio
-    - TP multiplier
-    - Confidence threshold
-    - HTF weight
+  then Optuna Bayesian optimisation (150 trials)
+  Discovers best TF + params across all timeframes.
+  Parameters saved to F:\trading_ml\params\US30_params.json
 
-  Example output:
-    US30 OPTIMAL PARAMS:
-      Entry TF   : 5m
-      HTF        : 60m (active)
-      SL ATR×    : 1.743
-      R:R        : 1:2.61
-      TP mult    : 2.61x
-      Confidence : 0.64
-      HTF weight : 0.38
-      Data source: tick+institutional
+  ── STAGE 4: PER-TF OPTIMISATION (~30-60 min) ─────────────────────
+  For each entry TF (1m, 3m, 5m, 10m, 15m):
+    - Runs 150 Optuna trials (PER_TF_TRIALS in .env)
+    - Saves top-5 parameter sets per TF (TOP_N_STRATEGIES in .env)
+    - Runs full backtest on each top-5 set (from BACKTEST_START_DATE)
+    - Saves results to SQLite database (trading.db)
+  Strategy IDs follow the format: US30_5m_rank1, US30_5m_rank2, etc.
 
-  ── STAGE 5: LIVE TRADING LOOP ────────────────────────────────
-  System enters live loop automatically after training.
-  On each closed candle of each symbol's entry TF:
-    1. Fetches fresh MT5 bars and merges with tick history
-    2. Applies institutional features to new bars
-    3. Runs all 4 ML models (LSTM + XGB + RF + PPO)
-    4. Checks HTF alignment using institutional composite score
-    5. Checks risk gate (daily loss, drawdown, max positions)
-    6. Places order if signal passes all gates
-    7. Logs trade to C:\trading_ml\logs\trade_log.json
+  ── STAGE 5: AUTO-ACTIVATION ───────────────────────────────────────
+  Automatically marks the best strategy (highest efficiency ratio)
+  as active in the database. live.py will pick this up.
 
-  Every 20 closed trades per symbol:
-    System re-runs Optuna (30 trials) and updates parameters
+  Efficiency ratio = (peak_profit / max_drawdown_in_money) × ER_MULTIPLIER
+  This rewards strategies with high profit relative to their worst drawdown.
 
-To stop: press Ctrl+C (closes cleanly, disconnects MT5)
+When training completes:
+  "TRAINING COMPLETE"
+  "Start live trading: python live.py"
+
+Total time from cold start to completion: ~60-120 min (first run).
+Subsequent retrains are faster if models already exist (resume mode).
+
+
+─────────────────────────────────────────────────────────────────────
+FIRST RUN — TERMINAL 2: Live Trading
+─────────────────────────────────────────────────────────────────────
+
+Once train.py finishes (you see "TRAINING COMPLETE"), open a second terminal:
+
+  cd F:\trading_ml
+  venv\Scripts\activate
+  python live.py
+
+What live.py does on startup:
+  1. Checks that all required model files exist on disk
+     If any are missing: prints an error and exits (run train.py first)
+  2. Loads data (tick Parquets or MT5 fallback), loads models from disk
+  3. Queries SQLite for the active strategy (highest efficiency ratio)
+  4. Also loads any strategies listed in EXTRA_STRATEGIES in .env
+  5. Enters the live trading loop
+
+On each closed candle:
+  1. Fetches fresh MT5 bars, merges with tick history (last 5000 bars kept)
+  2. Applies institutional features to new bars only
+  3. Runs all 4 ML models (LSTM + XGB + RF + PPO)
+  4. Checks HTF alignment using institutional composite score
+  5. Checks risk gate: daily loss, total drawdown, open positions, risk cap
+  6. Places order if signal confidence passes threshold
+  7. Logs every trade to SQLite (trading.db)
+
+To stop: press Ctrl+C (always use this — never close the terminal directly)
+
+
+─────────────────────────────────────────────────────────────────────
+DRY RUN MODE (test without placing real trades)
+─────────────────────────────────────────────────────────────────────
+
+  python live.py --dry
+
+Runs the full loop but prints "DRY RUN — would have placed order" instead
+of actually placing trades. Useful for verifying signals before going live.
+
+
+─────────────────────────────────────────────────────────────────────
+TEST TRADE MODE (verify full pipeline works end-to-end)
+─────────────────────────────────────────────────────────────────────
+
+  python live.py --test-trade
+
+Places ONE real micro-lot order (broker's minimum, e.g. 0.01 lot) and
+immediately closes it. Tests and prints PASS/FAIL for each step:
+
+  STEP 1: Order placement       — MT5 accepts the order and returns a ticket
+  STEP 2: DB logging            — trade written to live_trades in SQLite
+  STEP 3: Position verification — confirmed in MT5 positions list
+  STEP 4: BE monitoring         — break-even sync runs without errors
+  STEP 5: Risk cap check        — get_capital_at_risk() counts the trade
+  STEP 6: Trade close           — closes via MT5 and updates DB status
+
+Total cost: ~0.01 lot × spread ≈ a few cents worst case.
+
+Run this BEFORE going live on real money. If all steps show PASS, the full
+pipeline (order → DB → monitoring → close) is confirmed working.
+
+If STEP 6 fails (auto-close rejected), the script warns you and you close
+the test trade manually in MT5 — the risk is still just the spread cost.
+
+When to run --test-trade:
+  - First time setting up the system on a new account
+  - After changing MT5 credentials or server
+  - After a broker migration
+  - Whenever you want to confirm the system still connects and trades correctly
+
+
+─────────────────────────────────────────────────────────────────────
+SIGNAL CHECK MODE (diagnose why no trades are appearing)
+─────────────────────────────────────────────────────────────────────
+
+  python live.py --signal-check
+
+Loads models and data, evaluates the CURRENT candle for every active strategy,
+and prints what the ML models are seeing right now:
+
+  Strategy : US30_5m_rank1
+  TF       : 5m  HTF: 60m
+  Threshold: LONG >= 0.6400  SHORT <= 0.3600
+  Last 10 XGB probs : [0.512  0.489  0.534  0.501  0.478  0.523  0.497  0.511  0.488  0.502]
+  Latest bar result : No signal (prob=0.502)  Need 0.138 more to reach long threshold
+
+This is the key diagnostic for "no trades for a whole day":
+  - If probs are stuck between 0.35–0.65: the model sees no clear edge.
+    This is NORMAL in ranging or low-volume markets (overnight, pre-market).
+    Wait for a clear session (London open, NY open, or their overlap).
+  - If probs occasionally reach 0.58–0.63 but threshold is 0.64+: the
+    threshold may be too conservative. Run train.py to re-optimise it.
+  - If probs are all near 0.50: the market regime is not matching what
+    the model was trained on. This is expected in low-volatility chop.
+
+Run --signal-check at different times of day:
+  08:00–09:30 UTC  — London open (usually sees clearer signals)
+  13:30–17:00 UTC  — NY/London overlap (highest institutional flow)
+  17:00–21:00 UTC  — NY session (post-London)
+
+If signals never appear across multiple sessions over several days, consider
+running:  python train.py --force  (re-optimises confidence threshold).
+
+
+─────────────────────────────────────────────────────────────────────
+RESUME AFTER REBOOT — loads in ~2-5 min, no retraining
+─────────────────────────────────────────────────────────────────────
+
+After training has completed at least once, restarting is fast:
+
+  python live.py
+  → Checks model files → all found
+  → Loads data + models: ~2-5 min
+  → Queries DB for active strategy
+  → Live loop starts
+
+train.py is NOT needed on restart unless you want to retrain.
+
+
+─────────────────────────────────────────────────────────────────────
+CLI OPTIONS
+─────────────────────────────────────────────────────────────────────
+
+train.py options:
+  python train.py                   # trains missing TFs only (resume mode)
+  python train.py --force           # full retrain from scratch (all TFs)
+  python train.py --symbol US30     # train one symbol only
+  python train.py --report          # train then immediately generate HTML report
+
+live.py options:
+  python live.py                    # normal live trading
+  python live.py --dry              # dry run (signals logged, no real orders)
+  python live.py --test-trade       # place + close one micro test trade (pipeline check)
+  python live.py --signal-check     # show current ML probabilities vs threshold, then exit
+
+tick_pipeline.py options:
+  python tick_pipeline.py           # full build from scratch (first time only)
+  python tick_pipeline.py --append new_month.csv   # incremental append (~5 min)
 
 
 =====================================================================
-WHAT GETS SAVED WHERE
+PART 3 — RETRAINING WITH NEW DATA
 =====================================================================
 
-  C:\trading_ml\
+─────────────────────────────────────────────────────────────────────
+Retraining while live.py is NOT running (simple case)
+─────────────────────────────────────────────────────────────────────
+
+  1. Stop live.py with Ctrl+C
+  2. Run: python train.py --force
+  3. When training completes, run: python live.py
+  live.py picks up the freshly trained models automatically.
+
+
+─────────────────────────────────────────────────────────────────────
+Retraining while live.py IS running (hot-reload)
+─────────────────────────────────────────────────────────────────────
+
+You can retrain in a separate terminal while live.py continues trading.
+live.py checks model file modification times every 60 minutes
+(MODEL_RELOAD_INTERVAL_MIN in .env, default 60).
+
+When live.py detects that model files have been updated:
+  - If there are NO open positions for that symbol: reloads models immediately
+  - If there ARE open positions: waits until all positions close, then reloads
+  - It NEVER interrupts a trade to reload — positions are always protected
+
+Workflow:
+  Terminal 1 (live, running): python live.py
+  Terminal 2 (retrain):       python train.py --force
+  → train.py saves new models → live.py detects the change → hot-reloads safely
+
+To add a new month of tick data (Dukascopy incremental update):
+  1. Download the new month's CSV from Dukascopy JForex
+     → Export only the new period (e.g. April 2026) — overlaps are fine
+     → Save as: F:\trading_ml\tick_data\US30_april2026.csv
+
+  2. Append to existing Parquets (~2-10 min — much faster than full rebuild):
+     python tick_pipeline.py --append F:\trading_ml\tick_data\US30_april2026.csv
+
+     What --append does:
+       - Finds the last bar timestamp in existing Parquets
+       - Processes ONLY ticks after that timestamp
+       - Re-engineers features with proper warmup history
+       - Appends new bars to each Parquet file
+       - Prints a quality report showing updated bar counts
+       - Does NOT touch or reprocess historical data
+
+  3. Retrain models on the expanded dataset:
+     python train.py --force   (full retrain recommended after adding months of data)
+     — or —
+     python train.py           (resume mode: retrains missing/outdated models only)
+
+  live.py hot-reloads automatically when train.py finishes.
+
+  You do NOT need to keep old monthly CSVs after appending — the Parquets
+  contain all historical data. Only the new CSV is needed for each update.
+
+When to force retrain:
+  - You changed features in tick_pipeline.py or institutional_features.py
+  - You added months of new tick data and rebuilt the Parquets
+  - Model performance has degraded significantly over time
+  - You added a new symbol for the first time
+  - After any significant change to institutional_features.py
+
+
+─────────────────────────────────────────────────────────────────────
+DATA QUALITY: historical vs live bars
+─────────────────────────────────────────────────────────────────────
+
+There are two different data sources used, and they have different quality:
+
+HISTORICAL DATA (tick-derived Parquets):
+  - Source: Dukascopy tick CSV → tick_pipeline.py → .parquet files
+  - Quality: FULL — all microstructure features available:
+      real spread, bid/ask volume, tick count, tick velocity
+      VWAP from real ticks, CVD from real trade direction, etc.
+  - Coverage: 6 years (2020-2026), ~2.8M bars on 1m
+  - This is what models are TRAINED on
+  - All backtesting uses this data (accurate results)
+
+LIVE BARS (MT5 OHLCV):
+  - Source: MT5 API fetch on each new candle close
+  - Quality: PARTIAL — only OHLCV available from MT5 in real time
+  - Microstructure features (spread, delta, tick velocity, VWAP) are
+    ESTIMATED from the OHLCV using simple heuristics:
+      spread ~ ATR × 0.05
+      bid/ask volume ~ split by price direction
+      VWAP ~ calculated from High+Low+Close and cumulative volume
+  - This is the expected behaviour — not a limitation
+  - The deep 6-year tick history is preserved in the dataset
+  - Only the most recent bars (tail) come from MT5 OHLCV
+  - The system keeps the last 5000 bars; old tick data dominates
+
+Why this design is correct:
+  Models train on tick features → they expect those features in inference.
+  Since the live tail is only a small fraction of the 5000-bar window,
+  the estimated microstructure on the tail has minimal impact on signals.
+  The institutional features computed on the tail (VWAP sessions, volume
+  profile zones, CVD slopes) are still meaningful from OHLCV alone.
+
+In practice: you will not notice a degradation in signal quality from
+this. The models have seen millions of training bars with real microstructure;
+a few hundred estimated bars at the tail does not confuse them.
+
+
+─────────────────────────────────────────────────────────────────────
+IMPORTANT: live MT5 bars are NEVER written to disk
+─────────────────────────────────────────────────────────────────────
+
+The MT5 bars appended during live trading exist IN MEMORY ONLY.
+They are NOT written to the Parquet files on disk.
+
+  Parquet on disk = always 100% tick-derived quality data
+  Live session RAM = Parquet + MT5 tail (estimated microstructure)
+
+When live.py restarts, it loads the Parquet fresh and builds a new tail
+from MT5. The estimated bars from the previous session are gone.
+
+This means when you get your monthly Dukascopy CSV and run:
+  python tick_pipeline.py --append US30_april2026.csv
+
+...the append fills in the exact same period (April 2026) with REAL
+tick-derived bars. After the append:
+  - Your Parquet has 100% quality data from 2020 through end of April 2026
+  - There is nothing to "overwrite" — the estimated live bars were never
+    saved to disk in the first place
+  - You get a clean, seamless quality dataset with no gaps
+
+After appending, retrain to get models trained on 100% quality data:
+  python train.py --force
+
+Monthly workflow that gives you permanent full-quality data:
+  1. End of month: download that month's CSV from Dukascopy
+  2. python tick_pipeline.py --append US30_april2026.csv    (~5 min)
+  3. python train.py --force                                (~60-120 min)
+  4. live.py hot-reloads automatically when training finishes
+
+At every point in the cycle you have full-quality data in the Parquet.
+Only the most recent few hundred live bars (current month's tail)
+use estimated microstructure — and next month that gap gets filled too.
+
+
+=====================================================================
+PART 4 — MULTI-STRATEGY TRADING
+=====================================================================
+
+─────────────────────────────────────────────────────────────────────
+How strategies are created
+─────────────────────────────────────────────────────────────────────
+
+After per-TF optimisation (Stage 4 of train.py), the system saves
+up to 5 strategies per timeframe to the SQLite database:
+
+  US30_1m_rank1   ← best params on 1m by Sharpe
+  US30_1m_rank2
+  ...
+  US30_5m_rank1   ← best params on 5m by Sharpe
+  US30_5m_rank2
+  ...
+  US30_15m_rank1  ← best params on 15m by Sharpe
+  ...
+
+Each strategy has its own full backtest stats:
+  - Sharpe ratio
+  - Efficiency ratio = (peak_profit / max_dd_money) × ER_MULTIPLIER
+  - Win rate, profit factor, max drawdown %, max drawdown in money
+  - Total profit, number of trades, expectancy
+  - Full equity curve + monthly P&L stored in DB
+
+
+─────────────────────────────────────────────────────────────────────
+Auto-selection of best strategy
+─────────────────────────────────────────────────────────────────────
+
+train.py automatically marks the strategy with the highest efficiency ratio
+as "active". live.py reads this from the DB on startup and runs it.
+
+You do not need to do anything — the best strategy is selected automatically.
+
+
+─────────────────────────────────────────────────────────────────────
+Running additional strategies simultaneously
+─────────────────────────────────────────────────────────────────────
+
+The auto-selected best strategy always runs. To run additional strategies
+at the same time, add their IDs to .env:
+
+  EXTRA_STRATEGIES=US30_3m_rank2,US30_5m_rank1
+
+You can find strategy IDs in the HTML report or in the console output
+after training completes.
+
+With multiple strategies running simultaneously:
+  - Each strategy generates its own signals independently
+  - Each trade uses its own set of params (entry TF, SL, RR, confidence)
+  - The risk cap applies across ALL strategies combined (see below)
+
+
+─────────────────────────────────────────────────────────────────────
+Risk cap: how multiple open trades interact
+─────────────────────────────────────────────────────────────────────
+
+The system enforces a total capital-at-risk cap across all open positions.
+This is controlled by two .env settings (whichever is higher limits are used):
+
+  RISK_CAP_PCT=2.0       ← max % of balance at risk simultaneously
+  RISK_CAP_AMOUNT=200    ← max dollar amount at risk simultaneously
+
+When a new signal appears, the system checks how much is currently at risk:
+  - Counts all open trades where the stop loss has NOT been moved to BE
+  - If adding the new trade's risk would exceed the cap: skip the new trade
+
+Break-even (BE) awareness — this is the key feature:
+  When a trade moves far enough into profit, the SL is moved to break-even.
+  Once at BE, that trade carries ZERO additional risk (worst case: 0 loss).
+  The cap check therefore EXCLUDES any trade where SL is at BE.
+
+Example with RISK_CAP_PCT=2%, RISK_PER_TRADE_PCT=1%, 3 active strategies:
+  Trade A opened at 1% risk          → at risk: 1.0%
+  Trade B opened at 1% risk          → at risk: 2.0%  (cap reached)
+  Signal for Trade C appears         → at risk would be 3.0% → SKIPPED
+  Trade A moves SL to BE (0% risk)   → at risk: 1.0%
+  Signal for Trade C appears again   → at risk would be 2.0% → ALLOWED
+
+This means when markets are running and existing trades move to BE, the
+system can keep opening new trades even while others are still open.
+
+
+=====================================================================
+PART 5 — ADDING MORE SYMBOLS
+=====================================================================
+
+─────────────────────────────────────────────────────────────────────
+OPTION A — New symbol with tick CSV (highest quality)
+─────────────────────────────────────────────────────────────────────
+
+  1. Get Dukascopy tick CSV for the symbol
+     → Export from JForex Historical Data Manager (same as US30)
+     → Save to: F:\trading_ml\tick_data\DE40_ticks.csv
+
+  2. Update .env (three lines):
+       TICK_FILE_DE40=F:\trading_ml\tick_data\DE40_ticks.csv
+       TICK_SYMBOLS=US30,DE40
+       ACTIVE_SYMBOLS=US30,DE40
+
+  3. Build Parquets for DE40 only:
+     In .env: set  TICK_SYMBOL=DE40
+     Then run:  python tick_pipeline.py
+     Reset to:  TICK_SYMBOL=US30 after done
+
+  4. Train the new symbol:
+       python train.py --symbol DE40
+     Or retrain everything:
+       python train.py --force
+
+─────────────────────────────────────────────────────────────────────
+OPTION B — New symbol using MT5 history only (lower quality)
+─────────────────────────────────────────────────────────────────────
+
+No tick CSV needed. The system fetches history from MT5 directly.
+Microstructure features are estimated from OHLCV — still useful.
+
+  1. Update .env:
+       ACTIVE_SYMBOLS=US30,EURUSD
+
+  2. Confirm symbol name in .env (check MT5 Market Watch):
+       SYMBOL_EURUSD=EURUSD
+
+  3. Train:
+       python train.py --force
+
+
+=====================================================================
+PART 6 — REPORTING AND MONITORING
+=====================================================================
+
+─────────────────────────────────────────────────────────────────────
+Generate the HTML performance report (on demand)
+─────────────────────────────────────────────────────────────────────
+
+  python report.py
+
+Opens a browser showing trading_report.html. Contents:
+  - Summary cards: total strategies, best Sharpe, best ER, active strategy
+  - Strategy comparison table (all TFs, all ranks, all metrics)
+  - Interactive equity curve + drawdown chart per strategy
+  - Monthly P&L heatmap (green = profit, red = loss, 12-month grid)
+  - Feature importance chart (top-15 features used by XGBoost)
+
+Or generate the report immediately after training:
+  python train.py --report
+
+The report reads from the SQLite database (trading.db), which is
+populated by train.py. Run train.py before report.py.
+
+
+─────────────────────────────────────────────────────────────────────
+SQLite database — what is stored
+─────────────────────────────────────────────────────────────────────
+
+File: F:\trading_ml\trading.db
+
+Tables:
+  strategy_params  — one row per strategy (US30_5m_rank1 etc.)
+                     columns: Sharpe, ER, win rate, profit factor,
+                     max DD, total profit, n_trades, expectancy, is_active
+
+  equity_curves    — daily equity values per strategy
+                     used for the equity chart in report.py
+
+  monthly_pnl      — profit/loss per month per strategy
+                     used for the monthly heatmap in report.py
+
+  live_trades      — every trade placed by live.py
+                     columns: ticket, symbol, direction, risk_amount,
+                     entry, SL, TP, status (open/closed), pnl, be_done
+
+  optuna_trials    — all optimisation trial results per symbol/TF
+                     useful for debugging parameter search quality
+
+You can query the DB directly:
+  In PowerShell: python -c "import sqlite3; ..."
+  Or use DB Browser for SQLite (free GUI tool)
+
+
+─────────────────────────────────────────────────────────────────────
+Understanding expected trade frequency
+─────────────────────────────────────────────────────────────────────
+
+The HTML report shows a "Freq" column in the strategy table and a trade
+frequency box below the session chart. Both are computed from the backtest.
+
+Reading the Freq column:
+  "~14h gap"   means on average one trade every 14 hours across the 6-year backtest
+  "~2.3d gap"  means roughly one trade every 2-3 trading days
+  "3/hr"       means ~3 trades per hour (only very short TFs)
+
+Why you may see no trades for many hours:
+  The ML only fires a signal when the ensemble probability exceeds its
+  confidence threshold (e.g. 0.64). In ranging, low-volume, or off-session
+  markets, probabilities often sit in the 0.40–0.58 range — no signal fires.
+  This is correct behaviour, not a bug. Selective systems trade less but avoid
+  low-quality setups.
+
+Sessions with the highest signal rate (from backtest analysis):
+  NY/London Overlap (13:30–17:00 UTC) — typically the most active window
+  London open       (08:00–13:30 UTC) — second most active
+  New York solo     (17:00–21:00 UTC) — after London closes
+
+  Overnight (21:00–08:00 UTC) and weekends produce very few signals.
+  A whole overnight session with zero trades is completely normal.
+
+To check right now if signals are near threshold:
+  python live.py --signal-check
+
+To see expected frequency for each strategy:
+  python report.py   (look at "Freq" column and trade frequency box)
+
+
+─────────────────────────────────────────────────────────────────────
+Watch the live log (open a second terminal)
+─────────────────────────────────────────────────────────────────────
+
+Training log (one per training run, timestamped):
+  F:\trading_ml\logs\training_20260408_1430.log
+
+Live trading log (one per day):
+  F:\trading_ml\logs\trading_20260408.log
+
+  powershell Get-Content F:\trading_ml\logs\trading_20260408.log -Wait
+
+Key log lines to watch:
+  [OK] Connected to MT5          — system connected
+  Sleeping 287s to next candle   — waiting for next bar close
+  SIGNAL ► US30 LONG | conf:0.71 — signal generated
+  Trade blocked: daily loss limit — risk gate blocked a trade
+  Hot-reload triggered           — live.py reloaded new models
+  Risk cap reached               — skipped new trade (too much at risk)
+  BE moved: ticket 12345         — stop loss moved to break-even
+
+
+─────────────────────────────────────────────────────────────────────
+Check current ML-discovered parameters
+─────────────────────────────────────────────────────────────────────
+
+  type F:\trading_ml\params\US30_params.json
+
+Shows the globally best params found by GA + Optuna.
+The per-TF params (top-5 per TF) are stored in trading.db.
+
+
+─────────────────────────────────────────────────────────────────────
+Check active strategies
+─────────────────────────────────────────────────────────────────────
+
+Active strategy is printed at live.py startup:
+  "Active strategy: US30_5m_rank1 (ER=2.84)"
+  "Extra strategies from .env: US30_3m_rank2"
+
+Or query the database:
+  python -c "from db import get_all_strategies; [print(s) for s in get_all_strategies('US30') if s['is_active']]"
+
+
+─────────────────────────────────────────────────────────────────────
+Check open positions
+─────────────────────────────────────────────────────────────────────
+
+  MT5 terminal → Trade tab (bottom panel)
+  Positions placed by this system have comment: ml_{tf}m_tick or ml_{tf}m_mt5
+
+
+=====================================================================
+PART 7 — FILES SAVED BY THE SYSTEM
+=====================================================================
+
+  F:\trading_ml\
     data\
-      US30_1m_ticks.parquet    ← tick-derived 1m bars + all features
-      US30_5m_ticks.parquet    ← tick-derived 5m bars + all features
-      US30_15m_ticks.parquet   ← tick-derived 15m bars (HTF)
-      EURUSD_1m_ticks.parquet  ← MT5-derived (when built)
-      ...
+      US30_1m.parquet              ← tick-derived OHLCV bars (1m)
+      US30_5m.parquet              ← same for 5m
+      US30_15m.parquet             ← same for 15m (HTF)
+      US30_30m.parquet
+      US30_60m.parquet
+      US30_1m_featured.parquet     ← full 161-feature version (for backtesting)
+      US30_5m_featured.parquet     ← same for 5m
+      (one set per symbol per TF; featured parquets built during training)
 
     models\
-      lstm_US30_5m.keras       ← LSTM trained on tick data
-      xgb_US30_5m.pkl          ← XGBoost trained on tick data
-      rf_US30_5m.pkl           ← Random Forest
-      ppo_US30.zip             ← RL agent (PPO)
-      lstm_US30_1m.keras       ← same models for each TF candidate
-      ...
+      lstm_US30_5m.keras           ← LSTM for US30 5m TF
+      xgb_US30_5m.pkl              ← XGBoost
+      rf_US30_5m.pkl               ← Random Forest
+      scaler_US30_5m.pkl           ← feature scaler
+      ppo_US30.zip                 ← PPO reinforcement learning agent
+      (one set per symbol per entry TF; scaler per TF has correct feature count)
 
     params\
-      US30_params.json         ← current ML-discovered parameters
-      EURUSD_params.json       ← updates after every 20 live trades
-      ...
+      US30_params.json             ← globally best params (GA + Optuna winner)
 
     logs\
-      trading_20250402.log     ← full system log (daily)
-      trade_log.json           ← every trade placed with full context
+      training_20260408_1430.log   ← timestamped training log
+      trading_20260408.log         ← daily live trading log
+
+    trading.db                     ← SQLite database
+    trading_report.html            ← generated by report.py (overwritten each run)
 
 
 =====================================================================
-MONITORING YOUR SYSTEM
+PART 8 — TROUBLESHOOTING
 =====================================================================
 
-Watch the log in real time (new Command Prompt window):
-  cd C:\trading_ml\logs
-  powershell Get-Content trading_20250402.log -Wait
-
-Check current parameters at any time:
-  type C:\trading_ml\params\US30_params.json
-
-See all trades placed:
-  type C:\trading_ml\logs\trade_log.json
-
-Check open positions in MT5:
-  MT5 terminal → Trade tab (bottom panel)
-
-
-=====================================================================
-TROUBLESHOOTING
-=====================================================================
-
-"ModuleNotFoundError: tick_pipeline"
-  → All 4 .py files must be in the same folder (C:\trading_ml\)
+"ModuleNotFoundError: pipeline" or "ModuleNotFoundError: db"
+  → All .py files must be in the same folder (F:\trading_ml\)
+  → Make sure venv is activated: venv\Scripts\activate
 
 "No data loaded for US30"
-  → Run tick_pipeline.py first (Step 5) before integration.py
+  → Parquets not built yet. Run python tick_pipeline.py first.
+  → Check data\ folder exists and contains .parquet files.
+
+"Model files not found — run train.py first"
+  → live.py checks that XGB, RF, and scaler files exist for every entry TF
+  → If any are missing, you must run: python train.py
+  → This is the expected first-run error
 
 "MT5 symbol not found: US30"
-  → Your broker uses a different name. Check Market Watch.
-  → Edit INSTRUMENTS dict in phase2_adaptive_engine.py line ~60
-  → Also edit TICK_DATA_SYMBOLS key in integration.py
+  → Your broker uses a different name. Check MT5 Market Watch.
+  → Update .env: SYMBOL_US30=US30.cash (or whatever your broker shows)
+  → No .py file edits needed.
 
-"Parquet build failed mid-way"
-  → Delete partial files in C:\trading_ml\data\
-  → Re-run: python tick_pipeline.py
+"System is not placing trades"
+  → Check the live log: is it reaching the signal evaluation loop?
+  → Confidence threshold may be high relative to current market conditions.
+    The system auto-scales confidence to the 85th percentile of recent
+    probabilities — if the market is quiet, thresholds adjust accordingly.
+  → Check risk gate: daily loss or drawdown limit may already be hit.
+  → Check MT5 is connected and algo trading is enabled.
 
-"Training takes forever on 1m bars"
-  → 1m bars = millions of rows → slow LSTM training
-  → Temporarily remove 1m from PARAM_SEEDS entry_tf_options
-  → Add it back after confirming system works on 5m first
+"Training takes a very long time on 1m bars"
+  → 1m bars = 2-3 million rows → LSTM training is slow on first run
+  → This is expected. Subsequent restarts load from disk in seconds.
+  → Use: python train.py --force  only when you actually need to retrain.
 
 "Order rejected by MT5 (retcode 10016)"
-  → Invalid volume. Check lot size limits for your broker's US30
-  → Set min lot size in .env: MIN_LOT_US30=0.1
+  → Invalid lot size. Your broker has minimum lot requirements.
+  → Check MT5 Market Watch → right-click US30 → Specification → Volume min
 
-First run with real money?
-  → Test on demo first (same server, different login)
-  → Set MAX_DAILY_LOSS_PCT=1.0 and RISK_PER_TRADE_PCT=0.5 initially
-  → Monitor for 2–3 days before increasing risk
+"Backtest shows zero or very few trades"
+  → Featured parquets may not have been generated yet (train.py saves them)
+  → Run: python train.py  — this saves the full-feature parquets
+  → Then re-run: python report.py
+
+"Hot-reload not happening after retraining"
+  → live.py checks file modification times every MODEL_RELOAD_INTERVAL_MIN minutes
+  → Default is 60 — wait up to 60 min or set MODEL_RELOAD_INTERVAL_MIN=10 in .env
+  → Reload only happens when no positions are open for that symbol
+
+After machine reboot, system wants to retrain:
+  → Check that F:\trading_ml\models\ contains all expected .pkl/.keras/.zip files
+  → If any file is missing, run train.py to rebuild
+  → live.py never starts unless ALL required model files exist
+
+
+=====================================================================
+PART 9 — MOVING TO LIVE TRADING
+=====================================================================
+
+Only move to a live account after ALL of the following:
+  ✓ Demo ran cleanly for at least 5-7 trading days
+  ✓ live.py trade tab in MT5 shows trades being placed and closed correctly
+  ✓ No unexpected errors in the daily log files
+  ✓ Risk gate triggered correctly when limits were approached
+  ✓ HTML report shows reasonable backtest stats (ER > 1.5, DD < 20%)
+
+When ready:
+  1. Update .env with live account credentials:
+       MT5_LOGIN=your_live_account_number
+       MT5_PASSWORD=your_live_password
+       MT5_SERVER=YourBroker-Live
+  2. Start conservative on live:
+       MAX_DAILY_LOSS_PCT=2.0
+       RISK_PER_TRADE_PCT=0.5
+       RISK_CAP_PCT=1.0
+  3. python live.py  (loads saved models — no retraining needed)
+  4. Monitor closely for the first 2-3 days
+  5. Gradually increase to normal risk settings once confirmed stable
+
+
+=====================================================================
+QUICK REFERENCE — COMMON COMMANDS
+=====================================================================
+
+First-time: build tick data Parquets (one time, ~30-60 min):
+  python tick_pipeline.py
+
+Add a new month of tick data (incremental, ~2-10 min):
+  python tick_pipeline.py --append F:\trading_ml\tick_data\US30_april2026.csv
+
+First-time / retrain: full training pipeline:
+  python train.py
+
+Resume after reboot (models already on disk):
+  python live.py
+
+Force full retrain (after new data or feature changes):
+  python train.py --force
+
+Train one symbol only:
+  python train.py --symbol US30
+
+Generate HTML performance report:
+  python report.py
+
+Train then immediately generate report:
+  python train.py --report
+
+Dry run (signals logged, no real orders placed):
+  python live.py --dry
+
+Verify full pipeline works (place + close one micro test trade):
+  python live.py --test-trade
+
+Diagnose why no trades are appearing (show raw ML probabilities now):
+  python live.py --signal-check
+
+Watch live log in real time:
+  powershell Get-Content F:\trading_ml\logs\trading_YYYYMMDD.log -Wait
+
+Check current params:
+  type F:\trading_ml\params\US30_params.json
+
+Stop training or live trading:
+  Ctrl+C  (always use this — never close the terminal directly)

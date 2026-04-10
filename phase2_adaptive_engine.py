@@ -23,7 +23,27 @@ Usage:
   5. After training, system enters live loop automatically
 """
 
-import os, time, json, logging, warnings
+import os, sys, time, json, logging, warnings
+
+# Suppress TensorFlow C++ startup noise before any TF import.
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")
+
+# sklearn emits this when its joblib-based predict_proba is called from a
+# non-sklearn parallel context (e.g. DEAP GA loop). Predictions work fine.
+warnings.filterwarnings(
+    "ignore",
+    message=".*sklearn.utils.parallel.delayed.*",
+    category=UserWarning,
+)
+
+# Force UTF-8 on the Windows console (default is cp1252 which cannot
+# encode Unicode box-drawing characters used in log separators).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -87,8 +107,17 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / f"trading_{datetime.now():%Y%m%d}.log"),
-        logging.StreamHandler(),
+        # encoding='utf-8' on FileHandler so log files are always UTF-8.
+        logging.FileHandler(
+            LOG_DIR / f"trading_{datetime.now():%Y%m%d}.log",
+            encoding="utf-8",
+        ),
+        # Open stdout (fd 1) with explicit UTF-8 + replace for console.
+        # This avoids cp1252 UnicodeEncodeError on Windows PowerShell
+        # regardless of system locale or sys.stdout.reconfigure timing.
+        logging.StreamHandler(
+            stream=open(1, mode="w", encoding="utf-8", errors="replace", closefd=False)
+        ),
     ],
 )
 log = logging.getLogger("adaptive_engine")
@@ -108,20 +137,34 @@ log = logging.getLogger("adaptive_engine")
 def _sym(key: str, default: str) -> str:
     return os.getenv(f"SYMBOL_{key}", default)
 
-INSTRUMENTS = {
-    # Indices
-    _sym("US30",  "US30"):  "index",
-    _sym("DE40",  "DE40"):  "index",
-    _sym("USTEC", "USTEC"): "index",
-    _sym("UK100", "UK100"): "index",
-    _sym("US500", "US500"): "index",
-    # Forex
-    _sym("EURUSD", "EURUSD"): "forex",
-    _sym("GBPUSD", "GBPUSD"): "forex",
-    _sym("GBPJPY", "GBPJPY"): "forex",
-    _sym("EURJPY", "EURJPY"): "forex",
-    _sym("USDCAD", "USDCAD"): "forex",
+# All supported instruments: canonical key → (broker symbol, asset type).
+# Broker symbol is resolved from .env SYMBOL_<KEY>=... at startup.
+# Canonical keys are fixed (US30, DE40 etc.) regardless of broker name.
+_ALL_INSTRUMENTS = {
+    "US30":   (_sym("US30",   "US30"),   "index"),
+    "DE40":   (_sym("DE40",   "DE40"),   "index"),
+    "USTEC":  (_sym("USTEC",  "USTEC"),  "index"),
+    "UK100":  (_sym("UK100",  "UK100"),  "index"),
+    "US500":  (_sym("US500",  "US500"),  "index"),
+    "EURUSD": (_sym("EURUSD", "EURUSD"), "forex"),
+    "GBPUSD": (_sym("GBPUSD", "GBPUSD"), "forex"),
+    "GBPJPY": (_sym("GBPJPY", "GBPJPY"), "forex"),
+    "EURJPY": (_sym("EURJPY", "EURJPY"), "forex"),
+    "USDCAD": (_sym("USDCAD", "USDCAD"), "forex"),
 }
+
+# ACTIVE_SYMBOLS in .env controls which instruments are trained and traded.
+# Format: ACTIVE_SYMBOLS=US30,DE40,EURUSD  (canonical keys, no spaces)
+# Empty or missing = ALL instruments active.
+# Add a symbol when you have quality tick data or MT5 history for it.
+_active = {s.strip().upper() for s in os.getenv("ACTIVE_SYMBOLS", "").split(",") if s.strip()}
+INSTRUMENTS = {
+    broker: atype
+    for key, (broker, atype) in _ALL_INSTRUMENTS.items()
+    if not _active or key in _active
+}
+log_tmp = logging.getLogger("adaptive_engine")
+log_tmp.info(f"Active instruments: {list(INSTRUMENTS.keys())}")
 
 # MT5 timeframe map
 TF_MAP = {
@@ -137,37 +180,49 @@ TF_MAP = {
 # ── Seed parameter space (ML discovers true values within these ranges) ──
 PARAM_SEEDS = {
     # Entry timeframe candidates (minutes) — ML picks best per instrument
-    "entry_tf_options":  [1, 3, 5, 10, 15],
+    # Includes 30m for wider exploration on slower-moving setups
+    "entry_tf_options":  [1, 3, 5, 10, 15, 30],
     "entry_tf_default":  5,
 
     # HTF confirmation candidates — includes 0 = NONE (ML may skip HTF)
-    "htf_options":       [0, 15, 30, 60],   # 0 = no HTF confirmation
+    # Added 240m (4H) for stronger trend confirmation on longer entries
+    "htf_options":       [0, 15, 30, 60, 240],
     "htf_default":       60,
 
-    # Stop loss ATR multiplier range
-    "sl_atr_min":        0.5,
-    "sl_atr_max":        3.0,
+    # Stop loss ATR multiplier — widened low end to allow tighter scalp SLs
+    # and high end to allow wide SLs for volatile instruments
+    "sl_atr_min":        0.3,
+    "sl_atr_max":        5.0,
     "sl_atr_seed":       1.5,
 
-    # Risk:Reward ratio range
-    "rr_min":            1.0,
-    "rr_max":            4.0,
+    # Risk:Reward ratio — widened to explore aggressive 1:5+ and breakeven 1:1
+    "rr_min":            0.8,
+    "rr_max":            6.0,
     "rr_seed":           2.0,
 
-    # Take profit multiplier of SL distance
-    "tp_mult_min":       1.0,
-    "tp_mult_max":       5.0,
+    # Take profit multiplier of SL distance — wider for runner strategies
+    "tp_mult_min":       0.5,
+    "tp_mult_max":       8.0,
     "tp_mult_seed":      2.0,
 
-    # Signal confidence threshold
+    # Signal confidence threshold — lowered floor to explore more active trading,
+    # raised ceiling to allow very selective high-conviction only strategies
     "confidence_min":    0.50,
-    "confidence_max":    0.85,
-    "confidence_seed":   0.60,
+    "confidence_max":    0.92,
+    "confidence_seed":   0.65,
 
-    # HTF alignment weight (0 = ignore HTF, 1 = require strong alignment)
+    # HTF alignment weight — full range, 0 = ignore HTF entirely
     "htf_weight_min":    0.0,
     "htf_weight_max":    1.0,
     "htf_weight_seed":   0.5,
+
+    # Break-even stop options:
+    #   0 = never move SL
+    #   1 = move SL to entry+1pt when price reaches +1R
+    #   2 = move SL to entry+1pt when price reaches +2R
+    #   3 = move SL to entry+1pt when price reaches +3R (trail on runners)
+    "be_r_options":      [0, 1, 2, 3],
+    "be_r_seed":         1,
 }
 
 # ── Hard risk limits — NEVER modified by ML ──
@@ -178,15 +233,16 @@ HARD_LIMITS = {
     "risk_per_trade_pct":   float(os.getenv("RISK_PER_TRADE_PCT",  "1.0")),
 }
 
-# Optuna optimisation budget
-OPTUNA_TRIALS       = 150   # increase for more thorough search
-OPTUNA_LIVE_TRIALS  = 30    # faster re-optimisation after live trades
+# Optuna optimisation budget — 500 trials per TF, 12-24h runtime expected
+OPTUNA_TRIALS       = 500
+OPTUNA_LIVE_TRIALS  = 50    # faster re-optimisation after live trades
 
 # LSTM sequence length (bars to look back)
 SEQ_LEN = 60
 
 # Minimum bars needed before training
 MIN_BARS = 500
+
 
 # Live trade log path
 TRADE_LOG = LOG_DIR / "trade_log.json"
@@ -196,9 +252,55 @@ TRADE_LOG = LOG_DIR / "trade_log.json"
 # ─────────────────────────────────────────────────────────────
 
 def connect_mt5() -> bool:
-    if not mt5.initialize():
-        log.error(f"MT5 init failed: {mt5.last_error()}")
+    mt5_path = os.getenv("MT5_PATH", "").strip()
+
+    if not mt5_path:
+        # MT5_PATH not set — refuse to connect. Auto-detect is disabled because
+        # it can silently connect to the wrong terminal (different account/broker).
+        log.error("MT5_PATH is not set in .env — cannot connect.")
+        log.error("  Set MT5_PATH to your terminal executable, e.g.:")
+        log.error("  MT5_PATH=C:\\Program Files\\MetaTrader 5 IC Markets Global\\terminal64.exe")
+        log.error("  To find the path: open your MT5 terminal → Help → About → copy install dir")
         return False
+
+    from pathlib import Path as _Path
+    mt5_path_norm = str(_Path(mt5_path))
+    log.info(f"MT5 connecting to: {mt5_path_norm}")
+
+    if not _Path(mt5_path_norm).exists():
+        log.error(f"MT5 executable not found: {mt5_path_norm}")
+        log.error("  Check MT5_PATH in .env — paste the exact path from Windows Explorer")
+        return False
+
+    if not mt5.initialize(path=mt5_path_norm):
+        err = mt5.last_error()
+        mt5.shutdown()
+        _MT5_ERRORS = {
+            -10003: "terminal is not running or still starting up — open it and wait ~10s",
+            -10004: "executable exists but MT5 rejected the path — check the exact folder name",
+            -6:     "terminal not logged in to broker — log in first",
+        }
+        log.error(f"MT5 connection FAILED (code {err[0]}): {err[1]}")
+        log.error(f"  Cause : {_MT5_ERRORS.get(err[0], 'unknown — check MT5 terminal manually')}")
+        log.error(f"  Path  : {mt5_path_norm}")
+        log.error("  Fix   : open that terminal, log in, enable AutoTrading, wait ~10s, re-run")
+        return False
+
+    ok = _mt5_login_and_log()
+    if ok:
+        info = mt5.terminal_info()
+        if info:
+            actual = str(_Path(info.path) / "terminal64.exe")
+            if actual.lower() != mt5_path_norm.lower():
+                log.warning("  Connected terminal path does not match MT5_PATH:")
+                log.warning(f"    Expected : {mt5_path_norm}")
+                log.warning(f"    Actual   : {actual}")
+                log.warning("  Another terminal may have answered — verify account details above")
+    return ok
+
+
+def _mt5_login_and_log() -> bool:
+    """After initialize() succeeds: login if credentials set, then log connection info."""
     login    = int(os.getenv("MT5_LOGIN", "0"))
     password = os.getenv("MT5_PASSWORD", "")
     server   = os.getenv("MT5_SERVER", "")
@@ -207,12 +309,18 @@ def connect_mt5() -> bool:
             log.error(f"MT5 login failed: {mt5.last_error()}")
             mt5.shutdown()
             return False
+
     info    = mt5.terminal_info()
     account = mt5.account_info()
     log.info(f"MT5 connected | Build {info.build}")
+    log.info(f"  Terminal path : {info.path}")
+    log.info(f"  Data path     : {info.data_path}")
+    log.info(f"  Connected     : {info.connected} | Trade allowed: {info.trade_allowed}")
     if account:
-        log.info(f"Account {account.login} | {account.server} | "
+        log.info(f"  Account {account.login} | {account.server} | "
                  f"Balance: {account.balance} {account.currency}")
+    else:
+        log.warning("  No account info — terminal may not be logged in yet")
     return True
 
 
@@ -451,6 +559,11 @@ def build_lstm(n_features: int, seq_len: int = SEQ_LEN) -> tf.keras.Model:
 
 def make_sequences(df: pd.DataFrame, feature_cols: list,
                    seq_len: int = SEQ_LEN):
+    """
+    Used ONLY for live inference on small tails (SEQ_LEN+2 rows).
+    DO NOT use for training — materialises the full 3D array.
+    For training use make_lstm_dataset() which streams batches from RAM.
+    """
     X, y = [], []
     arr    = df[feature_cols].values
     target = df["target"].values
@@ -460,23 +573,73 @@ def make_sequences(df: pd.DataFrame, feature_cols: list,
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
 
-def train_lstm(train_df, val_df, feature_cols, symbol, tf_min):
-    log.info(f"  Training LSTM: {symbol} {tf_min}m")
-    X_tr, y_tr = make_sequences(train_df, feature_cols)
-    X_va, y_va = make_sequences(val_df,   feature_cols)
-    if len(X_tr) < 100:
-        log.warning(f"  Insufficient sequences for {symbol} {tf_min}m LSTM")
+def make_lstm_dataset(df: pd.DataFrame, feature_cols: list,
+                      seq_len: int = SEQ_LEN,
+                      batch_size: int = 256,
+                      shuffle: bool = True) -> "tf.data.Dataset":
+    """
+    Memory-efficient LSTM training dataset via tf.data.
+    Stores the flat feature array once (~700 MB for 2.1M × 81 features)
+    and generates sequences on-demand per batch — never materialises the
+    full 3D sequence cube (which would be 27 GB for 1m data uncapped).
+
+    RAM usage: (N × F × 4) bytes flat array + (batch × seq_len × F × 4) per batch.
+    For 2.1M bars: ~700 MB flat + ~5 MB per batch = ~705 MB total.
+    Trains on ALL historical bars regardless of dataset size.
+    """
+    feat_t   = tf.constant(df[feature_cols].values.astype(np.float32))  # (N, F)
+    target_t = tf.constant(df["target"].values.astype(np.float32))       # (N,)
+    n = len(df)
+
+    if n <= seq_len:
         return None
+
+    # Dataset of valid end indices: range [seq_len, n)
+    # For index i: sequence = feat_t[i-seq_len:i], label = target_t[i]
+    idx_ds = tf.data.Dataset.range(seq_len, n)
+
+    if shuffle:
+        idx_ds = idx_ds.shuffle(
+            buffer_size=min(n, 200_000), seed=42, reshuffle_each_iteration=True
+        )
+
+    def fetch(i):
+        return feat_t[i - seq_len : i], target_t[i]
+
+    return (
+        idx_ds
+        .map(fetch, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+
+def train_lstm(train_df, val_df, feature_cols, symbol, tf_min):
+    n_tr = len(train_df)
+    log.info(f"  Training LSTM: {symbol} {tf_min}m | {n_tr:,} bars "
+             f"(streaming — no RAM cap)")
+
+    if n_tr <= SEQ_LEN + 100:
+        log.warning(f"  Insufficient data for {symbol} {tf_min}m LSTM — skipping")
+        return None
+
+    ds_tr = make_lstm_dataset(train_df, feature_cols, shuffle=True)
+    ds_va = make_lstm_dataset(val_df,   feature_cols, shuffle=False)
+
+    if ds_tr is None or ds_va is None:
+        return None
+
     model = build_lstm(len(feature_cols))
-    cbs = [
-        EarlyStopping(patience=8, restore_best_weights=True, verbose=0),
-        ReduceLROnPlateau(patience=4, factor=0.5, verbose=0),
-    ]
-    model.fit(X_tr, y_tr, validation_data=(X_va, y_va),
-              epochs=100, batch_size=64, callbacks=cbs, verbose=0)
+    es = EarlyStopping(patience=8, restore_best_weights=True, verbose=0)
+    cbs = [es, ReduceLROnPlateau(patience=4, factor=0.5, verbose=0)]
+    # batch_size is baked into the dataset — do not pass it here
+    hist = model.fit(ds_tr, validation_data=ds_va,
+                     epochs=100, callbacks=cbs, verbose=0)
+    epochs_run = len(hist.history["loss"])
+    best_val   = min(hist.history.get("val_loss", [float("nan")]))
     path = MODEL_DIR / f"lstm_{symbol}_{tf_min}m.keras"
     model.save(path)
-    log.info(f"  LSTM saved: {path}")
+    log.info(f"  LSTM done: {epochs_run} epochs | best val_loss={best_val:.4f} | saved {path.name}")
     return model
 
 
@@ -505,11 +668,17 @@ def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
     )
     rf_model.fit(X_tr, y_tr)
 
+    xgb_val_acc = (xgb_model.predict(X_va) == y_va).mean()
+    rf_val_acc  = (rf_model.predict(X_va)  == y_va).mean()
+
     path_xgb = MODEL_DIR / f"xgb_{symbol}_{tf_min}m.pkl"
     path_rf  = MODEL_DIR / f"rf_{symbol}_{tf_min}m.pkl"
     joblib.dump(xgb_model, path_xgb)
     joblib.dump(rf_model,  path_rf)
-    log.info(f"  Ensemble saved: {path_xgb.name}, {path_rf.name}")
+    log.info(
+        f"  XGB val_acc={xgb_val_acc:.3f} | RF val_acc={rf_val_acc:.3f} | "
+        f"saved {path_xgb.name}, {path_rf.name}"
+    )
     return xgb_model, rf_model
 
 
@@ -527,18 +696,25 @@ class TradingEnv(gym.Env):
     """
     metadata = {"render_modes": []}
 
+    # RL uses a single-bar observation — indicators already encode history
+    # (EMA, RSI, ATR, CVD etc. are rolling features). A 60-bar flat obs
+    # produces 8760-dim input → 64-unit MLP → gradient explosion.
+    RL_OBS_BARS   = 1
+    MAX_EP_STEPS  = 5_000  # cap episode length — prevents GAE divergence over 400k-bar single episode
+
     def __init__(self, df: pd.DataFrame, feature_cols: list,
-                 sl_atr_mult: float = 1.5, rr: float = 2.0):
+                 sl_atr_mult: float = 1.5, rr: float = 2.0, be_r: int = 0):
         super().__init__()
         self.df           = df.reset_index(drop=True)
         self.feature_cols = feature_cols
         self.sl_mult      = sl_atr_mult
         self.rr           = rr
+        self.be_r         = be_r   # 0=off, 1=move BE at 1R, 2=move BE at 2R
         self.n_features   = len(feature_cols)
 
         self.observation_space = spaces.Box(
             low=-10, high=10,
-            shape=(SEQ_LEN * self.n_features,),
+            shape=(self.RL_OBS_BARS * self.n_features,),
             dtype=np.float32,
         )
         self.action_space = spaces.Discrete(3)  # 0=hold, 1=long, 2=short
@@ -546,15 +722,21 @@ class TradingEnv(gym.Env):
         self.reset()
 
     def _obs(self):
-        start = max(0, self.idx - SEQ_LEN)
-        block = self.df[self.feature_cols].iloc[start:self.idx].values
-        if len(block) < SEQ_LEN:
-            block = np.pad(block, ((SEQ_LEN - len(block), 0), (0, 0)))
-        return block.flatten().astype(np.float32)
+        # Single-bar observation: just the current bar's features.
+        # Indicators (EMA, RSI, ATR, CVD slopes etc.) already encode history,
+        # so the RL agent gets full market context without a multi-bar sequence.
+        # This keeps obs_dim = n_features (~146) instead of SEQ_LEN*n_features
+        # (~8760), preventing gradient explosion in the MLP policy.
+        row = self.df[self.feature_cols].iloc[self.idx].values.astype(np.float32)
+        np.nan_to_num(row, nan=0.0, posinf=10.0, neginf=-10.0, copy=False)
+        return np.clip(row, -10.0, 10.0)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.idx        = SEQ_LEN
+        # Randomise start position so each episode covers a different market regime
+        max_start = max(SEQ_LEN + 1, len(self.df) - self.MAX_EP_STEPS - 1)
+        self.idx        = int(np.random.randint(SEQ_LEN, max_start)) if max_start > SEQ_LEN else SEQ_LEN
+        self.ep_steps   = 0
         self.balance    = 10000.0
         self.peak       = 10000.0
         self.daily_pnl  = 0.0
@@ -564,19 +746,29 @@ class TradingEnv(gym.Env):
     def step(self, action):
         row  = self.df.iloc[self.idx]
         atr  = row.get("atr14", row["Close"] * 0.001)
-        done = self.idx >= len(self.df) - 2
+        self.ep_steps += 1
+        done = (self.idx >= len(self.df) - 2) or (self.ep_steps >= self.MAX_EP_STEPS)
         reward = 0.0
 
         # Close open trade if target/stop hit
         if self.open_trade:
-            t    = self.open_trade
-            pnl  = 0.0
-            hit  = False
-            if t["dir"] == 1:   # long
-                if row["Low"]  <= t["sl"]: pnl = -t["risk"]; hit = True
+            t = self.open_trade
+
+            # Break-even: move SL to entry+1pt once price reaches be_r * sl_dist
+            if self.be_r > 0 and not t.get("be_done", False):
+                be_trigger = t["entry"] + t["dir"] * t["sl_dist"] * self.be_r
+                if (t["dir"] == 1 and row["High"] >= be_trigger) or \
+                   (t["dir"] == -1 and row["Low"]  <= be_trigger):
+                    t["sl"]      = t["entry"] + t["dir"] * 1.0  # 1 US30 pt in profit
+                    t["be_done"] = True
+
+            pnl = 0.0
+            hit = False
+            if t["dir"] == 1:
+                if row["Low"]  <= t["sl"]: pnl = (t["sl"] - t["entry"]) / (t["sl_dist"] + 1e-10) * t["risk"]; hit = True
                 if row["High"] >= t["tp"]: pnl =  t["risk"] * self.rr; hit = True
-            else:                # short
-                if row["High"] >= t["sl"]: pnl = -t["risk"]; hit = True
+            else:
+                if row["High"] >= t["sl"]: pnl = (t["entry"] - t["sl"]) / (t["sl_dist"] + 1e-10) * t["risk"]; hit = True
                 if row["Low"]  <= t["tp"]: pnl =  t["risk"] * self.rr; hit = True
             if hit:
                 self.balance   += pnl
@@ -590,15 +782,20 @@ class TradingEnv(gym.Env):
         dd = (self.peak - self.balance) / (self.peak + 1e-10)
         reward -= dd * 2.0
 
+        # Clip reward to prevent exploding gradients in PPO
+        reward = float(np.clip(reward, -10.0, 10.0))
+
         # Open new trade
         if action != 0 and self.open_trade is None:
-            risk = self.balance * HARD_LIMITS["risk_per_trade_pct"] / 100
-            sl_dist = atr * self.sl_mult
+            # Keep balance floor at 1.0 so risk never goes zero/negative
+            risk = max(self.balance, 1.0) * HARD_LIMITS["risk_per_trade_pct"] / 100
+            sl_dist = max(atr * self.sl_mult, 1e-6)
             direction = 1 if action == 1 else -1
             sl = row["Close"] - direction * sl_dist
             tp = row["Close"] + direction * sl_dist * self.rr
             self.open_trade = {
-                "dir": direction, "sl": sl, "tp": tp, "risk": risk
+                "dir": direction, "sl": sl, "tp": tp, "risk": risk,
+                "entry": row["Close"], "sl_dist": sl_dist, "be_done": False,
             }
 
         # Hard limit: max drawdown terminates episode
@@ -610,35 +807,176 @@ class TradingEnv(gym.Env):
         return self._obs(), reward, done, False, {}
 
 
+def _rl_check_data(df_clean: pd.DataFrame, feature_cols: list) -> list:
+    """
+    Diagnose data quality issues before building the RL env.
+    Returns a cleaned list of feature_cols with constant/all-NaN columns removed.
+    Logs detailed stats so the root cause of any NaN logits is clear.
+    """
+    feat_df = df_clean[feature_cols]
+
+    # Count NaN per column after cleaning
+    nan_counts = feat_df.isnull().sum()
+    nan_cols   = nan_counts[nan_counts > 0]
+    if len(nan_cols) > 0:
+        log.warning(f"  [RL diag] {len(nan_cols)} columns still have NaN after cleaning:")
+        for col, cnt in nan_cols.items():
+            log.warning(f"    {col}: {cnt} NaN ({cnt/len(feat_df)*100:.1f}%)")
+    else:
+        log.info(f"  [RL diag] No NaN in any feature column after cleaning")
+
+    # Count inf per column
+    inf_counts = np.isinf(feat_df.values).sum(axis=0)
+    inf_cols   = [(feature_cols[i], inf_counts[i])
+                  for i in range(len(feature_cols)) if inf_counts[i] > 0]
+    if inf_cols:
+        log.warning(f"  [RL diag] {len(inf_cols)} columns have inf values:")
+        for col, cnt in inf_cols:
+            log.warning(f"    {col}: {cnt} inf")
+    else:
+        log.info(f"  [RL diag] No inf in any feature column after cleaning")
+
+    # Constant columns (std=0) cause 0/0 in some activations → NaN logits
+    stds     = feat_df.std()
+    zero_std = stds[stds == 0].index.tolist()
+    if zero_std:
+        log.warning(f"  [RL diag] {len(zero_std)} constant columns (std=0) — removing from obs:")
+        for col in zero_std[:10]:
+            log.warning(f"    {col} = {feat_df[col].iloc[0]:.4f} (all same value)")
+        if len(zero_std) > 10:
+            log.warning(f"    ... and {len(zero_std)-10} more")
+
+    # Overall obs stats
+    arr = feat_df.values
+    log.info(f"  [RL diag] Obs matrix {arr.shape}: "
+             f"mean={np.nanmean(arr):.4f} std={np.nanstd(arr):.4f} "
+             f"min={np.nanmin(arr):.4f} max={np.nanmax(arr):.4f}")
+    total_nan = np.isnan(arr).sum()
+    total_inf = np.isinf(arr).sum()
+    log.info(f"  [RL diag] Total NaN: {total_nan}  Total inf: {total_inf}")
+
+    # Return feature_cols with constant columns removed
+    clean_cols = [c for c in feature_cols if c not in zero_std]
+    if len(clean_cols) < len(feature_cols):
+        log.info(f"  [RL diag] Features reduced: {len(feature_cols)} → {len(clean_cols)} "
+                 f"(removed {len(feature_cols)-len(clean_cols)} constant cols)")
+    return clean_cols
+
+
+def _rl_model_is_healthy(model, env) -> bool:
+    """
+    Run one forward pass on a zero observation.
+    Returns False if the policy produces NaN logits (diverged weights).
+    This detects corrupted saved models before wasting time on continued training.
+    """
+    try:
+        obs_dim  = env.observation_space.shape[0]
+        test_obs = np.zeros((1, obs_dim), dtype=np.float32)
+        action, _ = model.predict(test_obs, deterministic=True)
+        # Also check policy logits directly
+        import torch
+        obs_t  = torch.FloatTensor(test_obs)
+        with torch.no_grad():
+            dist = model.policy.get_distribution(obs_t)
+            logits = dist.distribution.logits
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                log.warning(f"  [RL diag] Saved model has NaN/inf logits on zero obs "
+                            f"— weights are diverged, will retrain from scratch")
+                return False
+        log.info(f"  [RL diag] Saved model sanity check passed (logits finite)")
+        return True
+    except Exception as e:
+        log.warning(f"  [RL diag] Model health check failed: {e} — retraining from scratch")
+        return False
+
+
 def train_rl_agent(df: pd.DataFrame, feature_cols: list,
                    symbol: str, sl_mult: float, rr: float):
     log.info(f"  Training RL agent: {symbol}")
 
+    # ── Step 1: clean data ───────────────────────────────────────────
+    df_clean = df.copy()
+    df_clean[feature_cols] = (
+        df_clean[feature_cols]
+        .fillna(0.0)
+        .replace([np.inf, -np.inf], [10.0, -10.0])
+        .clip(-10.0, 10.0)
+    )
+    df_clean = df_clean.dropna(subset=feature_cols).reset_index(drop=True)
+    log.info(f"  RL env: {len(df_clean):,} clean bars  "
+             f"| {len(feature_cols)} raw features")
+
+    # ── Step 2: diagnose + remove constant columns ───────────────────
+    feature_cols = _rl_check_data(df_clean, feature_cols)
+    if len(feature_cols) == 0:
+        log.error("  [RL] No usable features after cleaning — skipping PPO")
+        return None
+
     def make_env():
-        return TradingEnv(df, feature_cols, sl_mult, rr)
+        return TradingEnv(df_clean, feature_cols, sl_mult, rr)
 
     env  = DummyVecEnv([make_env])
     path = str(MODEL_DIR / f"ppo_{symbol}")
+    ppo_zip = Path(path + ".zip")
 
-    if Path(path + ".zip").exists():
-        model = PPO.load(path, env=env)
-        model.set_env(env)
-        model.learn(total_timesteps=50_000, reset_num_timesteps=False)
-    else:
-        model = PPO("MlpPolicy", env, verbose=0,
-                    learning_rate=3e-4, n_steps=2048, batch_size=64,
-                    n_epochs=10, gamma=0.99, clip_range=0.2)
-        model.learn(total_timesteps=200_000)
+    try:
+        # ── Step 3: load or create model ────────────────────────────
+        retrain_fresh = True
+        if ppo_zip.exists():
+            log.info(f"  [RL] Loading existing model: {ppo_zip.name}")
+            try:
+                model = PPO.load(path, env=env)
+                model.set_env(env)
+                if _rl_model_is_healthy(model, env):
+                    retrain_fresh = False
+                    log.info(f"  [RL] Continuing training from saved model (50k steps)")
+                    model.learn(total_timesteps=50_000, reset_num_timesteps=False)
+                else:
+                    # Saved weights are NaN — delete and start fresh
+                    log.warning(f"  [RL] Deleting corrupted model, retraining from scratch")
+                    ppo_zip.unlink()
+                    retrain_fresh = True
+            except Exception as load_err:
+                log.warning(f"  [RL] Load failed ({load_err}) — retraining from scratch")
+                retrain_fresh = True
 
-    model.save(path)
-    log.info(f"  RL agent saved: {path}.zip")
-    return model
+        if retrain_fresh:
+            obs_dim = env.observation_space.shape[0]
+            log.info(f"  [RL] Training from scratch | obs_dim={obs_dim} "
+                     f"({len(feature_cols)} features × {TradingEnv.RL_OBS_BARS} bar) | 200k steps")
+            model = PPO("MlpPolicy", env, verbose=0,
+                        learning_rate=3e-5,
+                        n_steps=2048, batch_size=64,
+                        n_epochs=5,
+                        gamma=0.99, clip_range=0.15,
+                        max_grad_norm=0.3,
+                        target_kl=0.01,
+                        policy_kwargs={"net_arch": [32, 32]},
+                        ent_coef=0.005)
+            model.learn(total_timesteps=200_000)
+
+        # ── Step 4: final health check before saving ─────────────────
+        if not _rl_model_is_healthy(model, env):
+            log.warning(f"  [RL] Training produced NaN weights — discarding, not saving")
+            log.warning(f"  [RL] Root cause: likely extreme feature values or reward spikes")
+            log.warning(f"  [RL] Obs stats logged above — check [RL diag] lines")
+            return None
+
+        model.save(path)
+        log.info(f"  [RL] Agent saved: {path}.zip")
+        return model
+
+    except Exception as e:
+        log.warning(f"  [RL] Training failed: {e}")
+        log.warning(f"  [RL] Check [RL diag] lines above for root cause")
+        log.warning(f"  [RL] Skipping PPO — GA/Optuna will continue")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────
 # 9. GENETIC ALGORITHM — PARAMETER OPTIMISATION
 # ─────────────────────────────────────────────────────────────
-# Genome: [entry_tf_idx, htf_idx, sl_atr, rr, tp_mult, confidence_thresh, htf_weight]
+# Genome: [entry_tf_idx, htf_idx, sl_atr, rr, tp_mult, confidence_thresh, htf_weight, be_r_idx]
 
 GA_BOUNDS = [
     (0, len(PARAM_SEEDS["entry_tf_options"]) - 1),   # entry TF index
@@ -648,24 +986,38 @@ GA_BOUNDS = [
     (PARAM_SEEDS["tp_mult_min"],   PARAM_SEEDS["tp_mult_max"]),
     (PARAM_SEEDS["confidence_min"],PARAM_SEEDS["confidence_max"]),
     (PARAM_SEEDS["htf_weight_min"],PARAM_SEEDS["htf_weight_max"]),
+    (0, len(PARAM_SEEDS["be_r_options"]) - 1),        # BE trigger index (0/1/2R)
 ]
 
 def decode_genome(genome: list) -> dict:
+    # Clamp ALL list indices to valid range before lookup.
+    # GA mutation (Gaussian) can push indices outside bounds — unclamped
+    # int(round()) then causes IndexError on the options lists.
+    n_tf  = len(PARAM_SEEDS["entry_tf_options"])
+    n_htf = len(PARAM_SEEDS["htf_options"])
+    n_be  = len(PARAM_SEEDS["be_r_options"])
+
+    tf_idx  = int(np.clip(round(float(genome[0])), 0, n_tf  - 1))
+    htf_idx = int(np.clip(round(float(genome[1])), 0, n_htf - 1))
+    be_idx  = int(np.clip(round(float(genome[7])), 0, n_be  - 1))
+
     return {
-        "entry_tf":   PARAM_SEEDS["entry_tf_options"][int(round(genome[0]))],
-        "htf_tf":     PARAM_SEEDS["htf_options"][int(round(genome[1]))],
+        "entry_tf":   PARAM_SEEDS["entry_tf_options"][tf_idx],
+        "htf_tf":     PARAM_SEEDS["htf_options"][htf_idx],
         "sl_atr":     float(np.clip(genome[2], GA_BOUNDS[2][0], GA_BOUNDS[2][1])),
         "rr":         float(np.clip(genome[3], GA_BOUNDS[3][0], GA_BOUNDS[3][1])),
         "tp_mult":    float(np.clip(genome[4], GA_BOUNDS[4][0], GA_BOUNDS[4][1])),
         "confidence": float(np.clip(genome[5], GA_BOUNDS[5][0], GA_BOUNDS[5][1])),
         "htf_weight": float(np.clip(genome[6], GA_BOUNDS[6][0], GA_BOUNDS[6][1])),
+        "be_r":       PARAM_SEEDS["be_r_options"][be_idx],
     }
 
 
-def ga_fitness(genome, df_dict: dict, models: dict, scaler, feature_cols):
+def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, symbol: str):
     """
     Evaluate genome fitness via quick backtest on validation data.
     Returns (sharpe_ratio,) — DEAP expects a tuple.
+    Each genome picks its own entry_tf; we look up the matching scaler/models.
     """
     params = decode_genome(genome)
     entry_tf = params["entry_tf"]
@@ -673,8 +1025,23 @@ def ga_fitness(genome, df_dict: dict, models: dict, scaler, feature_cols):
     if entry_tf not in df_dict:
         return (-999.0,)
 
-    df = df_dict[entry_tf]
-    if len(df) < MIN_BARS:
+    df_full = df_dict[entry_tf]
+    if len(df_full) < MIN_BARS:
+        return (-999.0,)
+
+    # Use only the out-of-sample test set (last 15%) to prevent overfitting
+    # to the training data that the models were already trained on
+    n_full = len(df_full)
+    df = df_full.iloc[int(n_full * 0.85):]
+    if len(df) < 50:
+        return (-999.0,)
+
+    # Look up per-TF scaler and models
+    key          = f"{symbol}_{entry_tf}m"
+    scaler       = scalers_by_tf.get(key)
+    feature_cols = get_feature_cols(df)
+
+    if scaler is None:
         return (-999.0,)
 
     # Quick vectorised backtest
@@ -684,9 +1051,9 @@ def ga_fitness(genome, df_dict: dict, models: dict, scaler, feature_cols):
     atr    = df["atr14"].values
     closes = df["Close"].values
 
-    # Get ensemble signal
-    xgb_m = models.get("xgb")
-    rf_m  = models.get("rf")
+    # Get per-TF ensemble models
+    xgb_m = models_by_tf.get(f"xgb_{key}")
+    rf_m  = models_by_tf.get(f"rf_{key}")
     if xgb_m is None or rf_m is None:
         return (-999.0,)
 
@@ -694,14 +1061,14 @@ def ga_fitness(genome, df_dict: dict, models: dict, scaler, feature_cols):
     p_rf  = rf_m.predict_proba(feat)[:, 1]
     signal_prob = (p_xgb + p_rf) / 2.0
 
-    # Simulate trades
-    balance  = 10000.0
-    peak     = 10000.0
-    returns  = []
-    in_trade = False
+    # Simulate trades (one at a time — skip bars inside open trade's scan window)
+    balance    = 10000.0
+    peak       = 10000.0
+    returns    = []
+    skip_until = -1   # bar index to skip to after a trade entry
 
     for i in range(SEQ_LEN, len(df) - 1):
-        if in_trade:
+        if i <= skip_until:
             continue
 
         prob = signal_prob[i]
@@ -715,25 +1082,39 @@ def ga_fitness(genome, df_dict: dict, models: dict, scaler, feature_cols):
             continue
 
         sl_dist = atr[i] * params["sl_atr"]
-        if sl_dist == 0:
+        if sl_dist <= 0 or np.isnan(sl_dist):
             continue
 
-        entry = closes[i]
-        sl    = entry - direction * sl_dist
-        tp    = entry + direction * sl_dist * params["rr"]
-        risk  = balance * HARD_LIMITS["risk_per_trade_pct"] / 100
+        entry   = closes[i]
+        sl      = entry - direction * sl_dist
+        tp      = entry + direction * sl_dist * params["rr"]
+        risk    = max(balance, 1.0) * HARD_LIMITS["risk_per_trade_pct"] / 100
+        be_r    = params.get("be_r", 0)
+        be_trigger = entry + direction * sl_dist * be_r if be_r > 0 else None
+        be_stop    = entry + direction * 1.0 if be_r > 0 else None
+        be_done    = False
 
-        # Check next bar for hit
-        next_high = df["High"].iloc[i + 1]
-        next_low  = df["Low"].iloc[i + 1]
+        # Scan forward bars until TP/SL hit (up to 50 bars)
+        pnl        = 0.0
+        exit_bar   = i + 50   # default: skip 50 bars if trade never closes
+        for j in range(i + 1, min(i + 51, len(df) - 1)):
+            bar_high = df["High"].iloc[j]
+            bar_low  = df["Low"].iloc[j]
 
-        pnl = 0.0
-        if direction == 1:
-            if next_low  <= sl: pnl = -risk
-            elif next_high >= tp: pnl = risk * params["rr"]
-        else:
-            if next_high >= sl: pnl = -risk
-            elif next_low  <= tp: pnl = risk * params["rr"]
+            if be_trigger is not None and not be_done:
+                if direction == 1 and bar_high >= be_trigger:
+                    sl = be_stop; be_done = True
+                elif direction == -1 and bar_low <= be_trigger:
+                    sl = be_stop; be_done = True
+
+            if direction == 1:
+                if bar_low  <= sl: pnl = (sl - entry) / sl_dist * risk; exit_bar = j; break
+                if bar_high >= tp: pnl = risk * params["rr"];            exit_bar = j; break
+            else:
+                if bar_high >= sl: pnl = (entry - sl) / sl_dist * risk; exit_bar = j; break
+                if bar_low  <= tp: pnl = risk * params["rr"];            exit_bar = j; break
+
+        skip_until = exit_bar   # block next entry until this trade closes
 
         if pnl != 0:
             balance += pnl
@@ -749,12 +1130,20 @@ def ga_fitness(genome, df_dict: dict, models: dict, scaler, feature_cols):
 
     r_arr  = np.array(returns)
     sharpe = r_arr.mean() / (r_arr.std() + 1e-10) * np.sqrt(252)
+    if not np.isfinite(sharpe):
+        return (-999.0,)
     return (sharpe,)
 
 
-def run_genetic_algo(df_dict: dict, models: dict,
-                     scaler, feature_cols: list,
-                     n_gen=40, pop_size=80) -> dict:
+def run_genetic_algo(df_dict: dict, models_by_tf: dict,
+                     scalers_by_tf: dict, symbol: str,
+                     n_gen=80, pop_size=150) -> dict:
+    """
+    GA with wider exploration budget:
+      pop_size=150, n_gen=80 → 12,000 evaluations (was 3,200)
+      Higher mutation sigma=0.3 to jump across the wider param bounds
+      Tournament size=7 for stronger selection pressure
+    """
     log.info("  Running genetic algorithm parameter search...")
 
     # Avoid duplicate creator classes on re-run
@@ -773,11 +1162,11 @@ def run_genetic_algo(df_dict: dict, models: dict,
                      lambda: [rand_gene(i) for i in range(len(GA_BOUNDS))])
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
     toolbox.register("evaluate", ga_fitness,
-                     df_dict=df_dict, models=models,
-                     scaler=scaler, feature_cols=feature_cols)
-    toolbox.register("mate",    tools.cxBlend, alpha=0.3)
-    toolbox.register("mutate",  tools.mutGaussian, mu=0, sigma=0.2, indpb=0.3)
-    toolbox.register("select",  tools.selTournament, tournsize=5)
+                     df_dict=df_dict, models_by_tf=models_by_tf,
+                     scalers_by_tf=scalers_by_tf, symbol=symbol)
+    toolbox.register("mate",    tools.cxBlend, alpha=0.4)
+    toolbox.register("mutate",  tools.mutGaussian, mu=0, sigma=0.3, indpb=0.25)
+    toolbox.register("select",  tools.selTournament, tournsize=7)
 
     pop  = toolbox.population(n=pop_size)
     hof  = tools.HallOfFame(1)
@@ -786,7 +1175,7 @@ def run_genetic_algo(df_dict: dict, models: dict,
     stats.register("avg", np.mean)
 
     algorithms.eaSimple(pop, toolbox,
-                        cxpb=0.6, mutpb=0.3,
+                        cxpb=0.65, mutpb=0.35,
                         ngen=n_gen, stats=stats,
                         halloffame=hof, verbose=False)
 
@@ -799,8 +1188,8 @@ def run_genetic_algo(df_dict: dict, models: dict,
 # 10. OPTUNA BAYESIAN OPTIMISATION
 # ─────────────────────────────────────────────────────────────
 
-def run_optuna(df_dict: dict, models: dict,
-               scaler, feature_cols: list,
+def run_optuna(df_dict: dict, models_by_tf: dict,
+               scalers_by_tf: dict,
                n_trials: int = OPTUNA_TRIALS,
                symbol: str = "") -> dict:
     log.info(f"  Running Optuna ({n_trials} trials): {symbol}")
@@ -816,35 +1205,49 @@ def run_optuna(df_dict: dict, models: dict,
             trial.suggest_float("tp_mult",    *GA_BOUNDS[4]),
             trial.suggest_float("confidence", *GA_BOUNDS[5]),
             trial.suggest_float("htf_weight", *GA_BOUNDS[6]),
+            trial.suggest_int("be_r_idx", 0,
+                              len(PARAM_SEEDS["be_r_options"]) - 1),
         ]
-        result = ga_fitness(genome, df_dict, models, scaler, feature_cols)
+        result = ga_fitness(genome, df_dict, models_by_tf, scalers_by_tf, symbol)
         return result[0]
 
     study = optuna.create_study(
         direction="maximize",
-        sampler=TPESampler(seed=42),
+        sampler=TPESampler(seed=42, n_startup_trials=40),
         study_name=f"opt_{symbol}",
     )
 
-    # Warm-start with seed values
-    seed_genome = [
-        PARAM_SEEDS["entry_tf_options"].index(PARAM_SEEDS["entry_tf_default"]),
-        PARAM_SEEDS["htf_options"].index(PARAM_SEEDS["htf_default"]),
-        PARAM_SEEDS["sl_atr_seed"],
-        PARAM_SEEDS["rr_seed"],
-        PARAM_SEEDS["tp_mult_seed"],
-        PARAM_SEEDS["confidence_seed"],
-        PARAM_SEEDS["htf_weight_seed"],
+    # Multiple warm-start seeds to avoid local optima — covers conservative,
+    # aggressive, and scalp-style starting points across the wider bounds
+    _warm_starts = [
+        # Conservative: wide SL, modest RR, high confidence
+        {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(5),
+         "htf_idx": PARAM_SEEDS["htf_options"].index(60),
+         "sl_atr": 1.5, "rr": 2.0, "tp_mult": 2.0,
+         "confidence": 0.65, "htf_weight": 0.6, "be_r_idx": 1},
+        # Aggressive: tight SL, high RR, lower confidence
+        {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(3),
+         "htf_idx": PARAM_SEEDS["htf_options"].index(30),
+         "sl_atr": 0.6, "rr": 4.0, "tp_mult": 4.0,
+         "confidence": 0.55, "htf_weight": 0.4, "be_r_idx": 2},
+        # Scalp: very tight SL, 1:1 RR, very high confidence
+        {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(1),
+         "htf_idx": PARAM_SEEDS["htf_options"].index(15),
+         "sl_atr": 0.4, "rr": 1.0, "tp_mult": 1.0,
+         "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
+        # Runner: wide SL, very high RR, no HTF
+        {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(5),
+         "htf_idx": PARAM_SEEDS["htf_options"].index(0),
+         "sl_atr": 2.5, "rr": 5.0, "tp_mult": 6.0,
+         "confidence": 0.70, "htf_weight": 0.0, "be_r_idx": 3},
+        # Swing: 15m entry, 4H HTF, medium params
+        {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(15),
+         "htf_idx": PARAM_SEEDS["htf_options"].index(240),
+         "sl_atr": 2.0, "rr": 3.0, "tp_mult": 3.0,
+         "confidence": 0.72, "htf_weight": 0.7, "be_r_idx": 2},
     ]
-    study.enqueue_trial({
-        "entry_tf_idx": seed_genome[0],
-        "htf_idx":      seed_genome[1],
-        "sl_atr":       seed_genome[2],
-        "rr":           seed_genome[3],
-        "tp_mult":      seed_genome[4],
-        "confidence":   seed_genome[5],
-        "htf_weight":   seed_genome[6],
-    })
+    for ws in _warm_starts:
+        study.enqueue_trial(ws)
 
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
@@ -857,10 +1260,124 @@ def run_optuna(df_dict: dict, models: dict,
         "tp_mult":    best["tp_mult"],
         "confidence": best["confidence"],
         "htf_weight": best["htf_weight"],
+        "be_r":       PARAM_SEEDS["be_r_options"][best["be_r_idx"]],
         "best_score": study.best_value,
     }
     log.info(f"  Optuna best: {result}")
     return result
+
+
+# ─────────────────────────────────────────────────────────────
+# 10b. PER-TF OPTIMIZATION — locks entry_tf, returns top-N trials
+# ─────────────────────────────────────────────────────────────
+
+def run_per_tf_optimization(
+    df_dict: dict,
+    models_by_tf: dict,
+    scalers_by_tf: dict,
+    symbol: str,
+    locked_tf: int,
+    n_trials: int = 150,
+    top_n: int = 5,
+) -> list[dict]:
+    """
+    Run Optuna with entry_tf locked to locked_tf.
+    Returns list of top_n trial dicts sorted by Sharpe (best first).
+    Each dict has: params (decoded), sharpe, number.
+
+    Used to build the per-TF top-5 strategy table.
+    """
+    if locked_tf not in df_dict:
+        log.warning(f"  {symbol} {locked_tf}m: not in df_dict — skipping per-TF opt")
+        return []
+
+    key = f"{symbol}_{locked_tf}m"
+    if not scalers_by_tf.get(key):
+        log.warning(f"  {symbol} {locked_tf}m: no scaler — skipping per-TF opt")
+        return []
+
+    tf_idx = PARAM_SEEDS["entry_tf_options"].index(locked_tf) \
+        if locked_tf in PARAM_SEEDS["entry_tf_options"] else 0
+
+    log.info(f"  Per-TF Optuna: {symbol} {locked_tf}m ({n_trials} trials)")
+
+    all_trials = []
+
+    def objective(trial):
+        genome = [
+            tf_idx,   # locked — not suggested by Optuna
+            trial.suggest_int("htf_idx", 0, len(PARAM_SEEDS["htf_options"]) - 1),
+            trial.suggest_float("sl_atr",     *GA_BOUNDS[2]),
+            trial.suggest_float("rr",         *GA_BOUNDS[3]),
+            trial.suggest_float("tp_mult",    *GA_BOUNDS[4]),
+            trial.suggest_float("confidence", *GA_BOUNDS[5]),
+            trial.suggest_float("htf_weight", *GA_BOUNDS[6]),
+            trial.suggest_int("be_r_idx", 0, len(PARAM_SEEDS["be_r_options"]) - 1),
+        ]
+        result = ga_fitness(genome, df_dict, models_by_tf, scalers_by_tf, symbol)
+        return result[0]
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=TPESampler(seed=42, n_startup_trials=30),
+        study_name=f"per_tf_{symbol}_{locked_tf}m",
+    )
+
+    # Multiple warm starts per TF — avoids local optima in the wider search space.
+    # Each seed represents a different trading style to explore.
+    _per_tf_warm_starts = [
+        # Default seed
+        {"htf_idx": PARAM_SEEDS["htf_options"].index(60),
+         "sl_atr": 1.5, "rr": 2.0, "tp_mult": 2.0,
+         "confidence": 0.65, "htf_weight": 0.5, "be_r_idx": 1},
+        # Tight scalp
+        {"htf_idx": PARAM_SEEDS["htf_options"].index(15),
+         "sl_atr": 0.4, "rr": 1.0, "tp_mult": 1.0,
+         "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
+        # Wide swing
+        {"htf_idx": PARAM_SEEDS["htf_options"].index(240),
+         "sl_atr": 3.0, "rr": 4.0, "tp_mult": 5.0,
+         "confidence": 0.70, "htf_weight": 0.8, "be_r_idx": 2},
+        # No HTF — pure entry signal
+        {"htf_idx": PARAM_SEEDS["htf_options"].index(0),
+         "sl_atr": 1.0, "rr": 3.0, "tp_mult": 3.0,
+         "confidence": 0.60, "htf_weight": 0.0, "be_r_idx": 3},
+        # High conviction runner
+        {"htf_idx": PARAM_SEEDS["htf_options"].index(30),
+         "sl_atr": 2.0, "rr": 5.0, "tp_mult": 7.0,
+         "confidence": 0.85, "htf_weight": 0.6, "be_r_idx": 2},
+    ]
+    for ws in _per_tf_warm_starts:
+        study.enqueue_trial(ws)
+
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    # Collect all completed trials
+    for t in study.trials:
+        if t.value is None or t.value <= -900:
+            continue
+        params = {
+            "entry_tf":   locked_tf,
+            "htf_tf":     PARAM_SEEDS["htf_options"][t.params.get("htf_idx", 0)],
+            "sl_atr":     t.params.get("sl_atr", PARAM_SEEDS["sl_atr_seed"]),
+            "rr":         t.params.get("rr",     PARAM_SEEDS["rr_seed"]),
+            "tp_mult":    t.params.get("tp_mult", PARAM_SEEDS["tp_mult_seed"]),
+            "confidence": t.params.get("confidence", PARAM_SEEDS["confidence_seed"]),
+            "htf_weight": t.params.get("htf_weight", PARAM_SEEDS["htf_weight_seed"]),
+            "be_r":       PARAM_SEEDS["be_r_options"][t.params.get("be_r_idx", 0)],
+        }
+        all_trials.append({
+            "number": t.number,
+            "params": params,
+            "sharpe": float(t.value),
+        })
+
+    # Sort by Sharpe, return top N
+    all_trials.sort(key=lambda x: x["sharpe"], reverse=True)
+    top = all_trials[:top_n]
+    log.info(f"  Per-TF {symbol} {locked_tf}m: best Sharpe={top[0]['sharpe']:.3f}" if top else
+             f"  Per-TF {symbol} {locked_tf}m: no valid trials")
+    return top, all_trials   # (top_n, all for DB storage)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1150,19 +1667,12 @@ def incremental_update(symbol: str, df_dict: dict,
         log.warning(f"  Skipping incremental update: missing data for {symbol}")
         return
 
-    feature_cols = get_feature_cols(feat_df)
-    models = {
-        "xgb": models_cache.get(f"xgb_{key}"),
-        "rf":  models_cache.get(f"rf_{key}"),
-    }
-
     new_params = run_optuna(
-        df_dict    = {entry_tf: feat_df},
-        models     = models,
-        scaler     = scaler,
-        feature_cols = feature_cols,
-        n_trials   = OPTUNA_LIVE_TRIALS,
-        symbol     = symbol,
+        df_dict      = {entry_tf: feat_df},
+        models_by_tf = models_cache,
+        scalers_by_tf= scalers_cache,
+        n_trials     = OPTUNA_LIVE_TRIALS,
+        symbol       = symbol,
     )
     save_params(symbol, new_params)
 
@@ -1279,29 +1789,22 @@ def run_historical_training() -> tuple:
             )
             models_cache[f"ppo_{symbol}"] = rl_agent
 
-        # GA parameter search
-        default_key  = f"{symbol}_{default_tf}m"
-        scaler_def   = scalers_cache.get(default_key)
-        feat_def     = tf_feat.get(default_tf)
-        if scaler_def and feat_def is not None:
-            feat_cols = get_feature_cols(feat_def)
-            models_ga = {
-                "xgb": models_cache.get(f"xgb_{default_key}"),
-                "rf":  models_cache.get(f"rf_{default_key}"),
-            }
+        # GA parameter search — use per-TF models/scalers so any entry_tf works
+        # Check at least one TF has a scaler before running
+        if any(scalers_cache.get(f"{symbol}_{tf}m") for tf in PARAM_SEEDS["entry_tf_options"]
+               if tf in tf_feat):
             ga_params = run_genetic_algo(
                 df_dict      = tf_feat,
-                models       = models_ga,
-                scaler       = scaler_def,
-                feature_cols = feat_cols,
+                models_by_tf = models_cache,
+                scalers_by_tf= scalers_cache,
+                symbol       = symbol,
             )
 
             # Optuna refines GA result
             opt_params = run_optuna(
                 df_dict      = tf_feat,
-                models       = models_ga,
-                scaler       = scaler_def,
-                feature_cols = feat_cols,
+                models_by_tf = models_cache,
+                scalers_by_tf= scalers_cache,
                 symbol       = symbol,
             )
 

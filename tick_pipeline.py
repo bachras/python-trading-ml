@@ -182,21 +182,37 @@ def stream_tick_chunks(filepath: Path, fmt: dict):
         if "time" not in chunk.columns:
             chunk.columns = DUKA_COLS
 
-        # Parse timestamp
+        # Parse timestamp — as naive first, then localise EET → UTC.
+        # Dukascopy exports in EET (UTC+2 winter / UTC+3 summer).
+        # Passing utc=True directly would label EET times as UTC, shifting
+        # every timestamp 2-3 hours forward — corrupting all session features.
         try:
             chunk["time"] = pd.to_datetime(
                 chunk["time"].astype(str).str.strip(),
                 format=fmt["dt_format"],
-                utc=True,
                 errors="coerce",
             )
         except Exception:
             chunk["time"] = pd.to_datetime(
                 chunk["time"].astype(str).str.strip(),
-                infer_datetime_format=True,
-                utc=True,
+                format="mixed",
                 errors="coerce",
             )
+
+        # EET → UTC: handles US and UK DST transitions automatically.
+        # ambiguous="NaT"  — drops the duplicated hour at autumn clock-back
+        #                    (affects < 100 ticks/year, acceptable loss).
+        # nonexistent="shift_forward" — maps the missing hour at spring
+        #                    clock-forward to the next valid UTC instant.
+        chunk["time"] = (
+            chunk["time"]
+            .dt.tz_localize(
+                "Europe/Helsinki",
+                ambiguous="NaT",
+                nonexistent="shift_forward",
+            )
+            .dt.tz_convert("UTC")
+        )
 
         # Drop rows with unparseable timestamps
         chunk.dropna(subset=["time"], inplace=True)
@@ -219,11 +235,12 @@ def stream_tick_chunks(filepath: Path, fmt: dict):
         chunk["spread"] = chunk["ask"] - chunk["bid"]
         chunk = chunk[chunk["spread"] <= MAX_SPREAD]
 
-        # Volume sanity
-        chunk = chunk[
-            (chunk["ask_volume"] > 0) &
-            (chunk["bid_volume"] > 0)
-        ]
+        # Volume sanity — require total volume > 0 only.
+        # The old filter (ask_volume > 0 AND bid_volume > 0) rejected valid
+        # ticks where Dukascopy exports 0 on one side during one-sided flow
+        # or thin off-hours markets. Total > 0 is the correct threshold.
+        chunk["total_vol"] = chunk["ask_volume"] + chunk["bid_volume"]
+        chunk = chunk[chunk["total_vol"] > 0]
 
         n_after    = len(chunk)
         rejected   = n_before - n_after
@@ -234,8 +251,7 @@ def stream_tick_chunks(filepath: Path, fmt: dict):
             continue
 
         # ── Derived tick columns ──────────────────────────
-        chunk["mid"]       = (chunk["bid"] + chunk["ask"]) / 2.0
-        chunk["total_vol"] = chunk["ask_volume"] + chunk["bid_volume"]
+        chunk["mid"] = (chunk["bid"] + chunk["ask"]) / 2.0
 
         # Volume imbalance: +1 = all buy pressure, -1 = all sell pressure
         chunk["vol_imbalance"] = (
@@ -437,19 +453,50 @@ def engineer_tick_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
         d["true_ret5"]  = d["true_return"].rolling(5).sum()
         d["true_ret20"] = d["true_return"].rolling(20).sum()
 
-    # ── Session / time features ───────────────────────────
+    # ── DST-aware session features ────────────────────────────────
+    # Index is UTC (converted from EET in tick_pipeline).
+    # Convert to local time per timezone so US and UK DST transitions
+    # are handled independently. Without this, NYSE open appears at the
+    # wrong UTC hour for ~4 months/year, mislabelling every bar in those
+    # windows (late Oct and late Mar when UK/US clocks don't move together).
+    us_idx  = d.index.tz_convert("America/New_York")
+    uk_idx  = d.index.tz_convert("Europe/London")
+    us_mins = us_idx.hour * 60 + us_idx.minute
+    uk_mins = uk_idx.hour * 60 + uk_idx.minute
+
+    # ── Binary session flags (hand-crafted priors) ───────────────────
+    # NYSE session: 9:30 AM – 4:00 PM US Eastern
+    d["is_us_open"]    = ((us_mins >= 570) & (us_mins < 960)).astype(np.int8)
+    # Final 30 min of NYSE session (high-volume close window)
+    d["is_us_close"]   = ((us_mins >= 930) & (us_mins < 960)).astype(np.int8)
+    # Pre-market futures: 4:00 AM – 9:30 AM US Eastern
+    d["is_premarket"]  = ((us_mins >= 240) & (us_mins < 570)).astype(np.int8)
+    # London session: 8:00 AM – 5:00 PM UK time
+    d["is_london"]     = ((uk_mins >= 480) & (uk_mins < 1020)).astype(np.int8)
+    # London/NY overlap — both exchanges open simultaneously
+    d["is_us_overlap"] = (d["is_us_open"] & d["is_london"]).astype(np.int8)
+    # Asian / early-Frankfurt session: 2:00 AM – 8:00 AM UK time.
+    # US30 futures trade through this window and often produce clean trends
+    # driven by Asian macro flows before European participants enter.
+    d["is_asian"]      = ((uk_mins >= 120) & (uk_mins < 480)).astype(np.int8)
+
+    # ── Raw local-hour features (let ML discover its own session edges) ──
+    # Giving the model the continuous UK/US hour means it can find that,
+    # say, hours 3–6 UK have a different character than 6–8 without being
+    # constrained by our hand-drawn session boundaries. Optuna can also
+    # tune session thresholds as hyperparameters using these as inputs.
+    d["uk_hour"] = uk_idx.hour.astype(np.int8)
+    d["us_hour"] = us_idx.hour.astype(np.int8)
+
+    # Cyclical encoding keeps midnight continuity for gradient-based models
     hr  = d.index.hour
     dow = d.index.dayofweek
-
-    # US30 specific sessions (UTC times)
-    d["is_premarket"]  = ((hr >= 10) & (hr < 13)).astype(np.int8)
-    d["is_us_open"]    = ((hr >= 13) & (hr < 22)).astype(np.int8)
-    d["is_us_overlap"] = ((hr >= 13) & (hr < 16)).astype(np.int8)  # EU/US
-    d["is_us_close"]   = ((hr >= 19) & (hr < 22)).astype(np.int8)
-    d["hour_sin"]  = np.sin(2 * np.pi * hr / 24).astype(np.float32)
-    d["hour_cos"]  = np.cos(2 * np.pi * hr / 24).astype(np.float32)
-    d["dow_sin"]   = np.sin(2 * np.pi * dow / 5).astype(np.float32)
-    d["dow_cos"]   = np.cos(2 * np.pi * dow / 5).astype(np.float32)
+    d["hour_sin"]    = np.sin(2 * np.pi * hr / 24).astype(np.float32)
+    d["hour_cos"]    = np.cos(2 * np.pi * hr / 24).astype(np.float32)
+    d["uk_hour_sin"] = np.sin(2 * np.pi * uk_idx.hour / 24).astype(np.float32)
+    d["uk_hour_cos"] = np.cos(2 * np.pi * uk_idx.hour / 24).astype(np.float32)
+    d["dow_sin"]     = np.sin(2 * np.pi * dow / 5).astype(np.float32)
+    d["dow_cos"]     = np.cos(2 * np.pi * dow / 5).astype(np.float32)
 
     # ── Lag features ──────────────────────────────────────
     for lag in [1, 2, 3, 5, 8, 13]:
@@ -617,7 +664,133 @@ def build_all_timeframes(tick_file: Path, symbol: str,
 
 
 # ─────────────────────────────────────────────────────────────
-# 7. MULTI-FILE SUPPORT (if data is split by month/year)
+# 7. INCREMENTAL APPEND (add new months without full rebuild)
+# ─────────────────────────────────────────────────────────────
+
+def append_tick_data(new_csv_path: Path, symbol: str,
+                     timeframes: list = TARGET_TIMEFRAMES):
+    """
+    Append a new tick CSV to existing Parquet files without a full rebuild.
+
+    Typical use: you downloaded last month's ticks from Dukascopy.
+    This processes only the new ticks (after the last bar in each Parquet)
+    and appends new bars. Runs in ~2-10 min instead of 30-60 min.
+
+    Handles overlaps automatically — if your new CSV starts a few days
+    before the existing data ends, duplicate bars are dropped.
+
+    Usage:
+        python tick_pipeline.py --append US30_april2026.csv
+    """
+    new_csv_path = Path(new_csv_path)
+    if not new_csv_path.exists():
+        print(f"[ERROR] File not found: {new_csv_path}")
+        return
+
+    # Find the earliest last-bar timestamp across all TFs.
+    # We use the minimum so we don't miss bars on any TF.
+    cutoff = None
+    for tf in timeframes:
+        existing = load_ohlcv_parquet(symbol, tf)
+        if not existing.empty:
+            last_ts = existing.index[-1]
+            if cutoff is None or last_ts < cutoff:
+                cutoff = last_ts
+
+    if cutoff is None:
+        print("[INFO] No existing Parquets found — running full build instead.")
+        build_all_timeframes(new_csv_path, symbol, timeframes)
+        return
+
+    print(f"\n{'='*60}")
+    print(f"INCREMENTAL APPEND — {symbol}")
+    print(f"New file : {new_csv_path.name}")
+    print(f"Cutoff   : {cutoff}  (last bar in existing Parquets)")
+    print(f"{'='*60}\n")
+
+    # Stream new CSV, collect only ticks strictly after cutoff
+    fmt = detect_csv_format(new_csv_path)
+    new_tick_chunks = []
+    total_new = 0
+    for tick_chunk in stream_tick_chunks(new_csv_path, fmt):
+        filtered = tick_chunk[tick_chunk.index > cutoff]
+        if len(filtered) > 0:
+            new_tick_chunks.append(filtered)
+            total_new += len(filtered)
+
+    if not new_tick_chunks:
+        print(f"[INFO] No new ticks found after {cutoff.date()} — nothing to append.")
+        return
+
+    new_ticks = pd.concat(new_tick_chunks).sort_index()
+    new_ticks = new_ticks[~new_ticks.index.duplicated(keep="last")]
+    print(f"[INFO] {total_new:,} new ticks to process "
+          f"({new_ticks.index[0].date()} → {new_ticks.index[-1].date()})\n")
+
+    # Per-TF: build new bars, re-engineer with warmup history, append
+    WARMUP_BARS = 250   # bars of existing history needed for indicator warmup
+
+    for tf in timeframes:
+        existing = load_ohlcv_parquet(symbol, tf)
+        if existing.empty:
+            print(f"  [{tf}m] No existing data — skipping")
+            continue
+
+        # Build raw OHLCV bars from the new ticks
+        new_bars = ticks_to_ohlcv(new_ticks, tf)
+        if new_bars.empty:
+            print(f"  [{tf}m] No new complete bars")
+            continue
+
+        # Identify the raw (pre-feature) columns produced by ticks_to_ohlcv
+        raw_cols = [
+            "Open", "High", "Low", "Close", "Volume",
+            "spread_mean", "spread_max", "spread_std",
+            "tick_count", "tick_velocity", "vwap", "vwap_dist",
+            "vol_imbalance", "price_impact", "true_return",
+        ]
+
+        # Take the warmup tail from the existing Parquet (raw columns only)
+        warmup = existing.iloc[-WARMUP_BARS:]
+        warmup_raw = warmup[[c for c in raw_cols if c in warmup.columns]]
+
+        # Combine warmup tail + new bars, then re-engineer features
+        new_raw = new_bars[[c for c in raw_cols if c in new_bars.columns]]
+        combined_raw = pd.concat([warmup_raw, new_raw]).sort_index()
+        combined_raw = combined_raw[~combined_raw.index.duplicated(keep="last")]
+
+        combined_feat = engineer_tick_features(combined_raw)
+
+        # Keep only the bars that are genuinely new (after existing end)
+        new_end = existing.index[-1]
+        new_featured = combined_feat[combined_feat.index > new_end]
+
+        if new_featured.empty:
+            print(f"  [{tf}m] No new bars survived feature engineering")
+            continue
+
+        # Align columns: keep only columns present in both
+        shared_cols = existing.columns.intersection(new_featured.columns)
+        updated = pd.concat([existing[shared_cols],
+                             new_featured[shared_cols]]).sort_index()
+        updated = updated[~updated.index.duplicated(keep="last")]
+
+        write_ohlcv_parquet(symbol, tf, updated)
+        print(f"  [{tf}m] +{len(new_featured):,} bars appended | "
+              f"total: {len(updated):,} | "
+              f"now through: {updated.index[-1].date()}")
+
+        del combined_raw, combined_feat, new_featured, updated
+        gc.collect()
+
+    print(f"\n{'='*60}")
+    print("Append complete.")
+    print("Next step: python train.py  (retrains on expanded dataset)")
+    print(f"{'='*60}\n")
+
+
+# ─────────────────────────────────────────────────────────────
+# 8. MULTI-FILE SUPPORT (if data is split by month/year)
 # ─────────────────────────────────────────────────────────────
 
 def build_from_multiple_files(file_list: list, symbol: str,
@@ -731,10 +904,24 @@ def get_data_quality_report(symbol: str,
 # ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import sys
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Decide: single file or multiple files?
+    # ── Incremental append mode ──────────────────────────────────
+    # python tick_pipeline.py --append path\to\new_month.csv
+    if "--append" in sys.argv:
+        idx = sys.argv.index("--append")
+        if idx + 1 >= len(sys.argv):
+            print("[ERROR] --append requires a file path argument.")
+            print("  Usage: python tick_pipeline.py --append US30_april2026.csv")
+            sys.exit(1)
+        new_file = Path(sys.argv[idx + 1])
+        append_tick_data(new_file, SYMBOL, TARGET_TIMEFRAMES)
+        get_data_quality_report(SYMBOL, TARGET_TIMEFRAMES)
+        sys.exit(0)
+
+    # ── Full build mode (default) ────────────────────────────────
     if TICK_FILES:
         print("Multi-file mode detected.")
         build_from_multiple_files(TICK_FILES, SYMBOL, TARGET_TIMEFRAMES)
@@ -742,7 +929,7 @@ if __name__ == "__main__":
         if not TICK_FILE.exists():
             print(f"[ERROR] Tick file not found: {TICK_FILE}")
             print("  Please update TICK_FILE path at top of this script.")
-            exit(1)
+            sys.exit(1)
         build_all_timeframes(TICK_FILE, SYMBOL, TARGET_TIMEFRAMES)
 
     # Quality report

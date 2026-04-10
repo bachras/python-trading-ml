@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ML Trading Report — 2026-04-08 14:44</title>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #0f0f23;
+      color: #e0e0e0;
+      padding: 20px;
+    }
+    h1 { color: #3498db; font-size: 22px; margin-bottom: 6px; }
+    h2 { color: #3498db; font-size: 18px; margin: 24px 0 12px; }
+    h3 { color: #aaa; font-size: 14px; margin: 16px 0 8px; }
+    .subtitle { color: #888; font-size: 13px; margin-bottom: 20px; }
+
+    .best-strategy-banner {
+      background: #1a1a2e;
+      border-left: 4px solid #3498db;
+      padding: 10px 16px;
+      border-radius: 4px;
+      margin-bottom: 16px;
+      font-size: 14px;
+      color: #ccc;
+    }
+
+    .cards-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: #1a1a2e;
+      border: 1px solid #2d2d4e;
+      border-radius: 8px;
+      padding: 14px 18px;
+      min-width: 130px;
+      flex: 1;
+    }
+    .card-label { font-size: 11px; color: #888; text-transform: uppercase; }
+    .card-value { font-size: 22px; font-weight: bold; margin: 4px 0; }
+    .card-sub   { font-size: 10px; color: #666; }
+
+    .strategy-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .strategy-table th {
+      background: #1a1a2e;
+      color: #888;
+      padding: 8px 10px;
+      text-align: left;
+      border-bottom: 1px solid #2d2d4e;
+      white-space: nowrap;
+    }
+    .strategy-table td {
+      padding: 7px 10px;
+      border-bottom: 1px solid #1a1a2e;
+      white-space: nowrap;
+    }
+    .strategy-table tr:hover td { background: #1a1a2e; }
+    .strategy-table tr:nth-child(even) td { background: #0d0d1f; }
+
+    .info-box {
+      background: #1a1a2e;
+      border: 1px solid #2d2d4e;
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin: 20px 0;
+    }
+    .info-box h3 { color: #3498db; margin-bottom: 10px; }
+    .info-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .info-table td { padding: 6px 10px; border-bottom: 1px solid #2d2d4e; }
+    .info-table td:first-child { color: #888; width: 200px; white-space: nowrap; }
+
+    .section { margin-bottom: 30px; }
+    .divider {
+      border: none;
+      border-top: 1px solid #2d2d4e;
+      margin: 30px 0;
+    }
+    .note { color: #888; font-size: 11px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+
+<h1>ML Trading System — Performance Report</h1>
+<div class="subtitle">Generated: 2026-04-08 14:44 &nbsp;|&nbsp; Backtest from: 2020-01-02 &nbsp;|&nbsp;
+  Risk: percent (1.0%/trade) &nbsp;|&nbsp;
+  Starting balance: $10,000
+</div>
+
+<div class="section">
+  <p style="color:#888">Run training first to generate strategy data.</p>
+</div>
+
+<hr class="divider">
+<h2>Equity Curve &amp; Drawdown</h2>
+<div class="note">Top 10 strategies by efficiency ratio. Each line = one parameter set.</div>
+<div class="section"><p>No equity data available.</p></div>
+
+<hr class="divider">
+<h2>All Strategies — Top 5 per Timeframe</h2>
+<div class="section"><p>No strategies in database. Run training first.</p></div>
+
+<hr class="divider">
+<h2>Monthly P&L &amp; Feature Importance</h2>
+<p style="color:#888">No per-symbol data yet.</p>
+
+<hr class="divider">
+
+    <div class="info-box">
+      <h3>Optimisation Criteria</h3>
+      <table class="info-table">
+        <tr><td>Objective</td><td>Sharpe Ratio × √252 (GA phase) →
+            Efficiency Ratio (final ranking)</td></tr>
+        <tr><td>Method</td><td>Genetic Algorithm (40 gen, pop=80) →
+            Optuna Bayesian TPE (150 trials per TF)</td></tr>
+        <tr><td>Per-TF search</td><td>Each timeframe optimised independently
+            (entry_tf locked), top-5 saved</td></tr>
+        <tr><td>Entry TF options</td><td>1m / 3m / 5m / 10m / 15m</td></tr>
+        <tr><td>HTF options</td><td>None / 15m / 30m / 60m</td></tr>
+        <tr><td>SL range</td><td>0.5 – 3.0 × ATR</td></tr>
+        <tr><td>R:R range</td><td>1.0 – 4.0</td></tr>
+        <tr><td>Confidence</td><td>0.50 – 0.85 (ensemble signal threshold)</td></tr>
+        <tr><td>Break-even</td><td>OFF / +1R trigger / +2R trigger</td></tr>
+        <tr><td>Efficiency Ratio</td>
+            <td>ER = (peak profit $) / (max drawdown $) × 1.25</td></tr>
+        <tr><td>Backtest window</td><td>From 2020-01-02 to present</td></tr>
+        <tr><td>Risk mode</td>
+            <td>percent —
+            1.0% of balance/trade</td></tr>
+        <tr><td>Risk cap</td>
+            <td>2.0% of balance across all strategies
+                (BE trades exempt)</td></tr>
+        <tr><td>DD constraint</td><td>25% max drawdown terminates backtest episode</td></tr>
+      </table>
+    </div>
+
+<hr class="divider">
+<h2>Live Trades (last 50)</h2>
+<div class="section"><p>No live trades recorded yet.</p></div>
+
+<div class="note" style="margin-top:30px;text-align:center">
+  ML Trading System &nbsp;|&nbsp; Report generated 2026-04-08 14:44
+</div>
+
+</body>
+</html>
