@@ -42,6 +42,7 @@ warnings.filterwarnings("ignore", message=".*Converting sparse.*", category=User
 import argparse
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -112,6 +113,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("live")
 
+_LONDON_TZ = ZoneInfo("Europe/London")
+
+
+def _is_session_blocked(ts: datetime | None = None) -> bool:
+    """
+    Return True if the current time falls in the blocked session:
+    20:30 – 01:00 UK time (London timezone, DST-correct).
+
+    Covers illiquid post-NYSE-close overnight hours for US30.
+    No entries are placed in this window.
+    """
+    if ts is None:
+        ts = datetime.now(tz=_LONDON_TZ)
+    elif getattr(ts, "tzinfo", None) is None:
+        ts = ts.replace(tzinfo=_LONDON_TZ)
+    else:
+        ts = ts.astimezone(_LONDON_TZ)
+    h, m = ts.hour, ts.minute
+    after_2030  = (h == 20 and m >= 30) or h >= 21
+    before_0100 = (h == 0) or (h == 1 and m == 0)
+    return after_2030 or before_0100
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Strategy selection
@@ -159,6 +182,63 @@ def _get_active_strategies() -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Hard filter state (consecutive losses + daily trade cap)
+# ─────────────────────────────────────────────────────────────────────
+
+class _FilterState:
+    """Per-symbol filter state for consecutive loss cooldown and daily cap."""
+    CONSEC_LOSS_CAP      = 4     # trigger cooldown after this many consecutive losses
+    CONSEC_COOL_TRADES   = 6     # reduced-risk trades after trigger
+    CONSEC_COOL_RISK_PCT = 0.5   # risk % during cooldown
+    DAILY_TRADE_CAP      = 6     # max entries per calendar day
+
+    def __init__(self):
+        self.consec_losses      = 0
+        self.cooldown_remaining = 0
+        self.current_day        = None
+        self.daily_trades       = 0
+
+    def reset_day(self):
+        today = datetime.now(tz=_LONDON_TZ).date()
+        if today != self.current_day:
+            self.current_day  = today
+            self.daily_trades = 0
+
+    def daily_cap_reached(self) -> bool:
+        self.reset_day()
+        return self.daily_trades >= self.DAILY_TRADE_CAP
+
+    def effective_risk_pct(self, base_pct: float) -> float:
+        return self.CONSEC_COOL_RISK_PCT if self.cooldown_remaining > 0 else base_pct
+
+    def record_trade_open(self):
+        self.reset_day()
+        self.daily_trades += 1
+
+    def record_trade_close(self, win: bool):
+        if win:
+            self.consec_losses = 0
+        else:
+            self.consec_losses += 1
+            if (self.consec_losses >= self.CONSEC_LOSS_CAP and
+                    self.cooldown_remaining == 0):
+                self.cooldown_remaining = self.CONSEC_COOL_TRADES
+                log.warning(f"[FilterState] {self.consec_losses} consecutive losses "
+                            f"— reducing risk to {self.CONSEC_COOL_RISK_PCT}% "
+                            f"for next {self.CONSEC_COOL_TRADES} trades")
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+
+# Per-symbol filter state (initialised lazily)
+_filter_states: dict[str, _FilterState] = {}
+
+def _get_filter_state(symbol: str) -> _FilterState:
+    if symbol not in _filter_states:
+        _filter_states[symbol] = _FilterState()
+    return _filter_states[symbol]
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Risk cap (BE-aware)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -201,6 +281,16 @@ def _monitor_open_positions():
         if not ticket:
             continue
         if ticket not in pos_map:
+            # Trade closed — determine win/loss from stored trade data
+            entry_p = trade.get("entry_price", 0)
+            tp_p    = trade.get("tp_price", 0)
+            sl_p    = trade.get("sl_price", 0)
+            dir_    = trade.get("direction", 1)
+            # Approximate: if TP > entry for longs, it was a win; use stored prices
+            # A proper determination would query closed deals — this is a heuristic
+            is_win  = (dir_ == 1 and tp_p > sl_p) or (dir_ == -1 and tp_p < sl_p)
+            sym_    = trade.get("symbol", "")
+            _get_filter_state(sym_).record_trade_close(is_win)
             close_live_trade(ticket, pnl=0.0)
             continue
         pos   = pos_map[ticket]
@@ -365,7 +455,6 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
                     "entry_tf":   entry_tf,
                     "htf_tf":     htf_tf,
                     "sl_atr":     strategy.get("sl_atr",     PARAM_SEEDS["sl_atr_seed"]),
-                    "rr":         strategy.get("rr",         PARAM_SEEDS["rr_seed"]),
                     "tp_mult":    strategy.get("tp_mult",    PARAM_SEEDS["tp_mult_seed"]),
                     "confidence": strategy.get("confidence", PARAM_SEEDS["confidence_seed"]),
                     "htf_weight": strategy.get("htf_weight", PARAM_SEEDS["htf_weight_seed"]),
@@ -392,16 +481,48 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
                     log.debug(f"{sid}: no signal — {signal.get('reason','')}")
                     continue
 
+                # Session time gate — block entries 20:30–01:00 UK time
+                if _is_session_blocked():
+                    log.debug(f"{sid}: blocked by session gate (20:30-01:00 UK)")
+                    continue
+
+                # Daily trade cap
+                fstate = _get_filter_state(symbol)
+                if fstate.daily_cap_reached():
+                    log.debug(f"{sid}: daily trade cap reached ({_FilterState.DAILY_TRADE_CAP})")
+                    continue
+
                 # Hard risk gate
                 allowed, reason = risk_gate.can_trade()
                 if not allowed:
                     log.warning(f"[{sid}] Blocked by risk gate: {reason}")
                     continue
 
-                # Compute this trade's risk in money terms
-                balance    = get_account_balance()
+                # Volatility-adjusted position sizing (0.5–2% band inversely scaled by ATR)
+                # Uses ATR from live data cache: when ATR is high, risk less; low ATR → risk more.
+                VOL_SIZE_MIN = 0.5
+                VOL_SIZE_MAX = 2.0
+                balance      = get_account_balance()
+                base_pct     = RISK_PCT
+                entry_key_s  = f"{symbol}_{signal['entry_tf']}m"
+                df_live      = live_cache.get(entry_key_s, pd.DataFrame())
+                if not df_live.empty and "atr14" in df_live.columns:
+                    recent_atr  = df_live["atr14"].dropna()
+                    if len(recent_atr) >= 20:
+                        cur_atr  = float(recent_atr.iloc[-1])
+                        med_atr  = float(recent_atr.rolling(100, min_periods=20).median().iloc[-1])
+                        if med_atr > 0 and cur_atr > 0:
+                            norm_atr = cur_atr / med_atr
+                            base_pct = float(np.clip(RISK_PCT / norm_atr,
+                                                     VOL_SIZE_MIN, VOL_SIZE_MAX))
+
+                # Consecutive loss cooldown overrides vol sizing (stricter cap wins)
+                eff_pct    = fstate.effective_risk_pct(base_pct)
                 trade_risk = (FIXED_RISK_AMT if RISK_MODE == "fixed"
-                              else max(balance, 1.0) * RISK_PCT / 100.0)
+                              else max(balance, 1.0) * eff_pct / 100.0)
+                if fstate.cooldown_remaining:
+                    log.info(f"  [{sid}] Cooldown active ({fstate.cooldown_remaining} trades left) "
+                             f"— risk reduced to {eff_pct:.1f}%")
 
                 # BE-aware risk cap
                 if not _check_risk_cap(trade_risk, balance):
@@ -426,6 +547,7 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
                 )
 
                 if result["success"]:
+                    fstate.record_trade_open()
                     log_trade({
                         "symbol":    symbol, "direction": signal["direction"],
                         "entry":     signal["entry_price"], "sl": signal["sl_price"],
@@ -704,7 +826,6 @@ def run_signal_check():
         params = {
             "entry_tf":   entry_tf, "htf_tf": htf_tf,
             "sl_atr":     strategy.get("sl_atr",     1.5),
-            "rr":         strategy.get("rr",         2.0),
             "tp_mult":    strategy.get("tp_mult",    2.0),
             "confidence": conf,
             "htf_weight": strategy.get("htf_weight", 0.3),

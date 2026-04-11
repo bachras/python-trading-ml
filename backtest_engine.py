@@ -28,6 +28,8 @@ import pandas as pd
 import joblib
 from dotenv import load_dotenv
 
+from zoneinfo import ZoneInfo
+
 load_dotenv()
 
 BASE_DIR   = Path(os.getenv("BASE_DIR",   r"F:\trading_ml"))
@@ -38,7 +40,29 @@ BACKTEST_START_DATE = os.getenv("BACKTEST_START_DATE", "2020-01-02")
 ER_MULTIPLIER       = float(os.getenv("ER_MULTIPLIER", "1.25"))
 SEQ_LEN             = 20   # must match phase2
 
+_LONDON_TZ = ZoneInfo("Europe/London")
+
 log = logging.getLogger("backtest_engine")
+
+
+def _is_session_blocked(ts: pd.Timestamp) -> bool:
+    """
+    Return True if the bar falls in the blocked session window:
+    20:30 – 01:00 UK time (London timezone, DST-correct).
+
+    This window covers illiquid overnight hours for US30 (post-NYSE close
+    to pre-Asian open). Trades during this window are skipped in backtest
+    and live to avoid wide spreads and low liquidity.
+    """
+    # Convert to London time (DST-aware)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    uk = ts.astimezone(_LONDON_TZ)
+    h, m = uk.hour, uk.minute
+    # 20:30 → 24:00 or 00:00 → 01:00
+    after_2030  = (h == 20 and m >= 30) or h >= 21
+    before_0100 = (h == 0) or (h == 1 and m == 0)
+    return after_2030 or before_0100
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -134,7 +158,6 @@ def run_backtest(
 
     confidence = params.get("confidence", 0.6)
     sl_atr     = params.get("sl_atr", 1.5)
-    rr         = params.get("rr", 2.0)
     tp_mult    = params.get("tp_mult", 2.0)
     be_r       = params.get("be_r", 0)
 
@@ -154,13 +177,29 @@ def run_backtest(
     prob = (p_xgb + p_rf) / 2.0
 
     # Extract OHLC arrays
-    closes = df["Close"].values
-    highs  = df["High"].values
-    lows   = df["Low"].values
+    closes  = df["Close"].values
+    highs   = df["High"].values
+    lows    = df["Low"].values
     atr_arr = df["atr14"].values if "atr14" in df.columns else (
         pd.Series(highs - lows).rolling(14).mean().values
     )
-    dates  = df.index
+    dates       = df.index
+    # Spread model: half-spread cost on entry; zero if spread_mean not available
+    spread_arr  = df["spread_mean"].values if "spread_mean" in df.columns else np.zeros(len(df))
+    # Slippage: fixed 0.1 × ATR per side (conservative for CFDs at market close price)
+    SLIP_FACTOR = 0.1
+
+    # ── Hard filter pre-computation ─────────────────────────────────────
+    # Spread filter threshold: 2× the median spread (skip if spread is unusually wide)
+    spread_median = np.nanmedian(spread_arr[spread_arr > 0]) if (spread_arr > 0).any() else 0.0
+    SPREAD_MAX    = spread_median * 2.0 if spread_median > 0 else np.inf
+    # ATR volatility filter: skip if ATR > 3× its 100-bar rolling median (flash crash / gap)
+    atr_series    = pd.Series(atr_arr)
+    atr_roll_med  = atr_series.rolling(100, min_periods=20).median().values
+    DAILY_TRADE_CAP = 6   # max entries per calendar day
+    CONSEC_LOSS_CAP = 4   # after this many consecutive losses → reduce risk
+    CONSEC_LOSS_RISK_PCT = 0.5  # reduced risk % during cooldown
+    CONSEC_COOL_TRADES   = 6    # number of trades to hold reduced risk after trigger
 
     # ── Simulate trades ──────────────────────────────────────────────
     balance  = start_balance
@@ -170,8 +209,20 @@ def run_backtest(
     in_trade = False
     open_trade = {}
 
+    # Filter state
+    consec_losses      = 0
+    cooldown_remaining = 0
+    current_day        = None
+    daily_trade_count  = 0
+
     for i in range(SEQ_LEN, len(df) - 1):
         bar_date = dates[i]
+
+        # Daily trade counter reset
+        bar_day = bar_date.date() if hasattr(bar_date, "date") else None
+        if bar_day != current_day:
+            current_day       = bar_day
+            daily_trade_count = 0
 
         # Check open trade
         if in_trade:
@@ -191,12 +242,12 @@ def run_backtest(
                 if bl <= t["sl"]:
                     pnl_r = (t["sl"] - t["entry"]) / (t["sl_dist"] + 1e-10); hit = True
                 elif bh >= t["tp"]:
-                    pnl_r = t["rr"]; hit = True
+                    pnl_r = (t["tp"] - t["entry"]) / (t["sl_dist"] + 1e-10); hit = True
             else:
                 if bh >= t["sl"]:
                     pnl_r = (t["entry"] - t["sl"]) / (t["sl_dist"] + 1e-10); hit = True
                 elif bl <= t["tp"]:
-                    pnl_r = t["rr"]; hit = True
+                    pnl_r = (t["entry"] - t["tp"]) / (t["sl_dist"] + 1e-10); hit = True
 
             if hit:
                 pnl_money = pnl_r * t["risk"]
@@ -218,6 +269,18 @@ def run_backtest(
                     peak = balance
                 in_trade = False
                 equity_records.append((bar_date, balance))
+
+                # Update consecutive loss tracker
+                if pnl_r < 0:
+                    consec_losses += 1
+                    if consec_losses >= CONSEC_LOSS_CAP and cooldown_remaining == 0:
+                        cooldown_remaining = CONSEC_COOL_TRADES
+                else:
+                    consec_losses = 0
+
+                if cooldown_remaining > 0:
+                    cooldown_remaining -= 1
+
             continue
 
         # Check for signal
@@ -231,18 +294,57 @@ def run_backtest(
         if direction is None:
             continue
 
+        # Session gate: block entries during 20:30–01:00 UK time
+        if _is_session_blocked(bar_date):
+            continue
+
+        # Daily trade cap
+        if daily_trade_count >= DAILY_TRADE_CAP:
+            continue
+
+        # Spread filter: skip if spread is more than 2× the median
+        if not np.isnan(spread_arr[i]) and spread_arr[i] > SPREAD_MAX:
+            continue
+
+        # ATR volatility filter: skip during flash crashes / gaps (ATR > 3× rolling median)
+        if (not np.isnan(atr_roll_med[i]) and atr_roll_med[i] > 0 and
+                not np.isnan(atr_arr[i]) and atr_arr[i] > atr_roll_med[i] * 3.0):
+            continue
+
         sl_dist = atr_arr[i] * sl_atr
         if sl_dist <= 0 or np.isnan(sl_dist):
             continue
 
-        entry = closes[i]
-        sl    = entry - direction * sl_dist
-        tp    = entry + direction * sl_dist * tp_mult
+        # Entry with spread + slippage cost
+        # spread_cost = half the bid/ask spread (we cross on entry, not exit)
+        # slip_cost   = 0.1 × ATR (execution delay / market impact)
+        spread_cost = spread_arr[i] / 2.0
+        slip_cost   = atr_arr[i] * SLIP_FACTOR if not np.isnan(atr_arr[i]) else 0.0
+        total_cost  = spread_cost + slip_cost
+        # Longs pay above close, shorts receive below close
+        entry       = closes[i] + direction * total_cost
+        sl          = entry - direction * sl_dist
+        tp          = entry + direction * sl_dist * tp_mult
 
+        # Volatility-adjusted position sizing (0.5–2% band inversely scaled by ATR)
+        # When ATR is elevated, risk less; when ATR is low, risk slightly more.
+        # normalised_atr = current ATR / rolling 100-bar median ATR
+        # risk_pct = base_risk / normalised_atr, clamped to [0.5, 2.0]
+        VOL_SIZE_MIN = 0.5
+        VOL_SIZE_MAX = 2.0
+        if (not np.isnan(atr_roll_med[i]) and atr_roll_med[i] > 0 and
+                not np.isnan(atr_arr[i]) and atr_arr[i] > 0):
+            norm_atr = atr_arr[i] / atr_roll_med[i]
+            vol_adjusted_pct = np.clip(risk_pct / norm_atr, VOL_SIZE_MIN, VOL_SIZE_MAX)
+        else:
+            vol_adjusted_pct = risk_pct
+
+        # Consecutive loss cooldown overrides vol sizing (always the stricter cap)
+        effective_risk_pct = CONSEC_LOSS_RISK_PCT if cooldown_remaining > 0 else vol_adjusted_pct
         if risk_mode == "fixed":
             risk = fixed_amt
         else:
-            risk = max(balance, 1.0) * risk_pct / 100.0
+            risk = max(balance, 1.0) * effective_risk_pct / 100.0
 
         open_trade = {
             "dir":        direction,
@@ -250,7 +352,6 @@ def run_backtest(
             "sl":         sl,
             "tp":         tp,
             "sl_dist":    sl_dist,
-            "rr":         rr,
             "risk":       risk,
             "be_done":    False,
             "entry_time": bar_date,
@@ -258,6 +359,7 @@ def run_backtest(
             "session":    _detect_session(df.iloc[i]),
         }
         in_trade = True
+        daily_trade_count += 1
         equity_records.append((bar_date, balance))
 
     # ── Build daily equity curve ─────────────────────────────────────
@@ -294,13 +396,22 @@ def run_backtest(
     wins  = r[r > 0]
     loss  = r[r < 0]
 
-    # ── Standard Sharpe (annualised, using trade R-values) ───────────
-    sharpe    = r.mean() / (r.std() + 1e-10) * np.sqrt(252)
+    # ── Sharpe: annualised daily equity returns (not per-trade R) ────
+    # Using daily equity returns is standard — avoids inflating Sharpe by
+    # treating each trade as independent when they happen same day, and
+    # correctly penalises vol on days with multiple wins or losses.
+    daily_ret   = daily_eq.pct_change().dropna()
+    if len(daily_ret) > 1:
+        sharpe = float(daily_ret.mean() / (daily_ret.std() + 1e-10) * np.sqrt(252))
+    else:
+        sharpe = float(r.mean() / (r.std() + 1e-10) * np.sqrt(252))
 
-    # ── Sortino: only penalise downside deviation ────────────────────
-    downside  = r[r < 0]
-    down_std  = downside.std() if len(downside) > 1 else 1e-10
-    sortino   = r.mean() / (down_std + 1e-10) * np.sqrt(252)
+    # ── Sortino: only penalise downside daily returns ────────────────
+    down_daily = daily_ret[daily_ret < 0]
+    if len(down_daily) > 1:
+        sortino = float(daily_ret.mean() / (down_daily.std() + 1e-10) * np.sqrt(252))
+    else:
+        sortino = sharpe
 
     # ── Equity curve stats (using live risk % / fixed $ as simulated) ─
     max_dd_pct   = float(drawdown_pct.max())
@@ -482,7 +593,7 @@ def run_sensitivity(
     fixed_amt: float = 100.0, start_balance: float = 10_000.0,
 ) -> dict:
     """
-    Nudge confidence, sl_atr, and rr each by ±step and re-backtest.
+    Nudge confidence, sl_atr, and tp_mult each by ±step and re-backtest.
     A robust strategy degrades gracefully — not a cliff edge.
 
     Returns:
@@ -493,7 +604,7 @@ def run_sensitivity(
     NUDGES = [
         ("confidence", [-0.05, +0.05]),
         ("sl_atr",     [-0.2,  +0.2 ]),
-        ("rr",         [-0.3,  +0.3 ]),
+        ("tp_mult",    [-0.3,  +0.3 ]),
     ]
 
     base_bt    = run_backtest(df, params, scaler, xgb_m, rf_m,

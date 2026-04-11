@@ -185,6 +185,7 @@ def _add_column_if_missing(conn, table: str, column: str, col_type: str):
 def upsert_strategy(row: dict):
     """Insert or replace a strategy_params row."""
     row.setdefault("updated_at", datetime.now().isoformat())
+    row.setdefault("rr",                None)   # removed param — kept in DB for history
     # Default MC / sensitivity columns so old callers without them still work
     row.setdefault("sortino",           None)
     row.setdefault("calmar",            None)

@@ -7,7 +7,7 @@ All features are computed from tick data — impossible to replicate from OHLCV 
 Feature groups:
   1. VWAP family          — session, anchored, bands, slope, deviation
   2. Volume profile       — POC, VAH, VAL, HVN/LVN, distance, z-scores
-  3. Order flow / delta   — delta per bar, CVD, divergence, stacked imbalance
+  3. Order flow proxies   — quote_delta/quote_cvd (OHLCV-derived, not true tape)
   4. Liquidity structure  — swing levels, equal H/L pools, LVN voids, absorption
   5. Market regime        — trend/range/expanding/contracting classifier
 
@@ -322,20 +322,24 @@ def add_volume_profile_features(df: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. ORDER FLOW / DELTA
+# 3. ORDER FLOW / QUOTE DELTA PROXIES
 # ─────────────────────────────────────────────────────────────
 
 def add_order_flow_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Delta = ask_volume - bid_volume per bar.
-    Positive delta = buyers were aggressive (market orders hitting ask).
-    Negative delta = sellers were aggressive (market orders hitting bid).
+    OHLCV-proxy order flow features. Columns are prefixed `quote_` to signal
+    they are derived from OHLCV volume, NOT true L2/tape order flow.
 
-    Key signals:
-    - Delta divergence: price up but delta falling = bullish exhaustion
-    - Stacked imbalance: 3+ consecutive bars with 3:1 vol ratio = institutional push
-    - CVD trend: cumulative delta trending = sustained institutional direction
-    - Absorption: high volume but small price move = large limit orders absorbing
+    quote_delta = ask_volume - bid_volume per bar.
+    When tick data is unavailable: ask_vol = bid_vol = Volume * 0.5,
+    so quote_delta collapses to zero and CVD carries no directional signal.
+    The signal is only meaningful when real tick data is piped via tick_pipeline.
+
+    Key signals (when tick data is real):
+    - quote_delta_divergence: price up but delta falling = bullish exhaustion
+    - stacked_imbalance: 3+ consecutive bars with 3:1 vol ratio = institutional push
+    - quote_cvd trend: cumulative delta trending = sustained institutional direction
+    - absorption: high volume but small price move = large limit orders absorbing
     """
     d = df.copy()
 
@@ -343,43 +347,47 @@ def add_order_flow_features(df: pd.DataFrame) -> pd.DataFrame:
     ask_vol = d.get("ask_volume", d["Volume"] * 0.5)
     bid_vol = d.get("bid_volume", d["Volume"] * 0.5)
 
-    # ── Delta per bar ─────────────────────────────────────
-    d["delta"]     = ask_vol - bid_vol
-    d["delta_pct"] = d["delta"] / (d["Volume"] + 1e-10)   # normalised [-1, 1]
+    # ── Quote delta per bar ───────────────────────────────
+    # NOTE: "quote_delta" = ask_vol - bid_vol estimated from OHLCV volume.
+    # This is NOT true tape delta from L2 order flow. When tick data is absent,
+    # ask_vol = bid_vol = Volume * 0.5, making these proxies symmetrically zero.
+    # The `quote_` prefix signals OHLCV-proxy, not exchange-feed order flow.
+    d["quote_delta"]     = ask_vol - bid_vol
+    d["quote_delta_pct"] = d["quote_delta"] / (d["Volume"] + 1e-10)   # normalised [-1, 1]
 
-    # Delta magnitude z-score (unusually large delta = institutional)
-    d["delta_z"] = (
-        (d["delta"] - d["delta"].rolling(CVD_LOOKBACK).mean()) /
-        (d["delta"].rolling(CVD_LOOKBACK).std() + 1e-10)
+    # Quote delta magnitude z-score (unusually large delta = institutional)
+    d["quote_delta_z"] = (
+        (d["quote_delta"] - d["quote_delta"].rolling(CVD_LOOKBACK).mean()) /
+        (d["quote_delta"].rolling(CVD_LOOKBACK).std() + 1e-10)
     )
 
-    # ── Cumulative Volume Delta (CVD) ─────────────────────
+    # ── Quote CVD (Cumulative Volume Delta) ───────────────
     # Resets each session (daily)
-    dates   = d.index.date
-    d["cvd"] = d["delta"].groupby(dates).cumsum()
+    dates        = d.index.date
+    d["quote_cvd"] = d["quote_delta"].groupby(dates).cumsum()
 
-    # Normalised CVD (z-score within rolling window)
-    d["cvd_z"] = (
-        (d["cvd"] - d["cvd"].rolling(CVD_LOOKBACK).mean()) /
-        (d["cvd"].rolling(CVD_LOOKBACK).std() + 1e-10)
+    # Normalised quote CVD (z-score within rolling window)
+    d["quote_cvd_z"] = (
+        (d["quote_cvd"] - d["quote_cvd"].rolling(CVD_LOOKBACK).mean()) /
+        (d["quote_cvd"].rolling(CVD_LOOKBACK).std() + 1e-10)
     )
 
-    # CVD slope: is buying/selling pressure accelerating?
-    d["cvd_slope5"]  = d["cvd"].diff(5)
-    d["cvd_slope20"] = d["cvd"].diff(20)
+    # Quote CVD slope: is buying/selling pressure accelerating?
+    d["quote_cvd_slope5"]  = d["quote_cvd"].diff(5)
+    d["quote_cvd_slope20"] = d["quote_cvd"].diff(20)
 
-    # ── Delta divergence ──────────────────────────────────
+    # ── Quote delta divergence ────────────────────────────
     # Price makes higher high but delta makes lower high → exhaustion
     # Compute as: sign(price_change_5) != sign(delta_change_5)
     price_dir = np.sign(d["Close"].diff(5))
-    delta_dir = np.sign(d["delta"].diff(5))
-    d["delta_divergence"] = (price_dir != delta_dir).astype(float)
+    delta_dir = np.sign(d["quote_delta"].diff(5))
+    d["quote_delta_divergence"] = (price_dir != delta_dir).astype(float)
 
-    # Delta momentum vs price momentum (key divergence signal)
+    # Quote delta momentum vs price momentum (key divergence signal)
     # If delta is near-zero everywhere (e.g. ask/bid estimated as 50/50),
     # rolling corr returns NaN for all rows — fill with 0 (neutral) instead.
-    _corr = d["delta"].rolling(20).corr(d["Close"].diff())
-    d["delta_price_corr"] = _corr.fillna(0.0)
+    _corr = d["quote_delta"].rolling(20).corr(d["Close"].diff())
+    d["quote_delta_price_corr"] = _corr.fillna(0.0)
 
     # ── Stacked imbalance detection ───────────────────────
     # A "stacked imbalance" is 3+ consecutive bars where
@@ -414,8 +422,8 @@ def add_order_flow_features(df: pd.DataFrame) -> pd.DataFrame:
     d["absorption"] = ((vol_z > 1.5) & (move_ratio < 0.5)).astype(float)
 
     # Absorption direction: which side was defending?
-    d["absorption_bull"] = (d["absorption"] * (d["delta"] > 0)).astype(float)
-    d["absorption_bear"] = (d["absorption"] * (d["delta"] < 0)).astype(float)
+    d["absorption_bull"] = (d["absorption"] * (d["quote_delta"] > 0)).astype(float)
+    d["absorption_bear"] = (d["absorption"] * (d["quote_delta"] < 0)).astype(float)
 
     # ── Failed auction signal ─────────────────────────────
     # Price makes new high/low but closes back inside range = failed auction
@@ -567,8 +575,8 @@ def add_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     Regimes:
       0 = low volatility range     (small ATR, no direction)
       1 = high volatility range    (large ATR, no direction — choppy)
-      2 = bullish trend            (upward EMA slope, strong delta)
-      3 = bearish trend            (downward EMA slope, strong delta)
+      2 = bullish trend            (upward EMA slope, strong quote_delta)
+      3 = bearish trend            (downward EMA slope, strong quote_delta)
       4 = expanding volatility     (ATR increasing rapidly)
       5 = contracting volatility   (ATR decreasing — squeeze forming)
     """

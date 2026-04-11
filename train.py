@@ -11,13 +11,12 @@ Usage:
 
 What it does:
   1. Loads tick Parquet data + applies institutional features (~2-15 min)
-  2. Trains LSTM + XGB + RF per entry TF (skips TFs already on disk)
-  3. Trains PPO RL agent
-  4. Runs Genetic Algorithm + Optuna global optimisation
-  5. Runs per-TF optimisation: top-5 param sets per TF (new feature)
-  6. Runs full backtest on all strategies, saves results to SQLite
-  7. Saves all models to models/  and params to params/
-  8. Optionally generates HTML report
+  2. Trains XGBoost + Random Forest per entry TF (skips TFs already on disk)
+  3. Runs Genetic Algorithm + Optuna global optimisation
+  4. Runs per-TF optimisation: top-5 param sets per TF
+  5. Runs full backtest on all strategies, saves results to SQLite
+  6. Saves all models to models/  and params to params/
+  7. Optionally generates HTML report
 
 After this finishes, start live.py in a separate terminal.
 """
@@ -45,8 +44,6 @@ import numpy as np
 import pandas as pd
 import joblib
 from dotenv import load_dotenv
-from tensorflow.keras.models import load_model as keras_load_model
-
 load_dotenv()
 
 # ── Parse CLI args before importing heavy modules ──────────────────────
@@ -69,7 +66,7 @@ from pipeline import (
 )
 from phase2_adaptive_engine import (
     get_feature_cols, fit_scaler, apply_scaler,
-    train_lstm, train_ensemble, train_rl_agent,
+    train_ensemble,
     run_genetic_algo, run_optuna, run_per_tf_optimization,
     save_params, load_params,
     INSTRUMENTS, PARAM_SEEDS, HARD_LIMITS,
@@ -107,6 +104,72 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("train")
+
+PURGE_BARS = 10   # bars to drop at each train/OOS boundary to prevent leakage
+
+
+def _walk_forward_folds(df: pd.DataFrame):
+    """
+    Build 3 anchored expanding walk-forward folds.
+    Returns list of (train_df, val_df, oos_label) tuples.
+
+    Fold logic (based on calendar year of the data):
+      Fold 1: train up to end of year[-3], OOS = year[-2]
+      Fold 2: train up to end of year[-2], OOS = year[-1]
+      Fold 3: train up to end of year[-1], OOS = current year (if data exists)
+
+    If data spans < 3 years, falls back to single 70/30 split.
+    PURGE_BARS rows are dropped at each train/OOS boundary.
+    """
+    if df.empty:
+        return []
+
+    years = sorted(df.index.year.unique())
+    if len(years) < 3:
+        # Fallback: single 70/30 split
+        n     = len(df)
+        i_cut = int(n * 0.70)
+        train = df.iloc[:i_cut - PURGE_BARS]
+        val   = df.iloc[i_cut:]
+        if len(train) < 200 or len(val) < 50:
+            return []
+        return [(train, val, "single_fold")]
+
+    folds = []
+    for fold_idx in range(1, min(4, len(years))):
+        # OOS year is years[-fold_idx]
+        # Train is everything before OOS year minus purge
+        oos_year  = years[-fold_idx]
+        oos_mask  = df.index.year == oos_year
+        pre_mask  = df.index.year < oos_year
+
+        train_df  = df[pre_mask]
+        oos_df    = df[oos_mask]
+
+        if len(train_df) < 200 or len(oos_df) < 50:
+            continue
+
+        # Purge boundary: drop PURGE_BARS from end of train and start of OOS
+        train_df  = train_df.iloc[:-PURGE_BARS] if len(train_df) > PURGE_BARS else train_df
+        oos_df    = oos_df.iloc[PURGE_BARS:]    if len(oos_df)   > PURGE_BARS else oos_df
+
+        if len(train_df) < 200 or len(oos_df) < 50:
+            continue
+
+        folds.append((train_df, oos_df, str(oos_year)))
+
+    # Folds are in reverse order (newest OOS first) — reverse so earliest is fold 1
+    folds.reverse()
+
+    if not folds:
+        # Fallback
+        n     = len(df)
+        i_cut = int(n * 0.70)
+        train = df.iloc[:i_cut - PURGE_BARS]
+        val   = df.iloc[i_cut:]
+        return [(train, val, "single_fold")] if len(train) > 200 and len(val) > 50 else []
+
+    return folds
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -157,81 +220,81 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             key = f"{symbol}_{tf}m"
 
             if not FORCE_RETRAIN:
-                lstm_p   = MODEL_DIR / f"lstm_{key}.keras"
                 xgb_p    = MODEL_DIR / f"xgb_{key}.pkl"
                 rf_p     = MODEL_DIR / f"rf_{key}.pkl"
                 scaler_p = MODEL_DIR / f"scaler_{key}.pkl"
-                if lstm_p.exists() and xgb_p.exists() and rf_p.exists():
+                if xgb_p.exists() and rf_p.exists():
                     log.info(f"  {symbol} {tf}m: found on disk — loading (resume mode)")
-                    models_cache[f"lstm_{key}"] = keras_load_model(str(lstm_p))
                     models_cache[f"xgb_{key}"]  = joblib.load(xgb_p)
                     models_cache[f"rf_{key}"]   = joblib.load(rf_p)
                     if scaler_p.exists():
                         scalers_cache[key] = joblib.load(scaler_p)
                     continue
 
-            df   = tf_feat[tf]
-            n    = len(df)
-            i_tr = int(n * 0.70)
-            i_va = int(n * 0.85)
-
-            train_df  = df.iloc[:i_tr]
-            val_df    = df.iloc[i_tr:i_va]
+            df        = tf_feat[tf]
+            n         = len(df)
             feat_cols = get_feature_cols(df)
 
             log.info(f"  {symbol} {tf}m | {df.index[0].date()} → {df.index[-1].date()} | "
-                     f"{n:,} bars | train={len(train_df):,} val={len(val_df):,} | "
-                     f"{len(feat_cols)} features")
+                     f"{n:,} bars | {len(feat_cols)} features")
 
-            # NaN audit
-            nan_pct  = train_df[feat_cols].isna().mean()
-            bad_cols = nan_pct[nan_pct > 0.10]
-            if not bad_cols.empty:
-                log.warning(f"  {symbol} {tf}m: {len(bad_cols)} features >10% NaN: "
-                            + ", ".join(f"{c}={v:.0%}" for c, v in bad_cols.items()))
+            # ── Walk-forward 3-fold validation ────────────────────────
+            folds = _walk_forward_folds(df)
+            if not folds:
+                log.warning(f"  {symbol} {tf}m: insufficient data for walk-forward — skipping")
+                continue
 
-            # Target balance
-            if "target" in train_df.columns:
-                pos = train_df["target"].mean()
-                if pos < 0.20 or pos > 0.80:
-                    log.warning(f"  {symbol} {tf}m: imbalanced target {pos:.0%}")
-                else:
-                    log.info(f"  {symbol} {tf}m: target balance {pos:.0%} positive")
+            fold_xgb_scores = []
+            fold_rf_scores  = []
+            for fold_num, (train_df, val_df, oos_label) in enumerate(folds, 1):
+                log.info(f"    Fold {fold_num}/{len(folds)} | OOS={oos_label} | "
+                         f"train={len(train_df):,} val={len(val_df):,}")
 
-            # Fit scaler
-            scaler  = fit_scaler(train_df, feat_cols)
-            train_s = apply_scaler(train_df, scaler, feat_cols)
-            val_s   = apply_scaler(val_df,   scaler, feat_cols)
-            scalers_cache[key] = scaler
-            joblib.dump(scaler, MODEL_DIR / f"scaler_{key}.pkl")
-            log.info(f"  Scaler saved → scaler_{key}.pkl")
+                # NaN audit on first fold
+                if fold_num == 1:
+                    nan_pct  = train_df[feat_cols].isna().mean()
+                    bad_cols = nan_pct[nan_pct > 0.10]
+                    if not bad_cols.empty:
+                        log.warning(f"  {symbol} {tf}m: {len(bad_cols)} features >10% NaN")
 
-            # LSTM
-            lstm = train_lstm(train_s, val_s, feat_cols, symbol, tf)
-            if lstm:
-                models_cache[f"lstm_{key}"] = lstm
+                # Target balance check
+                if "target" in train_df.columns:
+                    pos = train_df["target"].mean()
+                    if pos < 0.20 or pos > 0.80:
+                        log.warning(f"  {symbol} {tf}m fold {fold_num}: "
+                                    f"imbalanced target {pos:.0%}")
 
-            # XGBoost + Random Forest
-            xgb_m, rf_m = train_ensemble(train_s, val_s, feat_cols, symbol, tf)
+                scaler  = fit_scaler(train_df, feat_cols)
+                train_s = apply_scaler(train_df, scaler, feat_cols)
+                val_s   = apply_scaler(val_df,   scaler, feat_cols)
+
+                xgb_fold, rf_fold = train_ensemble(train_s, val_s, feat_cols, symbol, tf)
+                X_val = val_s[feat_cols].values
+                y_val = val_df["target"].values
+                fold_xgb_scores.append((xgb_fold.predict(X_val) == y_val).mean())
+                fold_rf_scores.append( (rf_fold.predict(X_val)  == y_val).mean())
+
+            # Log cross-fold OOS accuracy summary
+            log.info(f"  {symbol} {tf}m walk-forward OOS accuracy | "
+                     f"XGB: {np.mean(fold_xgb_scores):.3f} ± {np.std(fold_xgb_scores):.3f} | "
+                     f"RF: {np.mean(fold_rf_scores):.3f} ± {np.std(fold_rf_scores):.3f}")
+
+            # ── Final production model: train on ALL data ─────────────
+            # Use the last fold's scaler (fitted on most data) for production
+            log.info(f"  {symbol} {tf}m: fitting final production model on all data")
+            final_scaler   = fit_scaler(df, feat_cols)
+            # Val for early stopping: last 15% of full dataset
+            i_va           = int(n * 0.85)
+            full_train_s   = apply_scaler(df.iloc[:i_va], final_scaler, feat_cols)
+            full_val_s     = apply_scaler(df.iloc[i_va:], final_scaler, feat_cols)
+            xgb_m, rf_m    = train_ensemble(full_train_s, full_val_s, feat_cols, symbol, tf)
+
+            scalers_cache[key] = final_scaler
             models_cache[f"xgb_{key}"] = xgb_m
             models_cache[f"rf_{key}"]  = rf_m
+            joblib.dump(final_scaler, MODEL_DIR / f"scaler_{key}.pkl")
+            log.info(f"  Scaler saved → scaler_{key}.pkl")
 
-
-        # ── PPO RL agent ───────────────────────────────────────────────
-        default_tf  = PARAM_SEEDS["entry_tf_default"]
-        default_key = f"{symbol}_{default_tf}m"
-        if default_tf in tf_feat and scalers_cache.get(default_key):
-            df_rl = apply_scaler(
-                tf_feat[default_tf],
-                scalers_cache[default_key],
-                get_feature_cols(tf_feat[default_tf]),
-            )
-            rl = train_rl_agent(
-                df_rl, get_feature_cols(df_rl), symbol,
-                sl_mult=PARAM_SEEDS["sl_atr_seed"],
-                rr=PARAM_SEEDS["rr_seed"],
-            )
-            models_cache[f"ppo_{symbol}"] = rl
 
         # ── Global GA + Optuna (picks best TF across all) ─────────────
         has_any_scaler = any(
@@ -256,7 +319,7 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             log.info(f"    Entry TF   : {best['entry_tf']}m")
             log.info(f"    HTF        : {best['htf_tf']}m")
             log.info(f"    SL ATR×    : {best['sl_atr']:.3f}")
-            log.info(f"    R:R        : 1:{best['rr']:.2f}")
+            log.info(f"    TP mult    : {best['tp_mult']:.2f}x")
             log.info(f"    Confidence : {best['confidence']:.2f}")
             be = best.get("be_r", 0)
             log.info(f"    Break-even : {'OFF' if be==0 else f'+{be}R → entry+1pt'}")
@@ -368,7 +431,6 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     "entry_tf":         trial["params"]["entry_tf"],
                     "htf_tf":           trial["params"]["htf_tf"],
                     "sl_atr":           trial["params"]["sl_atr"],
-                    "rr":               trial["params"]["rr"],
                     "tp_mult":          trial["params"]["tp_mult"],
                     "confidence":       trial["params"]["confidence"],
                     "htf_weight":       trial["params"]["htf_weight"],
@@ -558,36 +620,57 @@ def _activate_best_strategy(symbol: str):
             return False
         return True
 
-    # Tier 1: passed both MC and sensitivity, realistic ER
-    tier1 = [s for s in strategies if _qualifies(s, strict=True)
-             and s.get("mc_pass", 0) == 1 and s.get("robust", 0) == 1]
-    # Tier 2: passed MC only
-    tier2 = [s for s in strategies if _qualifies(s, strict=True)
-             and s.get("mc_pass", 0) == 1]
-    # Tier 3: realistic ER, trade count OK (drop MC/sensitivity requirement)
-    tier3 = [s for s in strategies if _qualifies(s, strict=True)]
-    # Tier 4: last resort — drop ER cap
-    tier4 = [s for s in strategies if _qualifies(s, strict=False)]
+    # Robustness helpers
+    def _dsr_pass(s) -> bool:
+        """DSR (Haircut Sharpe) > 0 — corrects for multiple-testing bias."""
+        hc = s.get("haircut_sharpe")
+        return hc is not None and hc > 0.0
 
-    valid = tier1 or tier2 or tier3 or tier4
+    def _sens_pass(s) -> bool:
+        """Sensitivity score ≥ 50 — not a cliff-edge parameter set."""
+        sc = s.get("sensitivity_score")
+        return sc is not None and sc >= 50.0
+
+    # Tier 1: DSR>0 + MC pass + sensitivity≥50 + realistic ER (full gates)
+    tier1 = [s for s in strategies if _qualifies(s, strict=True)
+             and _dsr_pass(s) and s.get("mc_pass", 0) == 1
+             and _sens_pass(s) and s.get("robust", 0) == 1]
+    # Tier 2: DSR>0 + MC pass (drop sensitivity)
+    tier2 = [s for s in strategies if _qualifies(s, strict=True)
+             and _dsr_pass(s) and s.get("mc_pass", 0) == 1]
+    # Tier 3: DSR>0 only (drop MC and sensitivity requirement)
+    tier3 = [s for s in strategies if _qualifies(s, strict=True)
+             and _dsr_pass(s)]
+    # Tier 4: ER-filter only (drop all robustness gates)
+    tier5_er = [s for s in strategies if _qualifies(s, strict=True)]
+    # Tier 5: last resort — drop ER cap too
+    tier5 = [s for s in strategies if _qualifies(s, strict=False)]
+
+    # Pick best available tier
+    valid = tier1 or tier2 or tier3 or tier5_er or tier5
+
     if not valid:
         log.warning(f"  No qualifying strategies for {symbol} — nothing activated")
         return
 
-    tier_used = ("MC+Robust" if valid is tier1 else
-                 "MC-pass"   if valid is tier2 else
-                 "ER-filter" if valid is tier3 else "fallback")
+    tier_used = ("DSR+MC+Sens" if valid is tier1 else
+                 "DSR+MC"      if valid is tier2 else
+                 "DSR-only"    if valid is tier3 else
+                 "ER-filter"   if valid is tier5_er else "fallback")
 
     valid.sort(key=lambda s: s["efficiency_ratio"], reverse=True)
     best_id = valid[0]["strategy_id"]
     for s in strategies:
         set_strategy_active(s["strategy_id"], s["strategy_id"] == best_id)
+    b = valid[0]
     log.info(f"  Auto-activated: {best_id} [{tier_used}] "
-             f"ER={valid[0]['efficiency_ratio']:.2f} "
-             f"WR={valid[0].get('win_rate',0):.1f}% "
-             f"MC={'PASS' if valid[0].get('mc_pass') else 'FAIL'} "
-             f"Robust={'YES' if valid[0].get('robust') else 'NO'} "
-             f"trades={valid[0].get('n_trades',0)}")
+             f"ER={b['efficiency_ratio']:.2f} "
+             f"WR={b.get('win_rate',0):.1f}% "
+             f"DSR={b.get('haircut_sharpe') or 0:.2f} "
+             f"MC={'PASS' if b.get('mc_pass') else 'FAIL'} "
+             f"Sens={b.get('sensitivity_score') or 0:.0f} "
+             f"Robust={'YES' if b.get('robust') else 'NO'} "
+             f"trades={b.get('n_trades',0)}")
 
 
 # ─────────────────────────────────────────────────────────────────────

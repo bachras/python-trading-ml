@@ -585,14 +585,8 @@ def run_historical_training() -> tuple:
                 get_feature_cols(tf_feat[default_tf]),
             ) if scalers_cache.get(default_key) else tf_feat[default_tf]
 
-            rl = train_rl_agent(
-                df_rl,
-                get_feature_cols(df_rl),
-                symbol,
-                sl_mult = PARAM_SEEDS["sl_atr_seed"],
-                rr      = PARAM_SEEDS["rr_seed"],
-            )
-            models_cache[f"ppo_{symbol}"] = rl
+            # PPO removed — XGB+RF only
+            pass
 
         # ── Genetic algorithm + Optuna parameter search ───────────
         # Use per-TF models/scalers so any genome entry_tf is valid
@@ -629,7 +623,6 @@ def run_historical_training() -> tuple:
             log.info(f"    HTF        : {best['htf_tf']}m "
                      f"({'NONE' if best['htf_tf']==0 else 'active'})")
             log.info(f"    SL ATR×    : {best['sl_atr']:.3f}")
-            log.info(f"    R:R        : 1:{best['rr']:.2f}")
             log.info(f"    TP mult    : {best['tp_mult']:.2f}x")
             log.info(f"    Confidence : {best['confidence']:.2f}")
             log.info(f"    HTF weight : {best['htf_weight']:.2f}")
@@ -688,7 +681,6 @@ def run_historical_training() -> tuple:
                         "entry_tf":         trial["params"]["entry_tf"],
                         "htf_tf":           trial["params"]["htf_tf"],
                         "sl_atr":           trial["params"]["sl_atr"],
-                        "rr":               trial["params"]["rr"],
                         "tp_mult":          trial["params"]["tp_mult"],
                         "confidence":       trial["params"]["confidence"],
                         "htf_weight":       trial["params"]["htf_weight"],
@@ -1051,7 +1043,6 @@ def run_live_loop(models_cache: dict, scalers_cache: dict,
                     "entry_tf":   entry_tf,
                     "htf_tf":     htf_tf,
                     "sl_atr":     strategy.get("sl_atr", PARAM_SEEDS["sl_atr_seed"]),
-                    "rr":         strategy.get("rr", PARAM_SEEDS["rr_seed"]),
                     "tp_mult":    strategy.get("tp_mult", PARAM_SEEDS["tp_mult_seed"]),
                     "confidence": strategy.get("confidence", PARAM_SEEDS["confidence_seed"]),
                     "htf_weight": strategy.get("htf_weight", PARAM_SEEDS["htf_weight_seed"]),

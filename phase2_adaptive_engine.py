@@ -25,10 +25,6 @@ Usage:
 
 import os, sys, time, json, logging, warnings
 
-# Suppress TensorFlow C++ startup noise before any TF import.
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")
-
 # sklearn emits this when its joblib-based predict_proba is called from a
 # non-sklearn parallel context (e.g. DEAP GA loop). Predictions work fine.
 warnings.filterwarnings(
@@ -65,19 +61,6 @@ import joblib
 
 import xgboost as xgb
 from deap import base, creator, tools, algorithms
-
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.optimizers import Adam
-tf.get_logger().setLevel("ERROR")
-
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import DummyVecEnv
-import gymnasium as gym
-from gymnasium import spaces
 
 warnings.filterwarnings("ignore")
 load_dotenv()
@@ -195,11 +178,6 @@ PARAM_SEEDS = {
     "sl_atr_max":        5.0,
     "sl_atr_seed":       1.5,
 
-    # Risk:Reward ratio — widened to explore aggressive 1:5+ and breakeven 1:1
-    "rr_min":            0.8,
-    "rr_max":            6.0,
-    "rr_seed":           2.0,
-
     # Take profit multiplier of SL distance — wider for runner strategies
     "tp_mult_min":       0.5,
     "tp_mult_max":       8.0,
@@ -237,7 +215,7 @@ HARD_LIMITS = {
 OPTUNA_TRIALS       = 500
 OPTUNA_LIVE_TRIALS  = 50    # faster re-optimisation after live trades
 
-# LSTM sequence length (bars to look back)
+# Minimum lookback bars for feature warmup (used as loop start offset in ga_fitness)
 SEQ_LEN = 60
 
 # Minimum bars needed before training
@@ -327,6 +305,12 @@ def _mt5_login_and_log() -> bool:
 def get_account_balance() -> float:
     info = mt5.account_info()
     return info.balance if info else 0.0
+
+
+def get_account_equity() -> float:
+    """Return equity (balance + floating P&L on all open positions)."""
+    info = mt5.account_info()
+    return info.equity if info else 0.0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -465,9 +449,62 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         d[f"c_lag{lag}"] = c.shift(lag)
         d[f"r_lag{lag}"] = d["logr1"].shift(lag)
 
-    # Targets
-    d["target"]        = (c.shift(-1) > c).astype(int)
-    d["target_return"] = d["logr1"].shift(-1)
+    # ── Triple Barrier Labeling (Lopez de Prado) ───────────────────────
+    # Label each bar by which barrier is touched first in the next bars:
+    #   1 = TP touched first (long wins)  →  bullish label
+    #   0 = SL touched first (long loses) →  bearish label
+    # Parameters: sl_atr=1.5, tp_mult=2.0 (sl_dist = atr14 * 1.5, tp = sl_dist * 2.0)
+    # Max hold: 50 bars (prevents labels from looking far into the future)
+    # Falls back to next-bar direction if ATR unavailable.
+    # NOTE: dropna() below purges the last MAX_HOLD rows that have no label.
+    MAX_HOLD = 50
+    TB_SL_ATR  = 1.5
+    TB_TP_MULT = 2.0
+
+    if "atr14" in d.columns:
+        closes_arr = d["Close"].values.astype(np.float64)
+        highs_arr  = d["High"].values.astype(np.float64)
+        lows_arr   = d["Low"].values.astype(np.float64)
+        atr_arr    = d["atr14"].values.astype(np.float64)
+        n          = len(d)
+        labels     = np.full(n, np.nan, dtype=np.float32)
+
+        sl_dist = atr_arr * TB_SL_ATR           # (n,)
+        long_tp = closes_arr + sl_dist * TB_TP_MULT
+        long_sl = closes_arr - sl_dist
+
+        # Walk forward bar-by-bar but vectorise across all open positions per step.
+        # At each step k, we check which UNLABELLED bars see TP or SL touched
+        # for the FIRST TIME at exactly this lookahead step.
+        # Correctness: once a bar is labelled it is removed from candidates,
+        # so "first touch" semantics are preserved.
+        unlabelled = np.ones(n, dtype=bool)
+        unlabelled[np.isnan(atr_arr) | (atr_arr <= 0)] = False  # skip bad ATR
+
+        for k in range(1, MAX_HOLD + 1):
+            if not unlabelled[:n - k].any():
+                break
+            # For row i, the bar at position i+k
+            future_high = highs_arr[k:]    # length n-k  (aligned to rows 0..n-k-1)
+            future_low  = lows_arr[k:]
+
+            cand = unlabelled[:n - k]
+            tp_touched = cand & (future_high >= long_tp[:n - k])
+            sl_touched = cand & (future_low  <= long_sl[:n - k])
+            both       = tp_touched & sl_touched
+
+            # Both touched in the same bar — award TP (conservative, avoids penalising
+            # setups where the bar spiked both ways before closing in profit direction)
+            labels[:n - k][sl_touched & ~both] = 0.0
+            labels[:n - k][tp_touched]          = 1.0   # includes both → TP wins
+            unlabelled[:n - k][tp_touched | sl_touched] = False
+
+        d["target"] = labels
+        d["target_return"] = d["logr1"].shift(-1)
+    else:
+        # Fallback if ATR not yet computed (should not happen in normal flow)
+        d["target"]        = (c.shift(-1) > c).astype(int)
+        d["target_return"] = d["logr1"].shift(-1)
 
     # HTF alignment placeholder (filled in later per trade)
     d["htf_bullish"] = 0
@@ -537,114 +574,7 @@ def apply_scaler(df: pd.DataFrame, scaler: StandardScaler,
 
 
 # ─────────────────────────────────────────────────────────────
-# 6. LSTM MODEL
-# ─────────────────────────────────────────────────────────────
-
-def build_lstm(n_features: int, seq_len: int = SEQ_LEN) -> tf.keras.Model:
-    model = Sequential([
-        LSTM(128, return_sequences=True,
-             input_shape=(seq_len, n_features)),
-        Dropout(0.2),
-        BatchNormalization(),
-        LSTM(64, return_sequences=False),
-        Dropout(0.2),
-        Dense(32, activation="relu"),
-        Dense(1, activation="sigmoid"),
-    ])
-    model.compile(optimizer=Adam(learning_rate=1e-3),
-                  loss="binary_crossentropy",
-                  metrics=["accuracy"])
-    return model
-
-
-def make_sequences(df: pd.DataFrame, feature_cols: list,
-                   seq_len: int = SEQ_LEN):
-    """
-    Used ONLY for live inference on small tails (SEQ_LEN+2 rows).
-    DO NOT use for training — materialises the full 3D array.
-    For training use make_lstm_dataset() which streams batches from RAM.
-    """
-    X, y = [], []
-    arr    = df[feature_cols].values
-    target = df["target"].values
-    for i in range(seq_len, len(df)):
-        X.append(arr[i - seq_len:i])
-        y.append(target[i])
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
-
-
-def make_lstm_dataset(df: pd.DataFrame, feature_cols: list,
-                      seq_len: int = SEQ_LEN,
-                      batch_size: int = 256,
-                      shuffle: bool = True) -> "tf.data.Dataset":
-    """
-    Memory-efficient LSTM training dataset via tf.data.
-    Stores the flat feature array once (~700 MB for 2.1M × 81 features)
-    and generates sequences on-demand per batch — never materialises the
-    full 3D sequence cube (which would be 27 GB for 1m data uncapped).
-
-    RAM usage: (N × F × 4) bytes flat array + (batch × seq_len × F × 4) per batch.
-    For 2.1M bars: ~700 MB flat + ~5 MB per batch = ~705 MB total.
-    Trains on ALL historical bars regardless of dataset size.
-    """
-    feat_t   = tf.constant(df[feature_cols].values.astype(np.float32))  # (N, F)
-    target_t = tf.constant(df["target"].values.astype(np.float32))       # (N,)
-    n = len(df)
-
-    if n <= seq_len:
-        return None
-
-    # Dataset of valid end indices: range [seq_len, n)
-    # For index i: sequence = feat_t[i-seq_len:i], label = target_t[i]
-    idx_ds = tf.data.Dataset.range(seq_len, n)
-
-    if shuffle:
-        idx_ds = idx_ds.shuffle(
-            buffer_size=min(n, 200_000), seed=42, reshuffle_each_iteration=True
-        )
-
-    def fetch(i):
-        return feat_t[i - seq_len : i], target_t[i]
-
-    return (
-        idx_ds
-        .map(fetch, num_parallel_calls=tf.data.AUTOTUNE)
-        .batch(batch_size)
-        .prefetch(tf.data.AUTOTUNE)
-    )
-
-
-def train_lstm(train_df, val_df, feature_cols, symbol, tf_min):
-    n_tr = len(train_df)
-    log.info(f"  Training LSTM: {symbol} {tf_min}m | {n_tr:,} bars "
-             f"(streaming — no RAM cap)")
-
-    if n_tr <= SEQ_LEN + 100:
-        log.warning(f"  Insufficient data for {symbol} {tf_min}m LSTM — skipping")
-        return None
-
-    ds_tr = make_lstm_dataset(train_df, feature_cols, shuffle=True)
-    ds_va = make_lstm_dataset(val_df,   feature_cols, shuffle=False)
-
-    if ds_tr is None or ds_va is None:
-        return None
-
-    model = build_lstm(len(feature_cols))
-    es = EarlyStopping(patience=8, restore_best_weights=True, verbose=0)
-    cbs = [es, ReduceLROnPlateau(patience=4, factor=0.5, verbose=0)]
-    # batch_size is baked into the dataset — do not pass it here
-    hist = model.fit(ds_tr, validation_data=ds_va,
-                     epochs=100, callbacks=cbs, verbose=0)
-    epochs_run = len(hist.history["loss"])
-    best_val   = min(hist.history.get("val_loss", [float("nan")]))
-    path = MODEL_DIR / f"lstm_{symbol}_{tf_min}m.keras"
-    model.save(path)
-    log.info(f"  LSTM done: {epochs_run} epochs | best val_loss={best_val:.4f} | saved {path.name}")
-    return model
-
-
-# ─────────────────────────────────────────────────────────────
-# 7. ENSEMBLE MODELS (XGBoost + Random Forest)
+# 6. ENSEMBLE MODELS (XGBoost + Random Forest)
 # ─────────────────────────────────────────────────────────────
 
 def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
@@ -683,310 +613,19 @@ def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
 
 
 # ─────────────────────────────────────────────────────────────
-# 8. REINFORCEMENT LEARNING ENVIRONMENT
+# 7. GENETIC ALGORITHM — PARAMETER OPTIMISATION
 # ─────────────────────────────────────────────────────────────
-
-class TradingEnv(gym.Env):
-    """
-    RL environment for the PPO agent.
-    State : last SEQ_LEN rows of features (flattened)
-    Action: 0=hold, 1=long, 2=short
-    Reward: risk-adjusted return, penalised for drawdown
-    The agent learns entry TF weight, HTF weight, and when to act.
-    """
-    metadata = {"render_modes": []}
-
-    # RL uses a single-bar observation — indicators already encode history
-    # (EMA, RSI, ATR, CVD etc. are rolling features). A 60-bar flat obs
-    # produces 8760-dim input → 64-unit MLP → gradient explosion.
-    RL_OBS_BARS   = 1
-    MAX_EP_STEPS  = 5_000  # cap episode length — prevents GAE divergence over 400k-bar single episode
-
-    def __init__(self, df: pd.DataFrame, feature_cols: list,
-                 sl_atr_mult: float = 1.5, rr: float = 2.0, be_r: int = 0):
-        super().__init__()
-        self.df           = df.reset_index(drop=True)
-        self.feature_cols = feature_cols
-        self.sl_mult      = sl_atr_mult
-        self.rr           = rr
-        self.be_r         = be_r   # 0=off, 1=move BE at 1R, 2=move BE at 2R
-        self.n_features   = len(feature_cols)
-
-        self.observation_space = spaces.Box(
-            low=-10, high=10,
-            shape=(self.RL_OBS_BARS * self.n_features,),
-            dtype=np.float32,
-        )
-        self.action_space = spaces.Discrete(3)  # 0=hold, 1=long, 2=short
-
-        self.reset()
-
-    def _obs(self):
-        # Single-bar observation: just the current bar's features.
-        # Indicators (EMA, RSI, ATR, CVD slopes etc.) already encode history,
-        # so the RL agent gets full market context without a multi-bar sequence.
-        # This keeps obs_dim = n_features (~146) instead of SEQ_LEN*n_features
-        # (~8760), preventing gradient explosion in the MLP policy.
-        row = self.df[self.feature_cols].iloc[self.idx].values.astype(np.float32)
-        np.nan_to_num(row, nan=0.0, posinf=10.0, neginf=-10.0, copy=False)
-        return np.clip(row, -10.0, 10.0)
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        # Randomise start position so each episode covers a different market regime
-        max_start = max(SEQ_LEN + 1, len(self.df) - self.MAX_EP_STEPS - 1)
-        self.idx        = int(np.random.randint(SEQ_LEN, max_start)) if max_start > SEQ_LEN else SEQ_LEN
-        self.ep_steps   = 0
-        self.balance    = 10000.0
-        self.peak       = 10000.0
-        self.daily_pnl  = 0.0
-        self.open_trade = None
-        return self._obs(), {}
-
-    def step(self, action):
-        row  = self.df.iloc[self.idx]
-        atr  = row.get("atr14", row["Close"] * 0.001)
-        self.ep_steps += 1
-        done = (self.idx >= len(self.df) - 2) or (self.ep_steps >= self.MAX_EP_STEPS)
-        reward = 0.0
-
-        # Close open trade if target/stop hit
-        if self.open_trade:
-            t = self.open_trade
-
-            # Break-even: move SL to entry+1pt once price reaches be_r * sl_dist
-            if self.be_r > 0 and not t.get("be_done", False):
-                be_trigger = t["entry"] + t["dir"] * t["sl_dist"] * self.be_r
-                if (t["dir"] == 1 and row["High"] >= be_trigger) or \
-                   (t["dir"] == -1 and row["Low"]  <= be_trigger):
-                    t["sl"]      = t["entry"] + t["dir"] * 1.0  # 1 US30 pt in profit
-                    t["be_done"] = True
-
-            pnl = 0.0
-            hit = False
-            if t["dir"] == 1:
-                if row["Low"]  <= t["sl"]: pnl = (t["sl"] - t["entry"]) / (t["sl_dist"] + 1e-10) * t["risk"]; hit = True
-                if row["High"] >= t["tp"]: pnl =  t["risk"] * self.rr; hit = True
-            else:
-                if row["High"] >= t["sl"]: pnl = (t["entry"] - t["sl"]) / (t["sl_dist"] + 1e-10) * t["risk"]; hit = True
-                if row["Low"]  <= t["tp"]: pnl =  t["risk"] * self.rr; hit = True
-            if hit:
-                self.balance   += pnl
-                self.daily_pnl += pnl
-                reward          = pnl / (t["risk"] + 1e-10)
-                self.open_trade = None
-                if self.balance > self.peak:
-                    self.peak = self.balance
-
-        # Drawdown penalty
-        dd = (self.peak - self.balance) / (self.peak + 1e-10)
-        reward -= dd * 2.0
-
-        # Clip reward to prevent exploding gradients in PPO
-        reward = float(np.clip(reward, -10.0, 10.0))
-
-        # Open new trade
-        if action != 0 and self.open_trade is None:
-            # Keep balance floor at 1.0 so risk never goes zero/negative
-            risk = max(self.balance, 1.0) * HARD_LIMITS["risk_per_trade_pct"] / 100
-            sl_dist = max(atr * self.sl_mult, 1e-6)
-            direction = 1 if action == 1 else -1
-            sl = row["Close"] - direction * sl_dist
-            tp = row["Close"] + direction * sl_dist * self.rr
-            self.open_trade = {
-                "dir": direction, "sl": sl, "tp": tp, "risk": risk,
-                "entry": row["Close"], "sl_dist": sl_dist, "be_done": False,
-            }
-
-        # Hard limit: max drawdown terminates episode
-        if dd > HARD_LIMITS["max_drawdown_pct"] / 100:
-            done = True
-            reward -= 10.0
-
-        self.idx += 1
-        return self._obs(), reward, done, False, {}
-
-
-def _rl_check_data(df_clean: pd.DataFrame, feature_cols: list) -> list:
-    """
-    Diagnose data quality issues before building the RL env.
-    Returns a cleaned list of feature_cols with constant/all-NaN columns removed.
-    Logs detailed stats so the root cause of any NaN logits is clear.
-    """
-    feat_df = df_clean[feature_cols]
-
-    # Count NaN per column after cleaning
-    nan_counts = feat_df.isnull().sum()
-    nan_cols   = nan_counts[nan_counts > 0]
-    if len(nan_cols) > 0:
-        log.warning(f"  [RL diag] {len(nan_cols)} columns still have NaN after cleaning:")
-        for col, cnt in nan_cols.items():
-            log.warning(f"    {col}: {cnt} NaN ({cnt/len(feat_df)*100:.1f}%)")
-    else:
-        log.info(f"  [RL diag] No NaN in any feature column after cleaning")
-
-    # Count inf per column
-    inf_counts = np.isinf(feat_df.values).sum(axis=0)
-    inf_cols   = [(feature_cols[i], inf_counts[i])
-                  for i in range(len(feature_cols)) if inf_counts[i] > 0]
-    if inf_cols:
-        log.warning(f"  [RL diag] {len(inf_cols)} columns have inf values:")
-        for col, cnt in inf_cols:
-            log.warning(f"    {col}: {cnt} inf")
-    else:
-        log.info(f"  [RL diag] No inf in any feature column after cleaning")
-
-    # Constant columns (std=0) cause 0/0 in some activations → NaN logits
-    stds     = feat_df.std()
-    zero_std = stds[stds == 0].index.tolist()
-    if zero_std:
-        log.warning(f"  [RL diag] {len(zero_std)} constant columns (std=0) — removing from obs:")
-        for col in zero_std[:10]:
-            log.warning(f"    {col} = {feat_df[col].iloc[0]:.4f} (all same value)")
-        if len(zero_std) > 10:
-            log.warning(f"    ... and {len(zero_std)-10} more")
-
-    # Overall obs stats
-    arr = feat_df.values
-    log.info(f"  [RL diag] Obs matrix {arr.shape}: "
-             f"mean={np.nanmean(arr):.4f} std={np.nanstd(arr):.4f} "
-             f"min={np.nanmin(arr):.4f} max={np.nanmax(arr):.4f}")
-    total_nan = np.isnan(arr).sum()
-    total_inf = np.isinf(arr).sum()
-    log.info(f"  [RL diag] Total NaN: {total_nan}  Total inf: {total_inf}")
-
-    # Return feature_cols with constant columns removed
-    clean_cols = [c for c in feature_cols if c not in zero_std]
-    if len(clean_cols) < len(feature_cols):
-        log.info(f"  [RL diag] Features reduced: {len(feature_cols)} → {len(clean_cols)} "
-                 f"(removed {len(feature_cols)-len(clean_cols)} constant cols)")
-    return clean_cols
-
-
-def _rl_model_is_healthy(model, env) -> bool:
-    """
-    Run one forward pass on a zero observation.
-    Returns False if the policy produces NaN logits (diverged weights).
-    This detects corrupted saved models before wasting time on continued training.
-    """
-    try:
-        obs_dim  = env.observation_space.shape[0]
-        test_obs = np.zeros((1, obs_dim), dtype=np.float32)
-        action, _ = model.predict(test_obs, deterministic=True)
-        # Also check policy logits directly
-        import torch
-        obs_t  = torch.FloatTensor(test_obs)
-        with torch.no_grad():
-            dist = model.policy.get_distribution(obs_t)
-            logits = dist.distribution.logits
-            if torch.isnan(logits).any() or torch.isinf(logits).any():
-                log.warning(f"  [RL diag] Saved model has NaN/inf logits on zero obs "
-                            f"— weights are diverged, will retrain from scratch")
-                return False
-        log.info(f"  [RL diag] Saved model sanity check passed (logits finite)")
-        return True
-    except Exception as e:
-        log.warning(f"  [RL diag] Model health check failed: {e} — retraining from scratch")
-        return False
-
-
-def train_rl_agent(df: pd.DataFrame, feature_cols: list,
-                   symbol: str, sl_mult: float, rr: float):
-    log.info(f"  Training RL agent: {symbol}")
-
-    # ── Step 1: clean data ───────────────────────────────────────────
-    df_clean = df.copy()
-    df_clean[feature_cols] = (
-        df_clean[feature_cols]
-        .fillna(0.0)
-        .replace([np.inf, -np.inf], [10.0, -10.0])
-        .clip(-10.0, 10.0)
-    )
-    df_clean = df_clean.dropna(subset=feature_cols).reset_index(drop=True)
-    log.info(f"  RL env: {len(df_clean):,} clean bars  "
-             f"| {len(feature_cols)} raw features")
-
-    # ── Step 2: diagnose + remove constant columns ───────────────────
-    feature_cols = _rl_check_data(df_clean, feature_cols)
-    if len(feature_cols) == 0:
-        log.error("  [RL] No usable features after cleaning — skipping PPO")
-        return None
-
-    def make_env():
-        return TradingEnv(df_clean, feature_cols, sl_mult, rr)
-
-    env  = DummyVecEnv([make_env])
-    path = str(MODEL_DIR / f"ppo_{symbol}")
-    ppo_zip = Path(path + ".zip")
-
-    try:
-        # ── Step 3: load or create model ────────────────────────────
-        retrain_fresh = True
-        if ppo_zip.exists():
-            log.info(f"  [RL] Loading existing model: {ppo_zip.name}")
-            try:
-                model = PPO.load(path, env=env)
-                model.set_env(env)
-                if _rl_model_is_healthy(model, env):
-                    retrain_fresh = False
-                    log.info(f"  [RL] Continuing training from saved model (50k steps)")
-                    model.learn(total_timesteps=50_000, reset_num_timesteps=False)
-                else:
-                    # Saved weights are NaN — delete and start fresh
-                    log.warning(f"  [RL] Deleting corrupted model, retraining from scratch")
-                    ppo_zip.unlink()
-                    retrain_fresh = True
-            except Exception as load_err:
-                log.warning(f"  [RL] Load failed ({load_err}) — retraining from scratch")
-                retrain_fresh = True
-
-        if retrain_fresh:
-            obs_dim = env.observation_space.shape[0]
-            log.info(f"  [RL] Training from scratch | obs_dim={obs_dim} "
-                     f"({len(feature_cols)} features × {TradingEnv.RL_OBS_BARS} bar) | 200k steps")
-            model = PPO("MlpPolicy", env, verbose=0,
-                        learning_rate=3e-5,
-                        n_steps=2048, batch_size=64,
-                        n_epochs=5,
-                        gamma=0.99, clip_range=0.15,
-                        max_grad_norm=0.3,
-                        target_kl=0.01,
-                        policy_kwargs={"net_arch": [32, 32]},
-                        ent_coef=0.005)
-            model.learn(total_timesteps=200_000)
-
-        # ── Step 4: final health check before saving ─────────────────
-        if not _rl_model_is_healthy(model, env):
-            log.warning(f"  [RL] Training produced NaN weights — discarding, not saving")
-            log.warning(f"  [RL] Root cause: likely extreme feature values or reward spikes")
-            log.warning(f"  [RL] Obs stats logged above — check [RL diag] lines")
-            return None
-
-        model.save(path)
-        log.info(f"  [RL] Agent saved: {path}.zip")
-        return model
-
-    except Exception as e:
-        log.warning(f"  [RL] Training failed: {e}")
-        log.warning(f"  [RL] Check [RL diag] lines above for root cause")
-        log.warning(f"  [RL] Skipping PPO — GA/Optuna will continue")
-        return None
-
-
-# ─────────────────────────────────────────────────────────────
-# 9. GENETIC ALGORITHM — PARAMETER OPTIMISATION
-# ─────────────────────────────────────────────────────────────
-# Genome: [entry_tf_idx, htf_idx, sl_atr, rr, tp_mult, confidence_thresh, htf_weight, be_r_idx]
+# Genome: [entry_tf_idx, htf_idx, sl_atr, tp_mult, confidence_thresh, htf_weight, be_r_idx]
+# rr removed — R-multiple is derived from actual exit price vs entry vs SL, not a param.
 
 GA_BOUNDS = [
     (0, len(PARAM_SEEDS["entry_tf_options"]) - 1),   # entry TF index
     (0, len(PARAM_SEEDS["htf_options"]) - 1),         # HTF index (0 = NONE)
     (PARAM_SEEDS["sl_atr_min"],    PARAM_SEEDS["sl_atr_max"]),
-    (PARAM_SEEDS["rr_min"],        PARAM_SEEDS["rr_max"]),
     (PARAM_SEEDS["tp_mult_min"],   PARAM_SEEDS["tp_mult_max"]),
     (PARAM_SEEDS["confidence_min"],PARAM_SEEDS["confidence_max"]),
     (PARAM_SEEDS["htf_weight_min"],PARAM_SEEDS["htf_weight_max"]),
-    (0, len(PARAM_SEEDS["be_r_options"]) - 1),        # BE trigger index (0/1/2R)
+    (0, len(PARAM_SEEDS["be_r_options"]) - 1),        # BE trigger index (0/1/2/3R)
 ]
 
 def decode_genome(genome: list) -> dict:
@@ -999,16 +638,15 @@ def decode_genome(genome: list) -> dict:
 
     tf_idx  = int(np.clip(round(float(genome[0])), 0, n_tf  - 1))
     htf_idx = int(np.clip(round(float(genome[1])), 0, n_htf - 1))
-    be_idx  = int(np.clip(round(float(genome[7])), 0, n_be  - 1))
+    be_idx  = int(np.clip(round(float(genome[6])), 0, n_be  - 1))
 
     return {
         "entry_tf":   PARAM_SEEDS["entry_tf_options"][tf_idx],
         "htf_tf":     PARAM_SEEDS["htf_options"][htf_idx],
         "sl_atr":     float(np.clip(genome[2], GA_BOUNDS[2][0], GA_BOUNDS[2][1])),
-        "rr":         float(np.clip(genome[3], GA_BOUNDS[3][0], GA_BOUNDS[3][1])),
-        "tp_mult":    float(np.clip(genome[4], GA_BOUNDS[4][0], GA_BOUNDS[4][1])),
-        "confidence": float(np.clip(genome[5], GA_BOUNDS[5][0], GA_BOUNDS[5][1])),
-        "htf_weight": float(np.clip(genome[6], GA_BOUNDS[6][0], GA_BOUNDS[6][1])),
+        "tp_mult":    float(np.clip(genome[3], GA_BOUNDS[3][0], GA_BOUNDS[3][1])),
+        "confidence": float(np.clip(genome[4], GA_BOUNDS[4][0], GA_BOUNDS[4][1])),
+        "htf_weight": float(np.clip(genome[5], GA_BOUNDS[5][0], GA_BOUNDS[5][1])),
         "be_r":       PARAM_SEEDS["be_r_options"][be_idx],
     }
 
@@ -1087,7 +725,7 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
 
         entry   = closes[i]
         sl      = entry - direction * sl_dist
-        tp      = entry + direction * sl_dist * params["rr"]
+        tp      = entry + direction * sl_dist * params["tp_mult"]
         risk    = max(balance, 1.0) * HARD_LIMITS["risk_per_trade_pct"] / 100
         be_r    = params.get("be_r", 0)
         be_trigger = entry + direction * sl_dist * be_r if be_r > 0 else None
@@ -1108,11 +746,11 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
                     sl = be_stop; be_done = True
 
             if direction == 1:
-                if bar_low  <= sl: pnl = (sl - entry) / sl_dist * risk; exit_bar = j; break
-                if bar_high >= tp: pnl = risk * params["rr"];            exit_bar = j; break
+                if bar_low  <= sl: pnl = (sl - entry) / (sl_dist + 1e-10) * risk; exit_bar = j; break
+                if bar_high >= tp: pnl = (tp - entry) / (sl_dist + 1e-10) * risk; exit_bar = j; break
             else:
-                if bar_high >= sl: pnl = (entry - sl) / sl_dist * risk; exit_bar = j; break
-                if bar_low  <= tp: pnl = risk * params["rr"];            exit_bar = j; break
+                if bar_high >= sl: pnl = (entry - sl) / (sl_dist + 1e-10) * risk; exit_bar = j; break
+                if bar_low  <= tp: pnl = (entry - tp) / (sl_dist + 1e-10) * risk; exit_bar = j; break
 
         skip_until = exit_bar   # block next entry until this trade closes
 
@@ -1201,10 +839,9 @@ def run_optuna(df_dict: dict, models_by_tf: dict,
             trial.suggest_int("htf_idx", 0,
                               len(PARAM_SEEDS["htf_options"]) - 1),
             trial.suggest_float("sl_atr",     *GA_BOUNDS[2]),
-            trial.suggest_float("rr",         *GA_BOUNDS[3]),
-            trial.suggest_float("tp_mult",    *GA_BOUNDS[4]),
-            trial.suggest_float("confidence", *GA_BOUNDS[5]),
-            trial.suggest_float("htf_weight", *GA_BOUNDS[6]),
+            trial.suggest_float("tp_mult",    *GA_BOUNDS[3]),
+            trial.suggest_float("confidence", *GA_BOUNDS[4]),
+            trial.suggest_float("htf_weight", *GA_BOUNDS[5]),
             trial.suggest_int("be_r_idx", 0,
                               len(PARAM_SEEDS["be_r_options"]) - 1),
         ]
@@ -1220,30 +857,30 @@ def run_optuna(df_dict: dict, models_by_tf: dict,
     # Multiple warm-start seeds to avoid local optima — covers conservative,
     # aggressive, and scalp-style starting points across the wider bounds
     _warm_starts = [
-        # Conservative: wide SL, modest RR, high confidence
+        # Conservative: wide SL, modest TP, high confidence
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(5),
          "htf_idx": PARAM_SEEDS["htf_options"].index(60),
-         "sl_atr": 1.5, "rr": 2.0, "tp_mult": 2.0,
+         "sl_atr": 1.5, "tp_mult": 2.0,
          "confidence": 0.65, "htf_weight": 0.6, "be_r_idx": 1},
-        # Aggressive: tight SL, high RR, lower confidence
+        # Aggressive: tight SL, high TP, lower confidence
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(3),
          "htf_idx": PARAM_SEEDS["htf_options"].index(30),
-         "sl_atr": 0.6, "rr": 4.0, "tp_mult": 4.0,
+         "sl_atr": 0.6, "tp_mult": 4.0,
          "confidence": 0.55, "htf_weight": 0.4, "be_r_idx": 2},
-        # Scalp: very tight SL, 1:1 RR, very high confidence
+        # Scalp: very tight SL, 1:1 TP, very high confidence
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(1),
          "htf_idx": PARAM_SEEDS["htf_options"].index(15),
-         "sl_atr": 0.4, "rr": 1.0, "tp_mult": 1.0,
+         "sl_atr": 0.4, "tp_mult": 1.0,
          "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
-        # Runner: wide SL, very high RR, no HTF
+        # Runner: wide SL, very high TP, no HTF
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(5),
          "htf_idx": PARAM_SEEDS["htf_options"].index(0),
-         "sl_atr": 2.5, "rr": 5.0, "tp_mult": 6.0,
+         "sl_atr": 2.5, "tp_mult": 6.0,
          "confidence": 0.70, "htf_weight": 0.0, "be_r_idx": 3},
         # Swing: 15m entry, 4H HTF, medium params
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(15),
          "htf_idx": PARAM_SEEDS["htf_options"].index(240),
-         "sl_atr": 2.0, "rr": 3.0, "tp_mult": 3.0,
+         "sl_atr": 2.0, "tp_mult": 3.0,
          "confidence": 0.72, "htf_weight": 0.7, "be_r_idx": 2},
     ]
     for ws in _warm_starts:
@@ -1256,7 +893,6 @@ def run_optuna(df_dict: dict, models_by_tf: dict,
         "entry_tf":   PARAM_SEEDS["entry_tf_options"][best["entry_tf_idx"]],
         "htf_tf":     PARAM_SEEDS["htf_options"][best["htf_idx"]],
         "sl_atr":     best["sl_atr"],
-        "rr":         best["rr"],
         "tp_mult":    best["tp_mult"],
         "confidence": best["confidence"],
         "htf_weight": best["htf_weight"],
@@ -1308,10 +944,9 @@ def run_per_tf_optimization(
             tf_idx,   # locked — not suggested by Optuna
             trial.suggest_int("htf_idx", 0, len(PARAM_SEEDS["htf_options"]) - 1),
             trial.suggest_float("sl_atr",     *GA_BOUNDS[2]),
-            trial.suggest_float("rr",         *GA_BOUNDS[3]),
-            trial.suggest_float("tp_mult",    *GA_BOUNDS[4]),
-            trial.suggest_float("confidence", *GA_BOUNDS[5]),
-            trial.suggest_float("htf_weight", *GA_BOUNDS[6]),
+            trial.suggest_float("tp_mult",    *GA_BOUNDS[3]),
+            trial.suggest_float("confidence", *GA_BOUNDS[4]),
+            trial.suggest_float("htf_weight", *GA_BOUNDS[5]),
             trial.suggest_int("be_r_idx", 0, len(PARAM_SEEDS["be_r_options"]) - 1),
         ]
         result = ga_fitness(genome, df_dict, models_by_tf, scalers_by_tf, symbol)
@@ -1328,23 +963,23 @@ def run_per_tf_optimization(
     _per_tf_warm_starts = [
         # Default seed
         {"htf_idx": PARAM_SEEDS["htf_options"].index(60),
-         "sl_atr": 1.5, "rr": 2.0, "tp_mult": 2.0,
+         "sl_atr": 1.5, "tp_mult": 2.0,
          "confidence": 0.65, "htf_weight": 0.5, "be_r_idx": 1},
         # Tight scalp
         {"htf_idx": PARAM_SEEDS["htf_options"].index(15),
-         "sl_atr": 0.4, "rr": 1.0, "tp_mult": 1.0,
+         "sl_atr": 0.4, "tp_mult": 1.0,
          "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
         # Wide swing
         {"htf_idx": PARAM_SEEDS["htf_options"].index(240),
-         "sl_atr": 3.0, "rr": 4.0, "tp_mult": 5.0,
+         "sl_atr": 3.0, "tp_mult": 5.0,
          "confidence": 0.70, "htf_weight": 0.8, "be_r_idx": 2},
         # No HTF — pure entry signal
         {"htf_idx": PARAM_SEEDS["htf_options"].index(0),
-         "sl_atr": 1.0, "rr": 3.0, "tp_mult": 3.0,
+         "sl_atr": 1.0, "tp_mult": 3.0,
          "confidence": 0.60, "htf_weight": 0.0, "be_r_idx": 3},
         # High conviction runner
         {"htf_idx": PARAM_SEEDS["htf_options"].index(30),
-         "sl_atr": 2.0, "rr": 5.0, "tp_mult": 7.0,
+         "sl_atr": 2.0, "tp_mult": 7.0,
          "confidence": 0.85, "htf_weight": 0.6, "be_r_idx": 2},
     ]
     for ws in _per_tf_warm_starts:
@@ -1360,7 +995,6 @@ def run_per_tf_optimization(
             "entry_tf":   locked_tf,
             "htf_tf":     PARAM_SEEDS["htf_options"][t.params.get("htf_idx", 0)],
             "sl_atr":     t.params.get("sl_atr", PARAM_SEEDS["sl_atr_seed"]),
-            "rr":         t.params.get("rr",     PARAM_SEEDS["rr_seed"]),
             "tp_mult":    t.params.get("tp_mult", PARAM_SEEDS["tp_mult_seed"]),
             "confidence": t.params.get("confidence", PARAM_SEEDS["confidence_seed"]),
             "htf_weight": t.params.get("htf_weight", PARAM_SEEDS["htf_weight_seed"]),
@@ -1402,7 +1036,6 @@ def load_params(symbol: str) -> dict:
         "entry_tf":   PARAM_SEEDS["entry_tf_default"],
         "htf_tf":     PARAM_SEEDS["htf_default"],
         "sl_atr":     PARAM_SEEDS["sl_atr_seed"],
-        "rr":         PARAM_SEEDS["rr_seed"],
         "tp_mult":    PARAM_SEEDS["tp_mult_seed"],
         "confidence": PARAM_SEEDS["confidence_seed"],
         "htf_weight": PARAM_SEEDS["htf_weight_seed"],
@@ -1425,7 +1058,6 @@ def get_signal(symbol: str, params: dict,
     entry_tf  = params["entry_tf"]
     htf_tf    = params["htf_tf"]     # 0 = no HTF
     sl_atr    = params["sl_atr"]
-    rr        = params["rr"]
     tp_mult   = params["tp_mult"]
     conf_thr  = params["confidence"]
     htf_w     = params["htf_weight"]
@@ -1449,15 +1081,7 @@ def get_signal(symbol: str, params: dict,
 
     scaled = apply_scaler(df.tail(SEQ_LEN + 5), scaler, feature_cols)
 
-    # LSTM signal
-    lstm_model = models_cache.get(f"lstm_{key}")
-    p_lstm = 0.5
-    if lstm_model is not None:
-        X, _ = make_sequences(scaled.tail(SEQ_LEN + 2), feature_cols)
-        if len(X) > 0:
-            p_lstm = float(lstm_model.predict(X[-1:], verbose=0)[0][0])
-
-    # Ensemble signal
+    # XGBoost + Random Forest signal (equal-weight average)
     last_feat = scaled[feature_cols].iloc[-1:].values
     p_xgb, p_rf = 0.5, 0.5
     xgb_m = models_cache.get(f"xgb_{key}")
@@ -1467,17 +1091,7 @@ def get_signal(symbol: str, params: dict,
     if rf_m is not None:
         p_rf  = float(rf_m.predict_proba(last_feat)[0][1])
 
-    # RL signal
-    p_rl = 0.5
-    rl_m = models_cache.get(f"ppo_{symbol}")
-    if rl_m is not None:
-        obs   = scaled[feature_cols].tail(SEQ_LEN).values.flatten()
-        obs   = np.clip(obs, -10, 10).astype(np.float32)
-        action, _ = rl_m.predict(obs, deterministic=True)
-        p_rl = 0.8 if action == 1 else (0.2 if action == 2 else 0.5)
-
-    # Weighted ensemble
-    prob = (p_lstm * 0.30 + p_xgb * 0.25 + p_rf * 0.25 + p_rl * 0.20)
+    prob = (p_xgb + p_rf) / 2.0
 
     # HTF filter: if HTF is bearish and signal is long, reduce confidence
     htf_dir = df["htf_bullish"].iloc[-1] if "htf_bullish" in df.columns else 0
@@ -1513,7 +1127,7 @@ def get_signal(symbol: str, params: dict,
         "sl_price":    round(sl, 5),
         "tp_price":    round(tp, 5),
         "sl_pips":     round(sl_dist, 5),
-        "rr":          round(rr, 2),
+        "tp_mult":     round(tp_mult, 2),
         "entry_tf":    entry_tf,
         "htf_used":    htf_tf,
         "htf_dir":     int(htf_dir),
@@ -1527,16 +1141,18 @@ def get_signal(symbol: str, params: dict,
 
 class RiskGate:
     def __init__(self):
-        self.session_start_balance = get_account_balance()
-        self.daily_loss            = 0.0
+        # Use equity (balance + floating P&L) for daily loss tracking.
+        # This correctly prevents exceeding risk limits when open positions are in loss.
+        self.session_start_equity = get_account_equity()
+        self.daily_loss           = 0.0
 
     def reset_daily(self):
-        self.session_start_balance = get_account_balance()
-        self.daily_loss            = 0.0
+        self.session_start_equity = get_account_equity()
+        self.daily_loss           = 0.0
 
     def position_size(self, sl_pips: float, symbol: str) -> float:
-        """Calculate lot size so risk = risk_per_trade_pct of balance."""
-        balance     = get_account_balance()
+        """Calculate lot size so risk = risk_per_trade_pct of equity."""
+        balance     = get_account_equity()
         risk_amount = balance * HARD_LIMITS["risk_per_trade_pct"] / 100
         sym_info    = mt5.symbol_info(symbol)
         if sym_info is None or sl_pips == 0:
@@ -1556,15 +1172,16 @@ class RiskGate:
 
     def can_trade(self) -> tuple:
         """Returns (allowed: bool, reason: str)"""
-        balance  = get_account_balance()
-        dd_pct   = ((self.session_start_balance - balance) /
-                    (self.session_start_balance + 1e-10)) * 100
+        # Equity includes floating P&L — correctly reflects true account risk
+        equity   = get_account_equity()
+        dd_pct   = ((self.session_start_equity - equity) /
+                    (self.session_start_equity + 1e-10)) * 100
 
         positions = mt5.positions_get()
         n_open    = len(positions) if positions else 0
 
-        daily_loss_pct = (self.daily_loss /
-                          (self.session_start_balance + 1e-10)) * 100
+        # Daily loss computed from equity to include open position losses
+        daily_loss_pct = max(dd_pct, 0.0)  # equity drawdown from session start = daily loss
 
         if daily_loss_pct >= HARD_LIMITS["max_daily_loss_pct"]:
             return False, f"Daily loss limit hit ({daily_loss_pct:.1f}%)"
@@ -1772,23 +1389,6 @@ def run_historical_training() -> tuple:
             models_cache[f"xgb_{key}"] = xgb_m
             models_cache[f"rf_{key}"]  = rf_m
 
-        # RL agent (train on default entry TF)
-        default_tf = PARAM_SEEDS["entry_tf_default"]
-        if default_tf in tf_feat:
-            df_rl = apply_scaler(
-                tf_feat[default_tf],
-                scalers_cache.get(f"{symbol}_{default_tf}m", StandardScaler()),
-                get_feature_cols(tf_feat[default_tf])
-            )
-            rl_agent = train_rl_agent(
-                df_rl,
-                get_feature_cols(df_rl),
-                symbol,
-                sl_mult = PARAM_SEEDS["sl_atr_seed"],
-                rr      = PARAM_SEEDS["rr_seed"],
-            )
-            models_cache[f"ppo_{symbol}"] = rl_agent
-
         # GA parameter search — use per-TF models/scalers so any entry_tf works
         # Check at least one TF has a scaler before running
         if any(scalers_cache.get(f"{symbol}_{tf}m") for tf in PARAM_SEEDS["entry_tf_options"]
@@ -1820,7 +1420,6 @@ def run_historical_training() -> tuple:
             log.info(f"    HTF       : {best_params['htf_tf']}m "
                      f"({'NONE' if best_params['htf_tf']==0 else 'active'})")
             log.info(f"    SL ATR x  : {best_params['sl_atr']:.3f}")
-            log.info(f"    R:R       : 1:{best_params['rr']:.2f}")
             log.info(f"    TP mult   : {best_params['tp_mult']:.2f}x")
             log.info(f"    Confidence: {best_params['confidence']:.2f}")
             log.info(f"    HTF weight: {best_params['htf_weight']:.2f}")
