@@ -653,7 +653,7 @@ def build_timing_summary(best: dict) -> str:
     htf_tf   = best.get("htf_tf", 0)
     conf     = best.get("confidence", 0) or 0
     sl_atr   = best.get("sl_atr", 0) or 0
-    rr       = best.get("rr", 0) or 0
+    tp_mult  = best.get("tp_mult", 0) or 0
     be_r     = best.get("be_r", 0)
 
     htf_desc = f"{htf_tf}m HTF confirmation" if htf_tf else "No HTF filter (entry TF only)"
@@ -698,9 +698,9 @@ def build_timing_summary(best: dict) -> str:
               current volatility. Tighter in quiet markets, wider in volatile.</td>
         </tr>
         <tr>
-          <td>Risk:Reward</td>
-          <td><b style="color:#2ecc71">1:{rr:.2f}</b> — TP placed at {rr:.2f}× the SL distance.
-              Minimum expectancy requires win rate > {100/(1+rr):.0f}%.</td>
+          <td>TP Multiplier</td>
+          <td><b style="color:#2ecc71">{tp_mult:.2f}× SL</b> — TP placed at {tp_mult:.2f}× the SL distance
+              from entry. Minimum expectancy requires win rate &gt; {100/(1+tp_mult):.0f}% at this ratio.</td>
         </tr>
         <tr>
           <td>Break-Even</td>
@@ -808,10 +808,38 @@ def build_strategy_table(strategies: list) -> str:
         else:
             freq_str = f"~{avg_hrs/24:.1f}d gap"
 
+        # Robustness traffic lights
+        dsr  = s.get("haircut_sharpe")
+        mc   = s.get("mc_pass")
+        sens = s.get("sensitivity_score")
+
+        dsr_cell = (
+            f'<span style="color:#2ecc71" title="Deflated Sharpe Ratio">{dsr:.2f}</span>'
+            if dsr is not None and dsr > 0
+            else f'<span style="color:#e74c3c" title="DSR ≤ 0 — fails robustness">{dsr:.2f}</span>'
+            if dsr is not None
+            else '<span style="color:#888">—</span>'
+        )
+        mc_cell = (
+            '<span style="color:#2ecc71" title="MC p5 Sharpe &gt; 0 — robust">✓</span>'
+            if mc
+            else '<span style="color:#e74c3c" title="MC p5 Sharpe ≤ 0 — fragile">✗</span>'
+            if mc is not None
+            else '<span style="color:#888">—</span>'
+        )
+        sens_cell = (
+            f'<span style="color:#2ecc71" title="Sensitivity score ≥ 50 — stable">{sens:.0f}</span>'
+            if sens is not None and sens >= 50
+            else f'<span style="color:#e74c3c" title="Sensitivity score &lt; 50 — unstable">{sens:.0f}</span>'
+            if sens is not None
+            else '<span style="color:#888">—</span>'
+        )
+
         active_badge = (
             '<span style="color:#2ecc71;font-weight:bold"> ★</span>'
             if s.get("is_active") else ""
         )
+        tp_mult = s.get("tp_mult")
         rows_html += f"""
         <tr>
           <td><b>{sid}</b>{active_badge}</td>
@@ -819,7 +847,7 @@ def build_strategy_table(strategies: list) -> str:
           <td>{s.get('rank','?')}</td>
           <td>{s.get('entry_tf','?')}m / {s.get('htf_tf',0)}m</td>
           <td>{_fmt(s.get('sl_atr'),'.3f')}×ATR</td>
-          <td>1:{_fmt(s.get('rr'),'.2f')}</td>
+          <td>{_fmt(tp_mult,'.2f')}×SL</td>
           <td>{_fmt(s.get('confidence'),'.2f')}</td>
           <td>{'OFF' if not be else f'+{be}R'}</td>
           <td style="color:{_color(er)}">{_fmt(er,'.2f')}</td>
@@ -833,6 +861,9 @@ def build_strategy_table(strategies: list) -> str:
           <td title="{per_day:.2f}/day  {per_week:.1f}/week"
               style="color:#3498db">{freq_str}</td>
           <td style="color:{_color(exp)}">{_fmt(exp,'+.3f')}R</td>
+          <td style="text-align:center">{dsr_cell}</td>
+          <td style="text-align:center">{mc_cell}</td>
+          <td style="text-align:center">{sens_cell}</td>
         </tr>"""
 
     return f"""
@@ -840,22 +871,26 @@ def build_strategy_table(strategies: list) -> str:
       <thead>
         <tr>
           <th>Strategy</th><th>TF</th><th>Rank</th>
-          <th>Entry/HTF</th><th>SL</th><th>R:R</th>
+          <th>Entry/HTF</th><th>SL</th><th>TP Mult</th>
           <th>Conf</th><th>BE</th>
           <th>ER ↓</th><th>Sharpe</th><th>Win%</th>
           <th>PF</th><th>Profit $</th>
           <th>MaxDD%</th><th>MaxDD$</th>
           <th>Trades</th><th title="Avg gap between trades">Freq</th><th>Expect</th>
+          <th title="Deflated Sharpe Ratio — Sharpe haircut for multiple testing. Must be &gt; 0.">DSR</th>
+          <th title="Monte Carlo pass — p5 Sharpe &gt; 0 across 1000 bootstrap resamples">MC</th>
+          <th title="Parameter sensitivity score 0–100. ≥ 50 = stable params.">Sens</th>
         </tr>
       </thead>
       <tbody>{rows_html}</tbody>
     </table>
     <p class="note">
       ★ = running live &nbsp;|&nbsp;
+      TP Mult = TP distance as multiple of SL distance &nbsp;|&nbsp;
       ER = (peak profit / max DD $) × {ER_MULTIPLIER} &nbsp;|&nbsp;
-      MaxDD% = relative (peak-to-trough as % of peak) &nbsp;|&nbsp;
-      MaxDD$ = absolute money &nbsp;|&nbsp;
-      Freq = avg gap between trades (hover for per-day/week) &nbsp;|&nbsp;
+      DSR = deflated Sharpe (green &gt; 0, red ≤ 0) &nbsp;|&nbsp;
+      MC = Monte Carlo p5 Sharpe &gt; 0 across 1000 resamples &nbsp;|&nbsp;
+      Sens = parameter stability score (green ≥ 50) &nbsp;|&nbsp;
       Sorted by TF then rank. All stats from {BACKTEST_START}.
     </p>"""
 
@@ -907,6 +942,404 @@ def build_feature_importance_chart(symbol: str, tf: int) -> str:
         yaxis=dict(gridcolor="#2d2d2d"),
     )
     return pyo.plot(fig, output_type="div", include_plotlyjs=False)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Rolling 90-day performance chart
+# ─────────────────────────────────────────────────────────────────────
+
+def build_rolling_performance_chart(strategy_id: str, trades: list) -> str:
+    """
+    Rolling 90-day Sharpe ratio and win rate.
+    The single most important chart for the live deployment decision:
+    if the last 90 days show degrading performance, do not go live until retrained.
+    """
+    if not HAS_PLOTLY or len(trades) < 30:
+        return "<p style='color:#888'>Need ≥ 30 trades for rolling performance chart.</p>"
+
+    df = pd.DataFrame(trades)
+    df["entry_time"] = pd.to_datetime(df["entry_time"])
+    df = df.sort_values("entry_time").set_index("entry_time")
+    df["pnl_r"]  = pd.to_numeric(df.get("pnl_r", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    df["win"]    = pd.to_numeric(df.get("win", pd.Series(dtype=float)), errors="coerce").fillna(0)
+
+    # Resample to daily — sum of pnl_r per day, win rate per day
+    daily_pnl = df["pnl_r"].resample("D").sum()
+    daily_win = df["win"].resample("D").mean() * 100
+
+    # Rolling 90-calendar-day window
+    WIN = 90
+    rolling_sharpe = (
+        daily_pnl.rolling(WIN, min_periods=20).mean() /
+        (daily_pnl.rolling(WIN, min_periods=20).std() + 1e-10) *
+        np.sqrt(252)
+    )
+    rolling_wr = daily_win.rolling(WIN, min_periods=20).mean()
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.55, 0.45],
+        subplot_titles=(f"Rolling 90-Day Sharpe — {strategy_id}",
+                        "Rolling 90-Day Win Rate (%)"),
+        vertical_spacing=0.08,
+    )
+
+    fig.add_trace(go.Scatter(
+        x=rolling_sharpe.index, y=rolling_sharpe.values,
+        mode="lines", name="Sharpe (90d)",
+        line=dict(color="#3498db", width=2),
+        hovertemplate="%{x|%Y-%m-%d}<br>Sharpe: %{y:.2f}<extra></extra>",
+    ), row=1, col=1)
+    fig.add_hline(y=0,   row=1, col=1, line_dash="dash", line_color="#e74c3c", line_width=1)
+    fig.add_hline(y=1.0, row=1, col=1, line_dash="dot",  line_color="#2ecc71", line_width=1,
+                  annotation_text="1.0 target", annotation_position="right")
+
+    fig.add_trace(go.Scatter(
+        x=rolling_wr.index, y=rolling_wr.values,
+        mode="lines", name="Win Rate (90d)",
+        line=dict(color="#e67e22", width=2),
+        hovertemplate="%{x|%Y-%m-%d}<br>Win Rate: %{y:.1f}%<extra></extra>",
+        fill="tozeroy", fillcolor="rgba(230,126,34,0.1)",
+    ), row=2, col=1)
+    fig.add_hline(y=50, row=2, col=1, line_dash="dash", line_color="#e74c3c", line_width=1,
+                  annotation_text="50% breakeven", annotation_position="right")
+
+    fig.update_layout(
+        height=480, plot_bgcolor="#1a1a2e", paper_bgcolor="#16213e",
+        font=dict(color="#e0e0e0", size=11),
+        showlegend=False,
+        margin=dict(l=60, r=80, t=40, b=20),
+    )
+    fig.update_xaxes(gridcolor="#2d2d2d")
+    fig.update_yaxes(gridcolor="#2d2d2d")
+    return pyo.plot(fig, output_type="div", include_plotlyjs=False)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Monte Carlo equity fan chart
+# ─────────────────────────────────────────────────────────────────────
+
+def build_mc_fan_chart(strategy_id: str, trades: list,
+                       n_sims: int = 500, seed: int = 42) -> str:
+    """
+    Bootstrap-resample the trade sequence n_sims times and plot the
+    p5/p25/p50/p75/p95 equity fan. Shows whether performance is robust
+    to trade ordering or depends on lucky sequencing.
+    """
+    if not HAS_PLOTLY or len(trades) < 10:
+        return "<p style='color:#888'>Need ≥ 10 trades for Monte Carlo fan chart.</p>"
+
+    pnl_r = np.array([float(t.get("pnl_r") or 0) for t in trades])
+    n     = len(pnl_r)
+    rng   = np.random.default_rng(seed)
+
+    # Simulate equity paths using fixed $100/trade risk (normalised)
+    paths = np.zeros((n_sims, n + 1))
+    paths[:, 0] = 100.0
+    for s in range(n_sims):
+        order = rng.choice(n, size=n, replace=True)
+        for i, idx in enumerate(order):
+            paths[s, i + 1] = paths[s, i] + pnl_r[idx]
+
+    pcts = np.percentile(paths, [5, 25, 50, 75, 95], axis=0)
+    xs   = list(range(n + 1))
+
+    fig = go.Figure()
+
+    # p5–p95 outer band
+    fig.add_trace(go.Scatter(
+        x=xs + xs[::-1],
+        y=list(pcts[4]) + list(pcts[0])[::-1],
+        fill="toself", fillcolor="rgba(52,152,219,0.10)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="p5–p95", hoverinfo="skip",
+    ))
+    # p25–p75 inner band
+    fig.add_trace(go.Scatter(
+        x=xs + xs[::-1],
+        y=list(pcts[3]) + list(pcts[1])[::-1],
+        fill="toself", fillcolor="rgba(52,152,219,0.25)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="p25–p75", hoverinfo="skip",
+    ))
+    # Median line
+    fig.add_trace(go.Scatter(
+        x=xs, y=pcts[2], mode="lines",
+        line=dict(color="#3498db", width=2),
+        name="Median",
+        hovertemplate="Trade %{x}<br>Median equity: $%{y:.1f}<extra></extra>",
+    ))
+    # Breakeven line
+    fig.add_hline(y=100, line_dash="dash", line_color="#888", line_width=1,
+                  annotation_text="Start $100", annotation_position="right")
+
+    fig.update_layout(
+        title=dict(text=f"Monte Carlo Equity Fan — {strategy_id} ({n_sims} bootstrap resamples)",
+                   font=dict(color="#e0e0e0")),
+        height=420, plot_bgcolor="#1a1a2e", paper_bgcolor="#16213e",
+        font=dict(color="#e0e0e0", size=11),
+        legend=dict(bgcolor="rgba(0,0,0,0.4)", bordercolor="#444", x=0.01, y=0.99),
+        xaxis=dict(title="Trade number", gridcolor="#2d2d2d"),
+        yaxis=dict(title="Normalised equity ($)", gridcolor="#2d2d2d"),
+        margin=dict(l=60, r=100, t=50, b=40),
+    )
+    return pyo.plot(fig, output_type="div", include_plotlyjs=False)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Return distribution histogram
+# ─────────────────────────────────────────────────────────────────────
+
+def build_return_distribution(strategy_id: str, trades: list) -> str:
+    """
+    Per-trade R-value histogram. Reveals tail risk hidden by Sharpe:
+    fat loss tails, skewness, and whether wins/losses are symmetric.
+    """
+    if not HAS_PLOTLY or len(trades) < 10:
+        return "<p style='color:#888'>Need ≥ 10 trades for return distribution.</p>"
+
+    pnl_r = [float(t.get("pnl_r") or 0) for t in trades]
+    arr   = np.array(pnl_r)
+    wins  = arr[arr > 0]
+    losses = arr[arr < 0]
+
+    mean_r  = float(arr.mean())
+    med_r   = float(np.median(arr))
+    skew    = float(pd.Series(arr).skew())
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=arr, nbinsx=50,
+        marker_color=np.where(arr >= 0, "#2ecc71", "#e74c3c").tolist(),
+        name="All trades",
+        hovertemplate="R-value: %{x:.2f}<br>Count: %{y}<extra></extra>",
+    ))
+    fig.add_vline(x=0,      line_dash="dash", line_color="#888",    line_width=1)
+    fig.add_vline(x=mean_r, line_dash="dot",  line_color="#f39c12", line_width=2,
+                  annotation_text=f"Mean {mean_r:+.2f}R",
+                  annotation_position="top right")
+    fig.add_vline(x=med_r,  line_dash="dot",  line_color="#9b59b6", line_width=2,
+                  annotation_text=f"Median {med_r:+.2f}R",
+                  annotation_position="top left")
+
+    win_rate = 100 * len(wins) / len(arr) if len(arr) > 0 else 0
+    avg_win  = float(wins.mean())  if len(wins)   > 0 else 0
+    avg_loss = float(losses.mean()) if len(losses) > 0 else 0
+
+    fig.update_layout(
+        title=dict(
+            text=(f"Trade R-Value Distribution — {strategy_id} | "
+                  f"Win {win_rate:.1f}%  Avg win {avg_win:+.2f}R  "
+                  f"Avg loss {avg_loss:+.2f}R  Skew {skew:+.2f}"),
+            font=dict(color="#e0e0e0", size=12),
+        ),
+        height=360, plot_bgcolor="#1a1a2e", paper_bgcolor="#16213e",
+        font=dict(color="#e0e0e0", size=11),
+        showlegend=False,
+        xaxis=dict(title="R-multiple (profit / risk)", gridcolor="#2d2d2d",
+                   zeroline=True, zerolinecolor="#555"),
+        yaxis=dict(title="Trade count", gridcolor="#2d2d2d"),
+        margin=dict(l=60, r=30, t=60, b=40),
+        bargap=0.05,
+    )
+    return pyo.plot(fig, output_type="div", include_plotlyjs=False)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Day-of-week performance chart
+# ─────────────────────────────────────────────────────────────────────
+
+def build_dow_chart(strategy_id: str, by_dow: dict) -> str:
+    """
+    Win rate and total P&L by day of week.
+    `_session_stats()` already computes `by_dow` — this renders it.
+    """
+    if not HAS_PLOTLY or not by_dow:
+        return ""
+
+    days    = [DOW_NAMES[d] for d in range(7)]
+    counts  = [by_dow[d]["n"]    for d in range(7)]
+    wr      = [100 * by_dow[d]["wins"] / max(by_dow[d]["n"], 1) for d in range(7)]
+    pnl     = [by_dow[d]["pnl"]  for d in range(7)]
+
+    # Only show days that have at least 1 trade
+    active  = [d for d in range(7) if counts[d] > 0]
+    if not active:
+        return ""
+
+    days_a  = [days[d]   for d in active]
+    wr_a    = [wr[d]     for d in active]
+    pnl_a   = [pnl[d]    for d in active]
+    cnt_a   = [counts[d] for d in active]
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Win Rate by Day (%)", "Total P&L by Day ($)"),
+        horizontal_spacing=0.12,
+    )
+
+    wr_colors  = ["#2ecc71" if w >= 50 else "#e74c3c" for w in wr_a]
+    pnl_colors = ["#2ecc71" if p >= 0  else "#e74c3c" for p in pnl_a]
+
+    fig.add_trace(go.Bar(
+        x=days_a, y=wr_a, marker_color=wr_colors, name="Win %",
+        text=[f"{w:.1f}%<br>({c})" for w, c in zip(wr_a, cnt_a)],
+        textposition="outside",
+        hovertemplate="%{x}<br>Win rate: %{y:.1f}%<extra></extra>",
+    ), row=1, col=1)
+    fig.add_hline(y=50, row=1, col=1, line_dash="dash", line_color="#888", line_width=1)
+
+    fig.add_trace(go.Bar(
+        x=days_a, y=pnl_a, marker_color=pnl_colors, name="P&L $",
+        text=[f"${p:+,.0f}" for p in pnl_a],
+        textposition="outside",
+        hovertemplate="%{x}<br>P&L: $%{y:+,.0f}<extra></extra>",
+    ), row=1, col=2)
+    fig.add_hline(y=0, row=1, col=2, line_dash="dash", line_color="#888", line_width=1)
+
+    fig.update_layout(
+        title=dict(text=f"Day-of-Week Performance — {strategy_id}",
+                   font=dict(color="#e0e0e0")),
+        height=340, plot_bgcolor="#1a1a2e", paper_bgcolor="#16213e",
+        font=dict(color="#e0e0e0", size=11),
+        showlegend=False,
+        margin=dict(l=50, r=30, t=60, b=40),
+    )
+    fig.update_xaxes(gridcolor="#2d2d2d")
+    fig.update_yaxes(gridcolor="#2d2d2d")
+    return pyo.plot(fig, output_type="div", include_plotlyjs=False)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Live vs backtest comparison
+# ─────────────────────────────────────────────────────────────────────
+
+def _prop_z_test(p1: float, n1: int, p2: float, n2: int) -> tuple[float, str]:
+    """Two-proportion z-test. Returns (z_stat, significance_string)."""
+    if n1 < 2 or n2 < 2:
+        return 0.0, "n/a"
+    p_pool = (p1 * n1 + p2 * n2) / (n1 + n2)
+    se = max((p_pool * (1 - p_pool) * (1/n1 + 1/n2)) ** 0.5, 1e-10)
+    z  = (p1 - p2) / se
+    sig = ("p<0.01" if abs(z) > 2.576
+           else "p<0.05" if abs(z) > 1.96
+           else "p<0.10" if abs(z) > 1.645
+           else "n.s.")
+    return z, sig
+
+
+def build_live_vs_backtest(live_trades: list, backtest_trades: list,
+                           strategy: dict) -> str:
+    """
+    Compare live closed trades against backtest expectations.
+    Requires MIN_LIVE_TRADES closed trades to show statistics.
+    Until then, shows a placeholder so the section is visible in every report.
+    """
+    MIN_LIVE_TRADES = 30
+
+    closed = [t for t in live_trades if t.get("status") == "closed"]
+    sid    = strategy.get("strategy_id", "?") if strategy else "?"
+
+    if len(closed) < MIN_LIVE_TRADES:
+        return f"""
+    <div class="info-box">
+      <h3>Live vs Backtest Comparison — {sid}</h3>
+      <p style="color:#888">
+        Waiting for live data: {len(closed)} / {MIN_LIVE_TRADES} closed trades recorded.<br>
+        This section will auto-populate once sufficient live trades accumulate —
+        no code change needed. Check back after the next trading week.
+      </p>
+      <table class="info-table" style="margin-top:12px;opacity:0.4">
+        <tr><td>Metric</td><td>Backtest</td><td>Live</td><td>Z-stat</td><td>Significance</td></tr>
+        <tr><td>Win rate</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+        <tr><td>Avg R per trade</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+        <tr><td>Profit factor</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+      </table>
+    </div>"""
+
+    # ── Compute live stats ─────────────────────────────────────────
+    live_pnl_r = np.array([float(t.get("pnl_r") or 0) for t in closed])
+    live_wins  = int(sum(t.get("win", 0) for t in closed))
+    live_n     = len(closed)
+    live_wr    = live_wins / live_n
+    live_avg_r = float(live_pnl_r.mean())
+    gross_w    = float(live_pnl_r[live_pnl_r > 0].sum()) if (live_pnl_r > 0).any() else 0
+    gross_l    = float(abs(live_pnl_r[live_pnl_r < 0].sum())) if (live_pnl_r < 0).any() else 1e-10
+    live_pf    = gross_w / gross_l
+
+    # ── Backtest stats ─────────────────────────────────────────────
+    bt_wr  = float(strategy.get("win_rate", 0) or 0) / 100
+    bt_pf  = float(strategy.get("profit_factor", 0) or 0)
+    bt_exp = float(strategy.get("expectancy", 0) or 0)
+    bt_n   = int(strategy.get("n_trades", 0) or 0)
+
+    # Compute backtest avg_r from backtest_trades if available
+    if backtest_trades:
+        bt_pnl_r   = np.array([float(t.get("pnl_r") or 0) for t in backtest_trades])
+        bt_avg_r   = float(bt_pnl_r.mean())
+    else:
+        bt_avg_r   = bt_exp
+
+    # ── Statistical tests ──────────────────────────────────────────
+    wr_z, wr_sig = _prop_z_test(live_wr, live_n, bt_wr, bt_n)
+
+    def _color_delta(live, bt, higher_is_better=True):
+        diff = live - bt
+        if abs(diff) < 0.01 * abs(bt + 1e-10):
+            return "#888"
+        good = diff > 0 if higher_is_better else diff < 0
+        return "#2ecc71" if good else "#e74c3c"
+
+    wr_color  = _color_delta(live_wr,  bt_wr)
+    r_color   = _color_delta(live_avg_r, bt_avg_r)
+    pf_color  = _color_delta(live_pf,  bt_pf)
+
+    flag = ""
+    if wr_sig in ("p<0.01","p<0.05") and live_wr < bt_wr:
+        flag = ('<p style="color:#e74c3c;font-weight:bold;margin-top:8px">'
+                '⚠ Statistically significant win rate degradation detected. '
+                'Consider pausing live trading and retraining.</p>')
+
+    return f"""
+    <div class="info-box">
+      <h3>Live vs Backtest Comparison — {sid}
+          <span style="font-size:11px;color:#888;font-weight:normal">
+          ({live_n} live closed trades)</span></h3>
+      <table class="info-table">
+        <tr>
+          <th style="color:#888">Metric</th>
+          <th style="color:#888">Backtest ({bt_n:,} trades)</th>
+          <th style="color:#888">Live ({live_n} trades)</th>
+          <th style="color:#888">Z-stat</th>
+          <th style="color:#888">Significance</th>
+        </tr>
+        <tr>
+          <td>Win rate</td>
+          <td>{bt_wr*100:.1f}%</td>
+          <td style="color:{wr_color}">{live_wr*100:.1f}%</td>
+          <td>{wr_z:+.2f}</td>
+          <td>{wr_sig}</td>
+        </tr>
+        <tr>
+          <td>Avg R per trade</td>
+          <td>{bt_avg_r:+.3f}R</td>
+          <td style="color:{r_color}">{live_avg_r:+.3f}R</td>
+          <td>—</td><td>—</td>
+        </tr>
+        <tr>
+          <td>Profit factor</td>
+          <td>{bt_pf:.2f}</td>
+          <td style="color:{pf_color}">{live_pf:.2f}</td>
+          <td>—</td><td>—</td>
+        </tr>
+      </table>
+      {flag}
+      <p class="note" style="margin-top:8px">
+        Green = live outperforming backtest expectation &nbsp;|&nbsp;
+        Red = live underperforming &nbsp;|&nbsp;
+        Z-test: two-proportion test for win rate drift (|z| &gt; 1.96 = significant at 5%)
+      </p>
+    </div>"""
 
 
 def build_live_trades_table(trades: list) -> str:
@@ -999,6 +1432,19 @@ def build_report():
                     + (f'<div class="card-sub">{sub}</div>' if sub else "")
                     + "</div>")
 
+        # Compute max consecutive losses from backtest trades
+        max_consec = 0
+        _streak = 0
+        for t in best_trades:
+            if not t.get("win", 1):
+                _streak += 1
+                max_consec = max(max_consec, _streak)
+            else:
+                _streak = 0
+
+        sortino = best.get("sortino") or 0
+        calmar  = best.get("calmar")  or 0
+
         htf_str = f"{htf}m" if htf else "None"
         summary_cards = f"""
         <div class="best-strategy-banner">
@@ -1015,6 +1461,12 @@ def build_report():
           {card("Sharpe Ratio", f"{sh:.2f}",
                 "#2ecc71" if sh>1 else ("#e67e22" if sh>0.5 else "#e74c3c"),
                 ">1.0 good, >2.0 excellent")}
+          {card("Sortino Ratio", f"{sortino:.2f}",
+                "#2ecc71" if sortino>1.5 else ("#e67e22" if sortino>0.5 else "#e74c3c"),
+                "Sharpe penalising downside only")}
+          {card("Calmar Ratio", f"{calmar:.2f}",
+                "#2ecc71" if calmar>1 else ("#e67e22" if calmar>0.5 else "#e74c3c"),
+                "Annual return / max DD%")}
           {card("Win Rate", f"{wr:.1f}%",
                 "#2ecc71" if wr>50 else "#e74c3c")}
           {card("Profit Factor", f"{pf:.2f}",
@@ -1029,6 +1481,9 @@ def build_report():
           {card("Max DD (Absolute $)", f"${ddm:,.0f}",
                 "#e74c3c" if ddm>2000 else ("#e67e22" if ddm>1000 else "#2ecc71"),
                 "largest money drawdown ever")}
+          {card("Max Consec Losses", f"{max_consec}",
+                "#e74c3c" if max_consec>6 else ("#e67e22" if max_consec>4 else "#2ecc71"),
+                "longest losing streak in backtest")}
           {card("Open Positions", f"{len(live_trades)}", "#9b59b6", "currently live")}
         </div>"""
 
@@ -1047,13 +1502,34 @@ def build_report():
     timing_div = build_timing_summary(best)
 
     # ── Session + hour charts ────────────────────────────────────────
-    session_div = ""
-    hour_div    = ""
-    freq_div    = ""
+    session_div  = ""
+    hour_div     = ""
+    freq_div     = ""
+    dow_div      = ""
+    roll_div     = ""
+    mc_fan_div   = ""
+    ret_dist_div = ""
     if best_trades:
-        session_div = build_session_chart(best["strategy_id"], best_trades)
-        hour_div    = build_hour_heatmap(best["strategy_id"], best_trades)
-        freq_div    = build_frequency_section(best, best_trades)
+        session_div  = build_session_chart(best["strategy_id"], best_trades)
+        hour_div     = build_hour_heatmap(best["strategy_id"], best_trades)
+        freq_div     = build_frequency_section(best, best_trades)
+        # DOW chart: reuse the by_dow dict already computed inside _session_stats
+        _ss          = _session_stats(best_trades)
+        dow_div      = build_dow_chart(best["strategy_id"], _ss["by_dow"])
+        roll_div     = build_rolling_performance_chart(best["strategy_id"], best_trades)
+        mc_fan_div   = build_mc_fan_chart(best["strategy_id"], best_trades)
+        ret_dist_div = build_return_distribution(best["strategy_id"], best_trades)
+
+    # ── Live vs backtest comparison ──────────────────────────────────
+    # Re-use the same DB query for the live table at the bottom of the report
+    live_closed  = get_open_trades() if HAS_DB else []
+    live_bt_div  = ""
+    if best:
+        live_bt_div = build_live_vs_backtest(
+            live_trades=live_closed,
+            backtest_trades=best_trades,
+            strategy=best,
+        )
 
     # ── Strategy table ──────────────────────────────────────────────
     strategy_tbl = build_strategy_table(strategies)
@@ -1077,7 +1553,20 @@ def build_report():
         <h3 style="margin-top:30px">Feature Importance — {symbol} {tf_best}m
             <span style="font-size:12px;color:#888;font-weight:normal">
             (what the ML uses most for decisions)</span></h3>
-        {build_feature_importance_chart(symbol, tf_best)}"""
+        {build_feature_importance_chart(symbol, tf_best)}
+        <div class="info-box" style="margin-top:10px;border-left:3px solid #e67e22">
+          <p style="color:#e67e22;font-size:12px;font-weight:bold;margin-bottom:4px">
+            CFD Data Note — Order Flow Features</p>
+          <p class="note">
+            Features named <b>cvd</b>, <b>delta</b>, <b>quote_delta</b>,
+            <b>absorption</b>, <b>stacked_imbalance</b>, and <b>vp_*</b> are derived from
+            Dukascopy <em>tick count / quote update frequency</em> — not real exchange-traded volume.
+            High feature importance for these does not mean the model has learned genuine
+            institutional order flow. It means these proxy signals correlate with price moves
+            in the historical data. Treat them as <b>liquidity-activity proxies</b>, not volume.
+            For validation, compare rankings against CME Micro YM futures volume on the same bars.
+          </p>
+        </div>"""
 
     # ── Optimisation criteria ────────────────────────────────────────
     optim_html = f"""
@@ -1094,7 +1583,7 @@ def build_report():
         <tr><td>Entry TF options</td><td>1m / 3m / 5m / 10m / 15m</td></tr>
         <tr><td>HTF options</td><td>None / 15m / 30m / 60m</td></tr>
         <tr><td>SL range</td><td>0.5 – 3.0 × ATR(14)</td></tr>
-        <tr><td>R:R range</td><td>1.0 – 4.0</td></tr>
+        <tr><td>TP Mult range</td><td>1.0 – 4.0 × SL distance</td></tr>
         <tr><td>Confidence</td><td>0.50 – 0.85 (ensemble threshold)</td></tr>
         <tr><td>Break-even</td><td>OFF / +1R / +2R trigger</td></tr>
         <tr><td>Efficiency Ratio</td>
@@ -1111,7 +1600,7 @@ def build_report():
       </table>
     </div>"""
 
-    live_tbl = build_live_trades_table(get_open_trades() if HAS_DB else [])
+    live_tbl = build_live_trades_table(live_closed)
 
     # ── Assemble HTML ────────────────────────────────────────────────
     risk_str = (_fmt(RISK_PCT,'.1f','%') if RISK_MODE=='percent'
@@ -1231,6 +1720,43 @@ def build_report():
 {freq_div}
 
 <hr class="divider">
+<h2>Day-of-Week Performance</h2>
+<div class="note" style="margin-bottom:8px">
+  Win rate and total P&amp;L per weekday. Reveals structural edges or weaknesses
+  on specific days — useful for adding day-of-week filters.
+</div>
+<div class="section">{dow_div if dow_div else
+  '<p style="color:#888">No trade data yet. Run training first.</p>'}</div>
+
+<hr class="divider">
+<h2>Rolling 90-Day Performance</h2>
+<div class="note" style="margin-bottom:8px">
+  Most important chart for the live deployment decision. If the last 90 days show
+  degrading Sharpe or win rate, retrain before going live.
+</div>
+<div class="section">{roll_div if roll_div else
+  '<p style="color:#888">Need ≥ 30 backtest trades for rolling chart.</p>'}</div>
+
+<hr class="divider">
+<h2>Monte Carlo Equity Fan</h2>
+<div class="note" style="margin-bottom:8px">
+  500 bootstrap resamples of the backtest trade sequence. The fan width shows whether
+  performance depends on lucky ordering (wide fan = high luck sensitivity).
+  A tight fan clustering above breakeven = genuinely robust edge.
+</div>
+<div class="section">{mc_fan_div if mc_fan_div else
+  '<p style="color:#888">Need ≥ 10 backtest trades for Monte Carlo chart.</p>'}</div>
+
+<hr class="divider">
+<h2>Trade R-Value Distribution</h2>
+<div class="note" style="margin-bottom:8px">
+  Per-trade P&amp;L as R-multiples (profit / initial risk).
+  Reveals tail risk hidden by Sharpe: fat loss tails, skewness, outlier dependence.
+</div>
+<div class="section">{ret_dist_div if ret_dist_div else
+  '<p style="color:#888">Need ≥ 10 backtest trades for distribution chart.</p>'}</div>
+
+<hr class="divider">
 <h2>All Strategies — Top {os.getenv('TOP_N_STRATEGIES','5')} per Timeframe</h2>
 <div class="section">{strategy_tbl}</div>
 
@@ -1241,6 +1767,11 @@ def build_report():
 
 <hr class="divider">
 {optim_html}
+
+<hr class="divider">
+<h2>Live vs Backtest Comparison</h2>
+<div class="section">{live_bt_div if live_bt_div else
+  '<p style="color:#888">No strategy loaded.</p>'}</div>
 
 <hr class="divider">
 <h2>Live Trades (last 50)</h2>

@@ -16,9 +16,6 @@ NOT responsible for:
 
 import os, sys, logging, warnings
 
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")
-
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -38,8 +35,6 @@ import pandas as pd
 import joblib
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
-from tensorflow.keras.models import load_model as keras_load_model
-from stable_baselines3 import PPO
 
 load_dotenv()
 
@@ -315,7 +310,7 @@ def models_exist(symbol: str) -> bool:
         if not (MODEL_DIR / f"rf_{key}.pkl").exists():   return False
         if not (MODEL_DIR / f"scaler_{key}.pkl").exists(): return False
     if not (PARAMS_DIR / f"{symbol}_params.json").exists(): return False
-    return True   # PPO is optional
+    return True
 
 
 def load_models_from_disk(symbol: str, tf_feat: dict) -> tuple[dict, dict]:
@@ -335,11 +330,6 @@ def load_models_from_disk(symbol: str, tf_feat: dict) -> tuple[dict, dict]:
         if sc_path.exists():
             scalers_cache[key] = joblib.load(sc_path)
 
-        lstm_path = MODEL_DIR / f"lstm_{key}.keras"
-        if lstm_path.exists():
-            models_cache[f"lstm_{key}"] = keras_load_model(str(lstm_path))
-            log.info(f"  Loaded LSTM   : {lstm_path.name}")
-
         xgb_path = MODEL_DIR / f"xgb_{key}.pkl"
         rf_path  = MODEL_DIR / f"rf_{key}.pkl"
         if xgb_path.exists():
@@ -348,11 +338,6 @@ def load_models_from_disk(symbol: str, tf_feat: dict) -> tuple[dict, dict]:
             models_cache[f"rf_{key}"]  = joblib.load(rf_path)
         if xgb_path.exists() and rf_path.exists():
             log.info(f"  Loaded ensemble: {symbol} {tf}m")
-
-    ppo_path = MODEL_DIR / f"ppo_{symbol}.zip"
-    if ppo_path.exists():
-        models_cache[f"ppo_{symbol}"] = PPO.load(str(ppo_path))
-        log.info(f"  Loaded PPO    : {ppo_path.name}")
 
     params = load_params(symbol)
     log.info(f"  Params : entry_tf={params.get('entry_tf')}m  "

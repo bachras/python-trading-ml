@@ -767,7 +767,14 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
         return (-999.0,)
 
     r_arr  = np.array(returns)
-    sharpe = r_arr.mean() / (r_arr.std() + 1e-10) * np.sqrt(252)
+    # Annualise by actual trade frequency, not by calendar days.
+    # Using sqrt(252) on per-trade R-multiples treats each trade as one
+    # calendar day — wrong when a strategy trades 2/day or 1/week.
+    # Instead: compute how many trades per year given the OOS date range,
+    # then sqrt(trades_per_year) gives the correct annualisation factor.
+    n_days = max((df.index[-1] - df.index[0]).days, 1)
+    trades_per_year = len(returns) / (n_days / 252.0)
+    sharpe = r_arr.mean() / (r_arr.std() + 1e-10) * np.sqrt(trades_per_year)
     if not np.isfinite(sharpe):
         return (-999.0,)
     return (sharpe,)
