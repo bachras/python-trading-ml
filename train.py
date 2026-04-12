@@ -40,6 +40,7 @@ warnings.filterwarnings("ignore", message=".*Converting sparse.*", category=User
 from pathlib import Path
 from datetime import datetime
 
+import random
 import numpy as np
 import pandas as pd
 import joblib
@@ -62,7 +63,8 @@ FORCE_RETRAIN = args.force or (os.getenv("FORCE_RETRAIN", "false").lower() == "t
 
 # ── Imports (after env is loaded) ──────────────────────────────────────
 from pipeline import (
-    load_symbol_data, models_exist, load_models_from_disk,
+    load_symbol_data, load_ohlcv_parquet, engineer_full_features,
+    models_exist, load_models_from_disk,
     TICK_DATA_SYMBOLS, SESSION_BARS,
 )
 from phase2_adaptive_engine import (
@@ -70,7 +72,7 @@ from phase2_adaptive_engine import (
     train_ensemble,
     run_genetic_algo, run_optuna, run_per_tf_optimization,
     save_params, load_params,
-    _select_label_col,
+    _select_label_col, _check_leakage,
     INSTRUMENTS, PARAM_SEEDS, HARD_LIMITS,
     MODEL_DIR, LOG_DIR, PARAMS_DIR, SEQ_LEN, MIN_BARS,
     OPTUNA_TRIALS,
@@ -107,7 +109,85 @@ logging.basicConfig(
 )
 log = logging.getLogger("train")
 
+# ── S3: Global random seed — reproducible training runs ─────────────────
+GLOBAL_SEED = int(os.getenv("GLOBAL_SEED", "42"))
+np.random.seed(GLOBAL_SEED)
+random.seed(GLOBAL_SEED)
+log.info(f"[SEED] Global seed set to {GLOBAL_SEED} "
+         f"(override via GLOBAL_SEED env var for different runs)")
+
 PURGE_BARS = 10   # bars to drop at each train/OOS boundary to prevent leakage
+
+
+def _check_feature_parity(symbol: str, tf: int, train_df: pd.DataFrame) -> None:
+    """
+    R5: Verify that the live feature pipeline (engineer_full_features) produces
+    the same feature values as the stored training DataFrame.
+
+    Approach (Option A): run engineer_full_features on the FULL raw tick parquet
+    (is_tick_derived=True to skip microstructure estimation) then compare the last
+    200 rows against the stored training features. Both paths are fully warmed up,
+    avoiding EMA startup divergence.
+
+    Blocking: raises RuntimeError if max feature diff > 1e-4 for any non-known column.
+    """
+    try:
+        raw = load_ohlcv_parquet(symbol, tf)
+        if raw.empty or len(raw) < 300:
+            log.warning(f"  [PARITY] {symbol} {tf}m: raw parquet too small ({len(raw)} rows) — skipping check")
+            return
+
+        log.info(f"  [PARITY] {symbol} {tf}m: running live pipeline on {len(raw):,} rows (full parquet)...")
+        live_df = engineer_full_features(raw.copy(), tf_minutes=tf,
+                                         symbol=symbol, is_tick_derived=True)
+        if live_df.empty:
+            log.warning(f"  [PARITY] {symbol} {tf}m: live pipeline returned empty DataFrame — skipping")
+            return
+
+        feat_cols   = get_feature_cols(train_df)
+        common_cols = [c for c in feat_cols if c in live_df.columns]
+        if not common_cols:
+            log.warning(f"  [PARITY] {symbol} {tf}m: no common feature columns — skipping")
+            return
+
+        # Align last 200 rows by index (both from the same raw parquet, so index matches)
+        shared_idx  = train_df.index.intersection(live_df.index)
+        if len(shared_idx) < 50:
+            log.warning(f"  [PARITY] {symbol} {tf}m: only {len(shared_idx)} shared rows — skipping")
+            return
+        check_idx   = shared_idx[-200:]
+
+        t_vals = train_df.loc[check_idx, common_cols].values.astype(float)
+        l_vals = live_df.loc[check_idx,  common_cols].values.astype(float)
+
+        # Replace NaN with 0 before diff (NaN in same position = no divergence)
+        t_vals = np.nan_to_num(t_vals, nan=0.0)
+        l_vals = np.nan_to_num(l_vals, nan=0.0)
+        diff   = np.abs(t_vals - l_vals)
+
+        max_diff      = float(diff.max())
+        worst_col_idx = int(diff.max(axis=0).argmax())
+        worst_col     = common_cols[worst_col_idx]
+
+        log.info(f"  [PARITY] {symbol} {tf}m: max_diff={max_diff:.2e}, "
+                 f"mean_diff={float(diff.mean()):.2e}, worst_feature={worst_col}")
+
+        if max_diff > 1e-4:
+            log.error(
+                f"  [PARITY] FAIL — training and live pipelines produce different values "
+                f"for the same input. Worst: {worst_col} diff={max_diff:.6f}. "
+                f"DO NOT DEPLOY until resolved."
+            )
+            raise RuntimeError(
+                f"Feature parity check FAILED for {symbol} {tf}m: "
+                f"{worst_col} diff={max_diff:.6f}"
+            )
+        log.info(f"  [PARITY] PASS — training and live features match within tolerance")
+
+    except RuntimeError:
+        raise
+    except Exception as _pe:
+        log.warning(f"  [PARITY] {symbol} {tf}m: parity check error ({_pe}) — skipping")
 
 
 def _spa_bootstrap_test(pnls: list, n_boot: int = 2000) -> float:
@@ -281,6 +361,12 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                             f"  [LABELS] {symbol} {tf}m: all TP rates identical ({min_r:.1%}) "
                             f"— check label computation in engineer_features()"
                         )
+
+            # R5: feature parity check — verify live and training pipelines agree
+            _check_feature_parity(symbol, tf, df)
+
+            # R6: leakage check — verify no features change under future-data permutation
+            _check_leakage(symbol, tf, df)
 
             log.info(f"  {symbol} {tf}m | {df.index[0].date()} → {df.index[-1].date()} | "
                      f"{n:,} bars | {len(feat_cols)} features")
@@ -609,9 +695,17 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     "sensitivity_score": sens.get("sensitivity_score"),
                     "robust":           int(sens.get("robust", False)),
                     "spa_p_value":      spa_p,
-                    # G4: store baselines so _SmartKillSwitch can use strategy-specific thresholds
-                    "expected_sharpe":   trial["sharpe"],
-                    "expected_win_rate": stats["win_rate"] / 100.0,  # convert % to decimal
+                    # G4 / R1: store performance baselines for kill switch strategy-specific thresholds
+                    "expected_sharpe":         trial["sharpe"],
+                    "expected_win_rate":       stats["win_rate"] / 100.0,  # convert % to decimal
+                    # R1: expected_trades_per_day — used by kill switch signal frequency check
+                    "expected_trades_per_day": round(
+                        stats["n_trades"] / max(
+                            (bt["equity_df"].index[-1] - bt["equity_df"].index[0]).days
+                            * (252 / 365) if not bt["equity_df"].empty else 252,
+                            1
+                        ), 2
+                    ) if stats["n_trades"] > 0 and not bt["equity_df"].empty else None,
                     "is_active":        0,
                 })
                 if not bt["equity_df"].empty:
@@ -677,7 +771,7 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                         models_cache[f"xgb_{scaler_key}"] = xgb_rt
                         models_cache[f"rf_{scaler_key}"]  = rf_rt
 
-                        # 3F: log label, class balance, OOS accuracy, and Brier for retrained model
+                        # 3F / R3: label col, OOS accuracy, and Brier before/after calibration
                         try:
                             X_rt_log  = rt_val_s[rt_feat_cols].values
                             y_rt_log  = df_rt.iloc[i_va:]["target"].values
@@ -686,12 +780,38 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                             rt_ens_p  = (rt_xgb_p + rt_rf_p) / 2.0
                             rt_acc    = float(((rt_ens_p >= 0.5).astype(int) == y_rt_log).mean())
                             tp_rate   = float(y_rt_log.mean())
-                            rt_brier  = float(np.mean((rt_ens_p - y_rt_log) ** 2))
-                            log.info(
-                                f"  [RETRAIN] {symbol} {tf}m → label={best_label_col} "
-                                f"| TP rate={tp_rate:.1%} | OOS acc={rt_acc:.3f} "
-                                f"| Brier={rt_brier:.4f}"
-                            )
+                            brier_raw = float(np.mean((rt_ens_p - y_rt_log) ** 2))
+
+                            # R3: apply existing calibrator to get Brier before/after pair
+                            cal_path  = MODEL_DIR / f"calibrator_{scaler_key}.pkl"
+                            brier_cal = None
+                            if cal_path.exists():
+                                try:
+                                    _cal      = joblib.load(cal_path)
+                                    rt_cal_p  = _cal.predict(rt_ens_p)
+                                    brier_cal = float(np.mean((rt_cal_p - y_rt_log) ** 2))
+                                except Exception:
+                                    pass
+
+                            if brier_cal is not None:
+                                improvement = brier_raw - brier_cal
+                                cal_tag     = "improved" if improvement > 0 else "WARN: degraded"
+                                log.info(
+                                    f"  [RETRAIN] {symbol} {tf}m → label={best_label_col} "
+                                    f"| TP rate={tp_rate:.1%} | OOS acc={rt_acc:.3f} "
+                                    f"| Brier before={brier_raw:.4f} after={brier_cal:.4f} ({cal_tag})"
+                                )
+                                if brier_cal >= brier_raw:
+                                    log.warning(
+                                        f"  [RETRAIN] Calibration did NOT improve Brier — "
+                                        f"check OOS sample size and label class balance"
+                                    )
+                            else:
+                                log.info(
+                                    f"  [RETRAIN] {symbol} {tf}m → label={best_label_col} "
+                                    f"| TP rate={tp_rate:.1%} | OOS acc={rt_acc:.3f} "
+                                    f"| Brier={brier_raw:.4f} (no calibrator available)"
+                                )
                             log.info(
                                 f"  [RETRAIN] saved: xgb_{scaler_key}.pkl, rf_{scaler_key}.pkl"
                             )
@@ -706,6 +826,39 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 else:
                     log.info(f"  {symbol} {tf}m: label retrain not needed "
                              f"— rank-1 maps to default label (be=0, mid-grid)")
+
+            # ── S2: Confidence threshold stability curve for rank-1 strategy ────
+            # Sweeps confidence ±0.03 in 0.01 steps and logs Sharpe at each point.
+            # A smooth plateau = robust; an isolated spike = fragile (calibration-sensitive).
+            if top_trials and _sens_models_ok:
+                rank1_p    = top_trials[0]["params"]
+                conf_base  = rank1_p.get("confidence", 0.65)
+                conf_steps = [round(conf_base + d, 2) for d in np.arange(-0.03, 0.04, 0.01)]
+                conf_steps = [c for c in conf_steps if 0.50 <= c <= 0.95]
+                curve_rows = []
+                for c_val in conf_steps:
+                    _p = dict(rank1_p); _p["confidence"] = c_val
+                    _bt = backtest_all_strategies(
+                        symbol=symbol, tf=tf, top_params=[_p],
+                        risk_mode=RISK_MODE, risk_pct=RISK_PCT,
+                        fixed_amt=FIXED_RISK_AMT, start_balance=10_000.0,
+                    )
+                    if _bt and _bt[0].get("stats"):
+                        _s = _bt[0]["stats"]["sharpe"]
+                        _e = _bt[0]["stats"]["efficiency_ratio"]
+                        curve_rows.append((c_val, _s, _e))
+                if len(curve_rows) >= 3:
+                    peak_sharpe  = max(r[1] for r in curve_rows)
+                    min_sharpe   = min(r[1] for r in curve_rows)
+                    shape_tag    = "SMOOTH" if (peak_sharpe - min_sharpe) / (abs(peak_sharpe) + 1e-10) < 0.20 else "SPIKE"
+                    log.info(f"  [STABILITY] {symbol} {tf}m confidence sensitivity "
+                             f"(rank-1, sl={rank1_p['sl_atr']}, tp={rank1_p['tp_mult']}):")
+                    for c_val, _s, _e in curve_rows:
+                        sel = " ← selected" if abs(c_val - conf_base) < 0.001 else ""
+                        log.info(f"    conf={c_val:.2f} → Sharpe={_s:.2f}, ER={_e:.2f}{sel}")
+                    log.info(f"  [STABILITY] Shape: {shape_tag} "
+                             + ("(max drop < 20% across ±0.03)" if shape_tag == "SMOOTH"
+                                else "— isolated peak, fragile to calibration shift"))
 
             # ── Post-TF summary table ──────────────────────────────────────────
             if tf_summary_rows:

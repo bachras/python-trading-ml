@@ -6,7 +6,7 @@
 **GO / NO-GO Summary:**
 | Tier | Items | Action |
 |------|-------|--------|
-| 🔴 BLOCKING | R1–R6 | Must fix before training |
+| 🔴 BLOCKING | R1–R7 | Must fix before training |
 | 🟠 STRONGLY RECOMMENDED | S1–S3 (Section 4) | Fix before paper trading |
 | 🟡 DEFERRED | P1–P3 (paper), L3-1–L3-9 | After live capital stable |
 
@@ -75,13 +75,15 @@
 
 ## 2. REMAINING ITEMS — MUST FIX BEFORE FIRST TRAINING RUN
 
-Six items are not yet complete. R1–R4 are small (< 30 lines each). R5–R6 are new critical additions identified after the v4 audit.
+Seven items are not yet complete. R1–R4 are small (< 30 lines each). R5–R7 are new critical additions identified after the v4 audit.
 
 ### R1. `expected_trades_per_day` Missing from Full Pipeline
 
 **Status:** `expected_sharpe` and `expected_win_rate` are stored in DB and loaded by `_SmartKillSwitch`. The `expected_trades_per_day` field is absent from all three components needed.
 
 **Why it matters:** The time-based kill switch window (A4 from v4) requires `expected_trades_per_day` to calibrate "last 10 calendar days" correctly. Without it, the time-window check cannot compare against a strategy-specific baseline. Also needed to detect signal frequency drops (e.g., model stops firing due to silent miscalibration).
+
+**Decision on `n_days_elapsed` source (Q3):** Derive from the oldest record in `live_trades` for that strategy — no schema migration required. On the very first trade the clock starts naturally. This is simpler and correct: the kill switch only makes sense once there is at least one live trade to measure from.
 
 **Fix — three small changes:**
 
@@ -96,12 +98,16 @@ n_trading_days = (bt_result["equity_curve"].index[-1] - bt_result["equity_curve"
 params_to_save["expected_trades_per_day"] = round(len(trades) / max(n_trading_days, 1), 2)
 ```
 
-3. **`live.py` `_SmartKillSwitch.__init__()`** — Load and use:
+3. **`live.py` `_SmartKillSwitch.__init__()` and `check()`** — Load baseline; derive elapsed from DB:
 ```python
 self.expected_trades_per_day = strategy.get("expected_trades_per_day", 2.0)
-# In time-window check:
-if n_days_elapsed >= 5 and n_live_trades < 0.3 * self.expected_trades_per_day * n_days_elapsed:
-    log.warning("[KILLSWITCH] Signal frequency below 30% of expected — model may have stopped firing")
+
+# In check() — derive n_days_elapsed from oldest live trade, no schema change needed:
+first_trade_ts = db.get_oldest_live_trade_ts(strategy_id)   # returns None if no trades yet
+if first_trade_ts is not None:
+    n_days_elapsed = (datetime.utcnow() - first_trade_ts).days
+    if n_days_elapsed >= 5 and n_live_trades < 0.3 * self.expected_trades_per_day * n_days_elapsed:
+        log.warning("[KILLSWITCH] Signal frequency below 30% of expected — model may have stopped firing")
 ```
 
 ---
@@ -190,50 +196,55 @@ Live Sharpe:     0.3   ← no error, no exception, just "bad performance"
 
 PSI drift detection (already implemented) only fires *after* live features diverge from training data distribution. It does not detect that the live computation *produces different values from the same input* as the training computation. These are two different failure modes.
 
-**Fix — add a `[PARITY]` check to `train.py` (one-time, runs at the end of feature engineering):**
+**Approach decision (Q1):** Use **Option A — compare both paths on the full training parquet, check last 200 rows.** The subsample approach is incorrect because EMA(200), regime features, and other path-dependent indicators computed on 500 rows will not have converged, producing false failures on every EMA-derived column (`p_vs_21`, `p_vs_55`, `ema_x_21_55`, regime features, etc.). The parity check must run on the full history so both paths have identical warmup. Runtime is a few minutes; this is acceptable as a one-time check at the end of training.
+
+**Fix — add `_check_feature_parity()` to `train.py`, call after `engineer_features()` completes:**
 
 ```python
-def _check_feature_parity(df_train: pd.DataFrame, n_sample: int = 500) -> None:
+def _check_feature_parity(df_train_with_features: pd.DataFrame,
+                           raw_parquet_path: str) -> None:
     """
-    Take last N rows of training data, recompute features via the live pipeline path,
-    and assert they match the training pipeline output within floating-point tolerance.
+    Run both feature pipelines on the SAME complete parquet file.
+    Compare the last 200 rows only (EMAs guaranteed converged, session boundaries stable).
     """
-    sample_idx = df_train.index[-n_sample:]
-    # Features already computed by training pipeline
-    train_feats = df_train.loc[sample_idx, get_feature_cols(df_train)].values
+    log.info("[PARITY] Loading raw bars and running live pipeline on full history ...")
+    raw_full   = pd.read_parquet(raw_parquet_path)          # OHLCV, no features
+    live_full  = add_institutional_features(raw_full)        # live code path
 
-    # Recompute via live pipeline path (pipeline.py entry point)
-    raw_sample  = load_raw_bars_for_index(sample_idx)   # raw OHLCV without features
-    live_feats  = compute_live_features(raw_sample).loc[sample_idx[-200:],
-                                                        get_feature_cols(df_train)].values
-    # Use last 200 rows (avoid warmup difference at start of sample)
-    diff = np.abs(train_feats[-200:] - live_feats)
-    max_diff     = float(diff.max())
-    mean_diff    = float(diff.mean())
-    worst_col_idx = int(diff.max(axis=0).argmax())
-    worst_col    = get_feature_cols(df_train)[worst_col_idx]
+    feat_cols  = get_feature_cols(df_train_with_features)
+    n          = 200
+    train_tail = df_train_with_features[feat_cols].iloc[-n:].values
+    live_tail  = live_full[feat_cols].iloc[-n:].values
 
-    log.info(f"[PARITY] Feature parity check: max_diff={max_diff:.8f}, "
-             f"mean_diff={mean_diff:.8f}, worst_feature={worst_col}")
+    diff          = np.abs(train_tail - live_tail)
+    max_diff      = float(diff.max())
+    mean_diff     = float(diff.mean())
+    worst_idx     = int(diff.max(axis=0).argmax())
+    worst_col     = feat_cols[worst_idx]
+    n_cols_differ = int((diff.max(axis=0) > 1e-6).sum())
+
+    log.info(f"[PARITY] max_diff={max_diff:.8f}, mean_diff={mean_diff:.8f}, "
+             f"n_features_differ={n_cols_differ}/{len(feat_cols)}, worst={worst_col}")
 
     if max_diff > 1e-4:
-        log.error(f"[PARITY] FAIL — training and live pipelines produce different values "
-                  f"for the same input. Worst: {worst_col} diff={max_diff:.6f}. "
+        bad_cols = [feat_cols[i] for i in np.where(diff.max(axis=0) > 1e-4)[0]]
+        log.error(f"[PARITY] FAIL — pipeline mismatch in: {bad_cols}. "
                   f"DO NOT DEPLOY until resolved.")
-        raise RuntimeError("Feature parity check failed — train/live pipeline mismatch")
+        raise RuntimeError(f"Feature parity check failed: {bad_cols}")
 
-    log.info("[PARITY] PASS — training and live features match within tolerance ✅")
+    log.info("[PARITY] PASS — training and live features match within 1e-4 ✅")
 ```
 
 **Expected output when correct:**
 ```
-[PARITY] Feature parity check: max_diff=0.00000000, mean_diff=0.00000000, worst_feature=vwap_dist_atr
-[PARITY] PASS — training and live features match within tolerance ✅
+[PARITY] Loading raw bars and running live pipeline on full history ...
+[PARITY] max_diff=0.00000000, mean_diff=0.00000000, n_features_differ=0/73, worst=vwap_dist_atr
+[PARITY] PASS — training and live features match within 1e-4 ✅
 ```
 
-**If it fails:** The log will name the specific feature(s) causing the mismatch. Fix the divergence in the relevant pipeline function before proceeding. Common causes: session boundary handling in VWAP, timezone conversion difference, rolling window `min_periods` mismatch.
+**If it fails:** The log lists the specific diverging features. Common causes: session boundary handling in VWAP, timezone conversion difference, rolling window `min_periods`, or `fillna` strategy differing between paths. Fix the divergent function — do not widen the tolerance.
 
-**Blocking:** Yes. Do not train without this check passing. A model trained on features that live cannot reproduce exactly will degrade regardless of how well it performs in backtest.
+**Blocking:** Yes. Runtime ~2–4 minutes on full history. Run once per training cycle.
 
 ---
 
@@ -244,57 +255,162 @@ def _check_feature_parity(df_train: pd.DataFrame, n_sample: int = 500) -> None:
 **What is currently relied upon:** Walk-forward with `PURGE_BARS=10` eliminates the most obvious train/test leakage. `bfill()` was removed (fixed in L1-17). But there is no *assertion* that features are causal — that no feature at bar `t` uses information from bar `t+1` or later.
 
 **Where leakage can silently enter:**
-- VWAP using full session total (which includes future bars) instead of running cumulative up to current bar
-- Volume profile `groupby(date)` computing the full-day POC then assigning it to all bars in that day — the morning bars "know" where the afternoon volume will concentrate
-- Rolling statistics with `closed='right'` vs `closed='left'` producing subtle look-ahead
-- Label generation touching future bars (already correct via triple barrier, but worth asserting)
+- VWAP using full session total instead of running cumulative up to current bar
+- Volume profile `groupby(date)` computing the full-day POC then assigning it to all bars — morning bars "know" where afternoon volume will concentrate
+- Rolling statistics with `closed='right'` vs `closed='left'`
+- **Swing detection with `SWING_LOOKBACK=10`** — confirming a swing high requires 10 bars *after* the candidate bar, making `swing_high_dist`, `equal_highs`, and similar features forward-looking by up to 10 bars (10–50 minutes on M1–M5). This is a **known, expected leakage source** in `add_liquidity_features()`.
 
-**What leakage does:**
-```
-Backtest: AMAZING (model appears to predict perfectly)
-Live:     DEAD     (model was predicting the present, not the future)
-```
+**Severity decision (Q2):** A two-tier response rather than a single `RuntimeError`. Blocking training entirely on swing detection would permanently halt training until `add_liquidity_features()` is rewritten. Instead:
 
-**Fix — add a `[LEAKAGE]` temporal integrity check in `engineer_features()` in `phase2_adaptive_engine.py`:**
+- **KNOWN leaky features** (declared in a whitelist): log `WARNING` with the feature names and the confirmed look-ahead distance. Training continues. These features are treated as **soft-causal approximations** — useful because the swing confirmation only looks ahead by 10 bars, not the full future, and price patterns are used as contextual filters not directional predictors. Add them to the model with knowledge that their signal may be slightly optimistic.
+- **UNEXPECTED leaky features** (not in whitelist): log `ERROR` and raise `RuntimeError`. Something new is forward-looking that was not intentionally designed that way.
 
-The key insight: if you shuffle the *future* portion of the data and recompute features, the features at bar `t` should **not change** if they are truly causal (because they only look backward). If they do change, the feature uses future information.
+**Fix — two-tier leakage check in `engineer_features()` in `phase2_adaptive_engine.py`:**
 
 ```python
-def _check_leakage(df: pd.DataFrame, n_check: int = 200) -> None:
-    """
-    Shuffle future rows and verify that features for past bars do not change.
-    A causal feature at bar t must depend only on data at bars <= t.
-    """
-    if len(df) < n_check * 2:
+# Features known to use a fixed look-ahead for structural confirmation.
+# Swing detection requires SWING_LOOKBACK bars after candidate bar to confirm.
+# Look-ahead is bounded (10 bars = 10–50 min) and used as context, not signal direction.
+KNOWN_LOOKAHEAD_FEATURES = frozenset([
+    "swing_high_dist", "swing_low_dist", "equal_highs", "equal_lows",
+    "liquidity_above", "liquidity_below",   # add others from add_liquidity_features() here
+])
+
+def _check_leakage(df_with_features: pd.DataFrame, n_check: int = 200) -> None:
+    if len(df_with_features) < n_check * 2:
         return
 
-    pivot = len(df) - n_check
-    df_test = df.copy()
-    # Shuffle the last n_check rows (future relative to pivot)
+    pivot = len(df_with_features) - n_check
+    df_test = df_with_features.copy()
     future_idx = df_test.index[pivot:]
-    df_test.loc[future_idx] = df_test.loc[future_idx].sample(frac=1).values
+    # Shuffle only raw OHLCV columns to avoid cascading through derived features
+    for col in ["open", "high", "low", "close", "volume"]:
+        df_test.loc[future_idx, col] = df_test.loc[future_idx, col].sample(frac=1).values
 
-    # Recompute features on the shuffled dataframe
     df_reshuffled = add_institutional_features(df_test)
 
-    # Features at bars BEFORE the pivot must be identical
-    feat_cols = get_feature_cols(df)
-    original  = df.loc[df.index[pivot-50:pivot], feat_cols].values
-    reshuffled = df_reshuffled.loc[df.index[pivot-50:pivot], feat_cols].values
+    feat_cols  = get_feature_cols(df_with_features)
+    original   = df_with_features.iloc[pivot-50:pivot][feat_cols].values
+    reshuffled = df_reshuffled.iloc[pivot-50:pivot][feat_cols].values
 
-    diff = np.abs(original - reshuffled)
-    if diff.max() > 1e-8:
-        bad_cols = [feat_cols[i] for i in np.where(diff.max(axis=0) > 1e-8)[0]]
-        log.error(f"[LEAKAGE] DETECTED in features: {bad_cols}. "
-                  f"These features change when future data is shuffled — forward-looking!")
-        raise RuntimeError(f"Data leakage detected in features: {bad_cols}")
+    diff     = np.abs(original - reshuffled)
+    bad_mask = diff.max(axis=0) > 1e-8
+    bad_cols = [feat_cols[i] for i in np.where(bad_mask)[0]]
 
-    log.info("[LEAKAGE] Temporal integrity check PASSED — no forward-looking features detected ✅")
+    known_leaky    = [c for c in bad_cols if c in KNOWN_LOOKAHEAD_FEATURES]
+    unknown_leaky  = [c for c in bad_cols if c not in KNOWN_LOOKAHEAD_FEATURES]
+
+    if known_leaky:
+        log.warning(f"[LEAKAGE] KNOWN look-ahead features detected (swing confirmation, "
+                    f"SWING_LOOKBACK=10 bars): {known_leaky}. "
+                    f"Accepted design trade-off — treat with reduced confidence.")
+
+    if unknown_leaky:
+        log.error(f"[LEAKAGE] UNEXPECTED forward-looking features: {unknown_leaky}. "
+                  f"These were not declared as known look-ahead — investigate immediately.")
+        raise RuntimeError(f"Unexpected data leakage in features: {unknown_leaky}")
+
+    if not bad_cols:
+        log.info("[LEAKAGE] Temporal integrity check PASSED — no forward-looking features ✅")
+    else:
+        log.info(f"[LEAKAGE] Check complete — {len(known_leaky)} known look-ahead, "
+                 f"0 unexpected leaks ✅")
 ```
 
-**Note on volume profile:** The per-session groupby approach (already implemented in L1-18) is potentially leaky for intraday bars — bars at 09:45 will have a POC computed from the full day's volume. This is a known design trade-off: true real-time VP requires bar-by-bar computation. **The leakage check will flag this** if present. If flagged, either accept it as a known approximation (with reduced confidence in VP features) or switch to cumulative intraday VP.
+**Volume profile note:** Session-level groupby VP (L1-18) is also a known approximation — intraday bars reference the full-day POC. This feature should be added to `KNOWN_LOOKAHEAD_FEATURES` unless switched to cumulative intraday VP. The check will flag it otherwise.
 
-**Blocking:** Yes. A leaky feature makes backtest results meaningless. The check takes < 5s.
+**Remediation path for swing detection (deferred to Layer 3):** Replace `SWING_LOOKBACK` confirmation with a real-time ZigZag or rolling-window local extremum that uses only past bars. Until then, the known-leaky whitelist is the correct pragmatic stance.
+
+**Blocking:** Unexpected leakage blocks training. Known leakage logs a warning and training proceeds. The check runs in < 10s.
+
+---
+
+### R7. Dukascopy Tick Data Has Zero/Negative Spread — Synthetic Spread Model Required
+
+**Status:** Not implemented. This silently invalidates all backtest cost modelling.
+
+**The problem:** Dukascopy provides tick data as bid and ask prices. When converted to OHLCV bars, the spread (ask − bid) is often recorded as zero or slightly negative due to quote sequencing artefacts (a bid quote arriving after a slightly higher ask quote from the previous tick). The result is that `spread_arr` in `ga_fitness()` and `backtest_engine.py` is effectively zero for most bars, even though the fix L1-1 ("spread + slippage in ga_fitness") was applied. The cost model exists but is being fed zero input.
+
+**What this means for the system:**
+- `ga_fitness()` includes `spread_arr[i] / 2 + atr[i] * 0.1` per trade — with `spread_arr[i] ≈ 0`, the optimizer never penalises strategies for entering near bid-ask boundaries
+- The backtest ER and Sharpe are computed in a zero-spread world, then deployed to a 1–3 point live spread world
+- This is a hidden optimism bias of ~1–3 points per trade entry and exit, which for a $100 fixed risk and a US30 SL of 50–150 points is a 2–4% per-trade cost underestimate — enough to flip a marginal strategy from positive to negative
+
+**US30 CFD typical spread profile (market physics, not configurable):**
+| Session | Spread (points) |
+|---------|----------------|
+| Active: 20:30–01:00 London | 1.0–2.5 |
+| Session open first 5 min | 2.5–5.0 (widen) |
+| News events (NFP, FOMC) | 5.0–20.0+ |
+| Outside session gate | N/A (gated out) |
+
+**Fix — implement a regime-aware synthetic spread model in `tick_pipeline.py` (or wherever bars are built from raw ticks), applied before features are computed:**
+
+```python
+SPREAD_BASE_PTS    = float(os.getenv("SPREAD_BASE_PTS",    "1.5"))   # minimum realistic spread
+SPREAD_ATR_COEFF   = float(os.getenv("SPREAD_ATR_COEFF",   "0.04"))  # scales with volatility
+SPREAD_OPEN_MULT   = float(os.getenv("SPREAD_OPEN_MULT",   "2.0"))   # session-open widen factor
+SPREAD_OPEN_BARS   = int(os.getenv("SPREAD_OPEN_BARS",     "5"))      # bars after session open
+
+def build_synthetic_spread(df: pd.DataFrame) -> pd.Series:
+    """
+    Replace zero/negative Dukascopy spread values with a regime-aware synthetic spread.
+
+    Model:
+      base = SPREAD_BASE_PTS                        (minimum floor)
+      vol  = ATR(14) * SPREAD_ATR_COEFF             (widens with volatility)
+      open = SPREAD_OPEN_MULT during first N bars of each trading session
+
+    Add small lognormal noise (σ=0.2) to avoid a perfectly smooth artificial series
+    that the model could learn to exploit.
+    """
+    raw_spread = df["ask"] - df["bid"] if "ask" in df.columns else pd.Series(0.0, index=df.index)
+
+    # ATR-based volatility component
+    atr14 = df["close"].diff().abs().rolling(14).mean().fillna(method="ffill").fillna(SPREAD_BASE_PTS)
+    vol_component = atr14 * SPREAD_ATR_COEFF
+
+    # Session-open widening: first SPREAD_OPEN_BARS bars of each date
+    session_bar_num = df.groupby(df.index.date).cumcount()
+    open_mult = np.where(session_bar_num < SPREAD_OPEN_BARS, SPREAD_OPEN_MULT, 1.0)
+
+    # Synthetic spread: max of raw (if valid) and model estimate
+    model_spread = (SPREAD_BASE_PTS + vol_component) * open_mult
+    synthetic    = np.maximum(raw_spread.fillna(0), model_spread)
+
+    # Add lognormal noise: spread should feel random, not mechanical
+    noise = np.random.lognormal(mean=0.0, sigma=0.20, size=len(df))
+    synthetic = synthetic * noise
+    synthetic = np.maximum(synthetic, SPREAD_BASE_PTS)   # hard floor always
+
+    return pd.Series(synthetic, index=df.index, name="spread")
+```
+
+**Integration points:**
+1. `tick_pipeline.py` — call `build_synthetic_spread(df)` when building OHLCV bars from raw ticks; store result as `df["spread"]`
+2. `backtest_engine.py` — already reads `spread_arr`; ensure it reads the `spread` column, not recomputing from bid/ask
+3. `ga_fitness()` — already uses `spread_arr`; no change needed once the column is populated correctly
+4. Log at training startup:
+```
+[SPREAD] Using synthetic spread model: base=1.5pts, atr_coeff=0.04, open_mult=2.0x for first 5 bars
+[SPREAD] Sample spread stats — mean=1.82pts, p50=1.61pts, p95=3.24pts, p99=5.10pts
+```
+
+**Add to `.env`:**
+```
+# ── SPREAD MODEL (Dukascopy data has zero/negative raw spread) ──────────────
+SPREAD_BASE_PTS=1.5      # hard floor, points (US30 CFD minimum realistic spread)
+SPREAD_ATR_COEFF=0.04    # spread widens with ATR: spread += ATR14 * coeff
+SPREAD_OPEN_MULT=2.0     # session-open first N bars get this multiplier
+SPREAD_OPEN_BARS=5       # how many bars after session open to apply multiplier
+```
+
+**Verification — spot-check after implementation:**
+- `[SPREAD]` log shows `mean ≈ 1.8–2.2`, `p95 ≈ 3–4`, `p99 < 10` — if these are 0 or near-0 the fix did not apply
+- Compare `ga_fitness()` Sharpe before and after the spread fix: expect a Sharpe *reduction* of 0.1–0.3 as real friction enters; if Sharpe increases the fix was not applied correctly
+- The best genome's `sl_atr` should not shrink significantly after the fix — if it does, the old optimizer was choosing SLs sized to exploit zero spread
+
+**Blocking:** Yes. All backtest metrics computed with zero spread are optimistic by a consistent friction-shaped bias. Fix before training to avoid optimizing strategies that cannot survive live costs.
 
 ---
 
@@ -408,15 +524,16 @@ Note: Fixed seeds for reproducibility. For production, use a different seed per 
 
 ## 6. PRE-TRAINING RUN CHECKLIST
 
-Complete all six remaining items (R1–R6), then verify this checklist before starting training:
+Complete all seven remaining items (R1–R7), then verify this checklist before starting training:
 
-### Code changes (R1–R6):
-- [ ] R1: Add `expected_trades_per_day` to `db.py` schema + `train.py` + `live.py` kill switch
+### Code changes (R1–R7):
+- [ ] R1: Add `expected_trades_per_day` to `db.py` schema + `train.py` + `live.py` kill switch; derive `n_days_elapsed` from oldest `live_trades` record (no schema migration needed)
 - [ ] R2: Add `[LABELS]` TP rate log at end of `engineer_features()`
 - [ ] R3: Add Brier before/after pair to `[RETRAIN]` block in `train.py`
 - [ ] R4: Add `ATR_SPIKE_FILTER_MULT=3.0` to `.env`
-- [ ] R5: Implement `[PARITY]` train/live feature parity check in `train.py`
-- [ ] R6: Implement `[LEAKAGE]` temporal integrity check in `engineer_features()`
+- [ ] R5: Implement `[PARITY]` train/live feature parity check in `train.py` — **run on full parquet, compare last 200 rows** (not subsample; EMA must be converged)
+- [ ] R6: Implement two-tier `[LEAKAGE]` check in `engineer_features()` — known look-ahead features (swing detection) → WARNING; unexpected leakage → RuntimeError
+- [ ] R7: Implement synthetic spread model in `tick_pipeline.py`; add `SPREAD_BASE_PTS`, `SPREAD_ATR_COEFF`, `SPREAD_OPEN_MULT`, `SPREAD_OPEN_BARS` to `.env`
 
 ### Environment:
 - [ ] `MAX_DRAWDOWN_PCT=35` — confirmed ✅ (`.env` line 132)
@@ -424,10 +541,12 @@ Complete all six remaining items (R1–R6), then verify this checklist before st
 - [ ] `FIXED_RISK_AMOUNT=100` — confirmed ✅ (`.env` line 141)
 - [ ] `VOL_SIZE_ENABLED` not set → defaults `false` — confirmed ✅
 - [ ] `ATR_SPIKE_FILTER_MULT=3.0` added to `.env` — pending R4
+- [ ] `SPREAD_BASE_PTS=1.5`, `SPREAD_ATR_COEFF=0.04`, `SPREAD_OPEN_MULT=2.0`, `SPREAD_OPEN_BARS=5` added to `.env` — pending R7
 
 ### After training run — spot-check these logs:
-- [ ] `[PARITY]` — max feature diff = 0.00000000; "PASS" message present ✅
-- [ ] `[LEAKAGE]` — "Temporal integrity check PASSED" message present ✅
+- [ ] `[SPREAD]` — mean ≈ 1.8–2.2 pts, p95 ≈ 3–4 pts, p99 < 10 pts; NOT near-zero
+- [ ] `[PARITY]` — max feature diff near 0; "PASS" message; n_features_differ=0 ✅
+- [ ] `[LEAKAGE]` — 0 unexpected leaks; known look-ahead features (swing) listed in WARNING only ✅
 - [ ] `[LABELS]` — 75 columns generated; no degenerate columns; be=1 TP rate ≤ be=0 for same sl/tp (tp≥2)
 - [ ] `[ENSEMBLE]` — XGB vs RF correlation logged; confirm < 0.92
 - [ ] `[CALIBRATION]` — Brier before > after in walk-forward OOS

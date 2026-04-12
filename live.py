@@ -38,7 +38,7 @@ warnings.filterwarnings("ignore", message=".*Converting sparse.*", category=User
 
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -303,13 +303,15 @@ class _SmartKillSwitch:
         # A conservative strategy (Sharpe=0.8 expected) and an aggressive one (Sharpe=2.0)
         # should not trigger at the same absolute levels.
         s = get_strategy(strategy_id)
-        self.expected_sharpe   = float(s.get("expected_sharpe")   or 0.0) if s else 0.0
-        self.expected_win_rate = float(s.get("expected_win_rate") or 0.5) if s else 0.5
+        self.expected_sharpe         = float(s.get("expected_sharpe")         or 0.0) if s else 0.0
+        self.expected_win_rate       = float(s.get("expected_win_rate")       or 0.5) if s else 0.5
+        self.expected_trades_per_day = float(s.get("expected_trades_per_day") or 0.0) if s else 0.0
         if self.expected_sharpe > 0:
             log.info(
                 f"[KILLSWITCH] {strategy_id}: baselines loaded — "
                 f"expected_sharpe={self.expected_sharpe:.2f}, "
-                f"expected_win_rate={self.expected_win_rate:.1%}"
+                f"expected_win_rate={self.expected_win_rate:.1%}, "
+                f"expected_trades_per_day={self.expected_trades_per_day:.2f}"
             )
         else:
             log.warning(
@@ -391,6 +393,35 @@ class _SmartKillSwitch:
                 f"| wins={wins}/{n} ({wr_pct:.1f}%) "
                 f"| sharpe={self.sharpe:.2f} | p_val={p_val:.4f}"
             )
+        # R1: Trade frequency check — detect dead/frozen strategy
+        # Uses full trade history to measure actual vs expected trades/day.
+        # Requires ≥5 days of live trading to avoid false alarms on new deployments.
+        if self.expected_trades_per_day > 0:
+            all_trades = get_recent_live_trades(self.sid, n=9999)
+            if all_trades:
+                oldest_ts = all_trades[-1].get("open_time") or all_trades[-1].get("close_time")
+                if oldest_ts:
+                    try:
+                        if isinstance(oldest_ts, str):
+                            oldest_dt = datetime.fromisoformat(oldest_ts)
+                        else:
+                            oldest_dt = oldest_ts
+                        n_days_elapsed = (datetime.now(timezone.utc) - oldest_dt.replace(
+                            tzinfo=oldest_dt.tzinfo or timezone.utc
+                        )).days
+                        if n_days_elapsed >= 5:
+                            actual_rate   = len(all_trades) / max(n_days_elapsed, 1)
+                            expected_rate = self.expected_trades_per_day
+                            if actual_rate < expected_rate * 0.30:
+                                log.warning(
+                                    f"[KILLSWITCH] {self.sid}: trade frequency LOW — "
+                                    f"actual={actual_rate:.2f}/day vs expected={expected_rate:.2f}/day "
+                                    f"over {n_days_elapsed} days ({len(all_trades)} trades). "
+                                    f"Check signal generation and MT5 connectivity."
+                                )
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+
         return self.status
 
 

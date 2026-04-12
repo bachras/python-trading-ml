@@ -39,6 +39,10 @@ MODEL_DIR  = Path(os.getenv("MODEL_DIR",  str(BASE_DIR / "models")))
 BACKTEST_START_DATE    = os.getenv("BACKTEST_START_DATE", "2020-01-02")
 ER_MULTIPLIER          = float(os.getenv("ER_MULTIPLIER", "1.25"))
 ATR_SPIKE_FILTER_MULT  = float(os.getenv("ATR_SPIKE_FILTER_MULT", "3.0"))
+SPREAD_BASE_PTS        = float(os.getenv("SPREAD_BASE_PTS",  "1.5"))
+SPREAD_ATR_COEFF       = float(os.getenv("SPREAD_ATR_COEFF", "0.04"))
+SPREAD_OPEN_MULT       = float(os.getenv("SPREAD_OPEN_MULT", "2.0"))
+SPREAD_OPEN_BARS       = int(os.getenv("SPREAD_OPEN_BARS",   "5"))
 SEQ_LEN             = 20   # must match phase2
 
 _LONDON_TZ = ZoneInfo("Europe/London")
@@ -185,8 +189,19 @@ def run_backtest(
         pd.Series(highs - lows).rolling(14).mean().values
     )
     dates       = df.index
-    # Spread model: half-spread cost on entry; zero if spread_mean not available
-    spread_arr  = df["spread_mean"].values if "spread_mean" in df.columns else np.zeros(len(df))
+    # Spread model (R7): half-spread cost on entry.
+    # When tick data has near-zero spread (Dukascopy artefact), apply synthetic regime-aware spread.
+    spread_arr = df["spread_mean"].values if "spread_mean" in df.columns else np.zeros(len(df))
+    if spread_arr.mean() < 0.1:
+        atr_s = df["atr14"].values if "atr14" in df.columns else np.ones(len(df))
+        session_bar_num = pd.Series(
+            df.groupby(df.index.date).cumcount().values, index=df.index
+        ).values
+        open_mult  = np.where(session_bar_num < SPREAD_OPEN_BARS, SPREAD_OPEN_MULT, 1.0)
+        base_spread = SPREAD_BASE_PTS + atr_s * SPREAD_ATR_COEFF
+        rng_bt      = np.random.default_rng(42)  # fixed seed — backtest must be deterministic
+        noise       = rng_bt.lognormal(mean=0.0, sigma=0.15, size=len(df))
+        spread_arr  = base_spread * open_mult * noise
     # Slippage: fixed 0.1 × ATR per side (conservative for CFDs at market close price)
     SLIP_FACTOR = 0.1
 

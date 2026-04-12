@@ -221,6 +221,26 @@ SEQ_LEN = 60
 # Minimum bars needed before training
 MIN_BARS = 500
 
+# ── S3: Global random seed (from env — set in train.py startup block) ────
+GLOBAL_SEED = int(os.getenv("GLOBAL_SEED", "42"))
+
+# ── R7: Synthetic spread model (Dukascopy spread is zero/near-zero) ──────
+# Applied in ga_fitness() and backtest_engine.py when spread_mean < 0.1 pts.
+SPREAD_BASE_PTS  = float(os.getenv("SPREAD_BASE_PTS",  "1.5"))
+SPREAD_ATR_COEFF = float(os.getenv("SPREAD_ATR_COEFF", "0.04"))
+SPREAD_OPEN_MULT = float(os.getenv("SPREAD_OPEN_MULT", "2.0"))
+SPREAD_OPEN_BARS = int(os.getenv("SPREAD_OPEN_BARS",   "5"))
+
+# R6: Features confirmed to use future bars (SWING_LOOKBACK = 10 bars each side).
+# These are whitelisted for the leakage check — training proceeds with a WARNING
+# rather than RuntimeError. Remediation (backward-only swing detection) is L3.
+KNOWN_LOOKAHEAD_FEATURES = frozenset({
+    "is_swing_high", "is_swing_low",
+    "dist_swing_high", "dist_swing_low",
+    "equal_high", "equal_low",
+    "stop_hunt_up", "stop_hunt_down",
+})
+
 
 # Live trade log path
 TRADE_LOG = LOG_DIR / "trade_log.json"
@@ -592,6 +612,28 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         d["target"]        = (c.shift(-1) > c).astype(int)
         d["target_return"] = d["logr1"].shift(-1)
 
+    # R2: [LABELS] diagnostics — TP rates, degenerate check, BE-bug check
+    label_cols = [c for c in d.columns if c.startswith("target_sl") and "_tp" in c and "_be" in c]
+    if label_cols:
+        tp_rates = {c: float(d[c].mean()) for c in label_cols}
+        min_rate = min(tp_rates.values())
+        max_rate = max(tp_rates.values())
+        log.info(f"[LABELS] {len(label_cols)} label cols | TP rate range [{min_rate:.3f}, {max_rate:.3f}]")
+        degenerate = [c for c, r in tp_rates.items() if r < 0.02 or r > 0.98]
+        if degenerate:
+            log.warning(f"[LABELS] Degenerate label columns (TP rate < 2% or > 98%): {degenerate}")
+        # BE-bug check: BE>0 should have LOWER TP rate than BE=0 equivalent
+        be0_rates = {c: r for c, r in tp_rates.items() if c.endswith("_be0")}
+        for be0_col, be0_rate in be0_rates.items():
+            prefix = be0_col[: -len("_be0")]
+            for be_v in [1, 2]:
+                be_col = f"{prefix}_be{be_v}"
+                if be_col in tp_rates and tp_rates[be_col] > be0_rate + 0.01:
+                    log.warning(
+                        f"[LABELS] BE bug suspect: {be_col} TP={tp_rates[be_col]:.3f} "
+                        f"> {be0_col} TP={be0_rate:.3f} — BE trigger should reduce TP rate"
+                    )
+
     # HTF alignment placeholder (filled in later per trade)
     d["htf_bullish"] = 0
     d["htf_strength"] = 0.0
@@ -629,6 +671,79 @@ def add_htf_alignment(entry_df: pd.DataFrame,
     entry_df["htf_strength"] = htf_str.reindex(entry_df.index, method="ffill").fillna(0) * htf_weight
 
     return entry_df
+
+
+# ─────────────────────────────────────────────────────────────
+# R6: LEAKAGE CHECK
+# ─────────────────────────────────────────────────────────────
+
+def _check_leakage(symbol: str, tf: int, df: pd.DataFrame) -> None:
+    """
+    Shuffle future rows into the dataframe, re-run add_institutional_features,
+    and compare feature values at a pivot region. Any feature that changes when
+    future data is shuffled is leaking future information.
+
+    KNOWN_LOOKAHEAD_FEATURES (swing detection) → WARNING only.
+    All other changed features → RuntimeError.
+    """
+    from institutional_features import add_institutional_features  # lazy — avoids circular import
+
+    if len(df) < 200:
+        log.warning(f"[LEAKAGE] {symbol}/{tf}m: too few rows ({len(df)}) to check — skipping")
+        return
+
+    pivot = max(100, len(df) // 2)
+    # Rows before pivot: these are the "safe" region we compare
+    check_slice = slice(pivot - 50, pivot)
+
+    # Baseline: run add_institutional_features on the unmodified df
+    df_base = df.copy()
+    base_feat = add_institutional_features(df_base)
+    base_vals = base_feat.iloc[check_slice].copy()
+
+    # Permuted: shuffle all rows AFTER pivot (simulates future-data leakage)
+    df_perm = df.copy()
+    future_idx = df_perm.index[pivot:]
+    perm_order = np.random.default_rng(42).permutation(len(future_idx))
+    df_perm.loc[future_idx] = df_perm.loc[future_idx].iloc[perm_order].values
+    perm_feat = add_institutional_features(df_perm)
+    perm_vals = perm_feat.iloc[check_slice].copy()
+
+    # Compare shared feature columns (exclude raw OHLCV and targets)
+    shared_cols = [
+        c for c in base_vals.columns
+        if c in perm_vals.columns
+        and c not in {"Open", "High", "Low", "Close", "Volume", "target", "target_return"}
+        and not c.startswith("target_sl")
+    ]
+
+    leaked_soft = []  # known lookahead (swing) — WARNING
+    leaked_hard = []  # unwhitelisted — RuntimeError
+
+    for col in shared_cols:
+        try:
+            b = base_vals[col].astype(float)
+            p = perm_vals[col].astype(float)
+            if np.nanmax(np.abs(b.values - p.values)) > 1e-6:
+                if col in KNOWN_LOOKAHEAD_FEATURES:
+                    leaked_soft.append(col)
+                else:
+                    leaked_hard.append(col)
+        except (TypeError, ValueError):
+            pass  # non-numeric column — skip
+
+    if leaked_soft:
+        log.warning(
+            f"[LEAKAGE] {symbol}/{tf}m: known lookahead features changed under permutation "
+            f"(accepted approximation): {leaked_soft}"
+        )
+    if leaked_hard:
+        raise RuntimeError(
+            f"[LEAKAGE] {symbol}/{tf}m: unwhitelisted features changed under future-data "
+            f"permutation — possible lookahead leakage: {leaked_hard}"
+        )
+
+    log.info(f"[LEAKAGE] {symbol}/{tf}m: leakage check passed ({len(shared_cols)} features checked)")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -678,12 +793,13 @@ def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
         subsample=0.8, colsample_bytree=0.8,
         use_label_encoder=False, eval_metric="logloss",
         early_stopping_rounds=20, verbosity=0,
+        seed=GLOBAL_SEED,
     )
     xgb_model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
 
     rf_model = RandomForestClassifier(
         n_estimators=300, max_depth=8, min_samples_leaf=10,
-        n_jobs=-1, random_state=42
+        n_jobs=-1, random_state=GLOBAL_SEED,
     )
     rf_model.fit(X_tr, y_tr)
 
@@ -860,10 +976,25 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
             )
         )
 
-    # ── Spread model (Stage 2: market physics visible to optimizer) ───
+    # S1: Per-genome deterministic RNG — reproducible fill/noise across evaluations
+    genome_seed = abs(hash(tuple(round(float(g), 4) for g in genome))) % (2 ** 31)
+    rng = np.random.default_rng(genome_seed)
+
+    # ── Spread model (R7: synthetic spread when tick data has near-zero spread) ──
     spread_arr = (df["spread_mean"].values
                   if "spread_mean" in df.columns
                   else np.zeros(len(df), dtype=np.float64))
+    if spread_arr.mean() < 0.1:
+        # Dukascopy artefact: bid/ask quote sequencing yields near-zero spread.
+        # Apply a regime-aware synthetic spread to avoid optimising in a zero-friction world.
+        atr_s = df["atr14"].values
+        session_bar_num = pd.Series(
+            df.groupby(df.index.date).cumcount().values, index=df.index
+        ).values
+        open_mult  = np.where(session_bar_num < SPREAD_OPEN_BARS, SPREAD_OPEN_MULT, 1.0)
+        base_spread = SPREAD_BASE_PTS + atr_s * SPREAD_ATR_COEFF
+        noise       = rng.lognormal(mean=0.0, sigma=0.15, size=len(df))
+        spread_arr  = base_spread * open_mult * noise
     SLIP_FACTOR = 0.1
 
     # ── Simulate trades (one at a time, fixed $100 risk per trade) ────
@@ -898,6 +1029,12 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
         # Stage 2: include spread + slippage in entry price
         spread_cost = spread_arr[i] / 2.0 if not np.isnan(spread_arr[i]) else 0.0
         slip_cost   = atr[i] * SLIP_FACTOR if not np.isnan(atr[i]) else 0.0
+
+        # S1: Fill probability — wide spread relative to SL reduces fill chance
+        fill_prob = float(np.clip(1.0 - (spread_cost / (sl_dist + 1e-10)) * 0.5, 0.80, 1.0))
+        if rng.random() > fill_prob:
+            continue
+
         entry  = closes[i] + direction * (spread_cost + slip_cost)
         sl     = entry - direction * sl_dist
         tp     = entry + direction * sl_dist * tp_mult
@@ -1069,7 +1206,7 @@ def run_optuna(df_dict: dict, models_by_tf: dict,
 
     study = optuna.create_study(
         direction="maximize",
-        sampler=TPESampler(seed=42, n_startup_trials=40),
+        sampler=TPESampler(seed=GLOBAL_SEED, n_startup_trials=40),
         study_name=f"opt_{symbol}",
     )
 
@@ -1173,7 +1310,7 @@ def run_per_tf_optimization(
 
     study = optuna.create_study(
         direction="maximize",
-        sampler=TPESampler(seed=42, n_startup_trials=30),
+        sampler=TPESampler(seed=GLOBAL_SEED, n_startup_trials=30),
         study_name=f"per_tf_{symbol}_{locked_tf}m",
     )
 
