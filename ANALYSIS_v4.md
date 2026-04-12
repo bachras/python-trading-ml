@@ -65,7 +65,20 @@ backtest_engine: std([+2R, -1R, 0, +1.5R, 0, +2R, 0])   — 7 calendar days
 ```
 `backtest_engine` Sharpe will be lower because zero days add to variance estimate. The optimizer therefore favours strategies with fewer, more selective trades (which have fewer zero-return days and thus artificially higher Sharpe in ga_fitness).
 
-**Fix direction:** Include zero-return days in the daily equity series inside `ga_fitness()`. Track the first and last trade date, fill the full calendar range with zeros for no-trade days, then compute std/mean on the complete series.
+**Fix — date range decision (resolved):** Use **first trade date → last trade date** within the `ga_fitness()` evaluation window. Zero-pad calendar days in that range with no trades.
+
+Do **not** use the full dataset range (`df.index[0]` → `df.index[-1]`) — that includes pre-signal warmup days before any trades could occur, adding spurious zeros to the denominator and creating a Sharpe that is lower than `backtest_engine`'s (which also starts from the first trade event). Goal is matching `backtest_engine`, not penalising the optimizer relative to it.
+
+```python
+# Correct zero-padding approach
+first_trade_day = trade_days.min()
+last_trade_day  = trade_days.max()
+full_range = pd.date_range(first_trade_day, last_trade_day, freq="B")  # business days
+daily_pnl_series = pd.Series(0.0, index=full_range)
+daily_pnl_series.update(pd.Series(bincount_pnl, index=trade_days))
+daily_ret = daily_pnl_series / start_equity
+sharpe = daily_ret.mean() / (daily_ret.std() + 1e-10) * np.sqrt(252)
+```
 
 ---
 
@@ -78,7 +91,9 @@ backtest_engine: std([+2R, -1R, 0, +1.5R, 0, +2R, 0])   — 7 calendar days
 - **If intentional:** Document it explicitly. High ATR outliers are a valid exclusion (news spikes, opening auction chaos aligns with I4 execution regime awareness).
 - **If unintentional:** Assess whether it hurts or helps. High-volatility entries may be exactly when the signal is strongest (breakout regime).
 
-**Action:** Confirm intent, add to `.env` as `ATR_SPIKE_FILTER_MULT=3.0` so it is adjustable/removable.
+**Resolved:** Make configurable via env var. The 3.0 multiplier was not explicitly planned in v3 and its justification is a judgment call (not pure physics like spread). Making it configurable costs one `.env` line and one code line, keeps current behaviour unchanged, and exposes a silent filter that could be removing good breakout signals.
+
+**Action:** Add `ATR_SPIKE_FILTER_MULT=3.0` to `.env`. Read in `backtest_engine.py` via `float(os.getenv("ATR_SPIKE_FILTER_MULT", "3.0"))`. Log the value at backtest start: `[CONFIG] ATR spike filter: skip bars where ATR > {mult}× rolling median`.
 
 ---
 
@@ -107,17 +122,59 @@ Without the expected baseline comparison:
 - A strategy that was always weak cannot be distinguished from one that was strong and degraded
 - The `reduce`/`disable` thresholds are absolute, not relative to the strategy's own baseline
 
-**Fix direction:** When `train.py` saves the best strategy, store `expected_sharpe` and `expected_win_rate` in the DB alongside other metrics. `_SmartKillSwitch` reads these at init and uses them as thresholds:
+**Resolved — implement both DB storage AND kill switch wiring now (not deferred):**
+
+This was listed as L3-7 (deferred) but is promoted to immediate action. The fix is ~30 lines and the kill switch without a baseline is strategy-blind. A conservative strategy (expected Sharpe=0.8) and an aggressive one (expected Sharpe=2.0) need different trigger levels.
+
+**Part 1 — `train.py`:** When saving best strategy params to DB, also store:
+- `expected_sharpe` — from `backtest_engine` Sharpe on the full backtest
+- `expected_win_rate` — from backtest trade statistics
+- `expected_trades_per_day` — for the time-window kill switch (Q4/A4)
+
+**Part 2 — `live.py` `_SmartKillSwitch.__init__()`:** Load these values from DB at init:
 ```python
+strategy = db.get_strategy(symbol, tf)
+self.expected_sharpe    = strategy["sharpe"]
+self.expected_win_rate  = strategy["win_rate"]
+self.expected_daily_trades = strategy["trades_per_day"]
+```
+
+**Part 3 — trigger logic:**
+```python
+# Trade-count window (last 20 trades)
 if rolling_sharpe < 0.5 * self.expected_sharpe and n_trades >= 20:
     state = "reduce"
-if rolling_win_rate < self.expected_win_rate - 0.10 and n_trades >= 50:
+if rolling_win_rate < self.expected_win_rate - 0.10 and n_trades >= 30:
     state = "disable"
+# Time window (last 10 calendar days) — Q4/A4
+if time_window_sharpe < 0.5 * self.expected_sharpe and days_elapsed >= 10:
+    state = max(state, "reduce")  # take worse of two windows
 ```
 
 ---
 
 ## 3. LOGGING REQUIREMENTS
+
+**Implementation status of each sub-section (resolved):**
+
+| Section | Requires new code? | Action |
+|---------|-------------------|--------|
+| 3A — Label TP rates | **Yes — add `logger.info()`** | Add summary log at end of `engineer_features()` |
+| 3B — GA spread costs | No — verification spec | Check manually: inspect ga_fitness output after training run |
+| 3C — HTF nudge stats | No — enhancement (later) | Add after paper trading begins |
+| 3D — Sharpe comparison | No — verification spec | Manual check: run backtest on best params, compare numbers |
+| 3E — Label selection per genome | No — check existing logs | Verify `_select_label_col()` already logs; add if missing |
+| 3F — Final model retrain | **Yes — add `logger.info()`** | Log label column used + Brier before/after |
+| 3G — Calibration curve | **Yes — add `logger.info()`** | Log bin table after `IsotonicRegression.fit()` |
+| 3H — SPA output | No — check existing logs | Verify `_spa_bootstrap_test()` already logs p-value |
+| 3I — PSI drift | No — check existing logs | Verify `_DriftMonitor` already logs PSI per feature |
+| 3J — Kill switch transitions | **Yes — add `logger.info()`** | Log every state change with timestamp + reason |
+| 3K — Max DD startup | **Yes — add `logger.info()`** | Add config dump at `live.py` startup |
+| 3L — BE spot-check | No — one-time manual check | Run once after first training, no code needed |
+
+**New `logger.info()` calls required in: 3A, 3F, 3G, 3J, 3K.** All others are verification specs — check the existing output matches the format shown.
+
+---
 
 The following logs must be present to confirm each technique is working correctly during and after a training run.
 
@@ -788,12 +845,11 @@ These items remain planned but are not in scope until live trading is validated:
 | L3-4 | Execution regime features | `institutional_features.py` | Medium | `execution_quality_score = f(spread_pct, tick_velocity_z, quote_update_freq)` as ML feature |
 | L3-5 | Dynamic capital allocation | `live.py` | Medium | Tighten confidence threshold when rolling live Sharpe < 70% of expected |
 | L3-6 | Regime-conditional models | `train.py`, `phase2_adaptive_engine.py` | Low | Separate XGB/RF per regime cluster |
-| L3-7 | Kill switch vs expected baseline (G4 fix) | `live.py`, `db.py` | High | Store `expected_sharpe` + `expected_win_rate` in DB; kill switch reads at init |
-| L3-8 | HTF nudge replaced by learnable ML feature (A7) | `institutional_features.py`, `phase2_adaptive_engine.py` | Medium | Add HTF state as model feature; remove linear nudge |
+| L3-7 | HTF nudge replaced by learnable ML feature (A7) | `institutional_features.py`, `phase2_adaptive_engine.py` | Medium | Add HTF state as model feature; remove linear nudge |
 
 ---
 
-## 6. KNOWN REMAINING INCONSISTENCY (LOW RISK)
+## 7. KNOWN REMAINING INCONSISTENCY (LOW RISK)
 
 **HTF alignment in backtest_engine:**
 
@@ -811,15 +867,17 @@ Fix: apply the same HTF nudge in `backtest_engine` as in `get_signal()` to get a
 
 ---
 
-## 7. ESTIMATED STATUS SUMMARY
+## 8. ESTIMATED STATUS SUMMARY
 
-| Layer | Items | Done | Partial | Remaining |
-|-------|-------|------|---------|-----------|
-| Layer 1 (internal consistency) | 18 | 16 | 2 | 0 |
-| Layer 2 (edge reliability) | 4 | 2 | 2 | 0 |
-| Config/env | 3 | 0 | 1 | 2 |
-| Additional gaps (Section 5) | 9 | 0 | 0 | 9 |
-| Layer 3 (deferred) | 8 | 0 | 0 | 8 |
+| Layer | Items | Done | Partial/In-progress | Remaining |
+|-------|-------|------|---------------------|-----------|
+| Layer 1 (internal consistency) | 18 | 16 | 2 (G1, G2) | 0 |
+| Layer 2 (edge reliability) | 4 | 2 | 2 (G3, G4→promoted) | 0 |
+| Config/env | 3 | 0 | 3 (items 1,2,5 above) | 0 |
+| Logging (new code required) | 5 | 0 | 5 (3A,3F,3G,3J,3K) | 0 |
+| Section 5 immediate (A2,A8,A9) | 3 | 0 | 3 (items 10,11,12) | 0 |
+| Section 5 paper-trade phase (A1,A3,A5,A6) | 4 | 0 | 0 | 4 |
+| Layer 3 (deferred) | 7 | 0 | 0 | 7 |
 
 ### Priority order for Section 5 items:
 
@@ -836,18 +894,25 @@ Fix: apply the same HTF nudge in `backtest_engine` as in `get_signal()` to get a
 | A7 | HTF nudge ML replacement | **Low (deferred)** | No | Large — moved to Layer 3 |
 
 ### Immediate action items before first training run:
-1. **Set `MAX_DRAWDOWN_PCT=35` in `.env`** — hard blocker, circuit breaker fires at 10% otherwise
-2. **Confirm env var name:** `VOL_SIZE_ENABLED` (not `VOL_SIZING_ENABLED`) in `live.py`
-3. **Add startup config log** in `live.py` to print all risk gate values at init
-4. **Fix Sharpe denominator** in `ga_fitness()` (G1 — include zero-return calendar days)
-5. **Add `expected_sharpe` + `expected_win_rate`** to DB strategy save (enables G4 kill switch baseline)
-6. **Add CVaR penalty** to `ga_fitness()` (A2 — 10 lines, highest impact per line of code)
-7. **Add ensemble diversity check** to `train.py` (A8 — no cost, pure diagnostic)
-8. **Add trade quality penalty** to `ga_fitness()` (A9 — 5 lines, guards against spread-eating strategies)
+
+| # | Item | File(s) | Type | Resolved decision |
+|---|------|---------|------|-------------------|
+| 1 | Set `MAX_DRAWDOWN_PCT=35` in `.env` | `.env` | Config | Hard blocker — circuit breaker fires at 10% otherwise |
+| 2 | Confirm env var name `VOL_SIZE_ENABLED` | `live.py`, `.env` | Config | Naming mismatch vs docs — verify actual name used in code |
+| 3 | Add startup config log (3K) | `live.py` | New log | `logger.info("[CONFIG] ...")` at init — new code required |
+| 4 | Fix Sharpe denominator (G1) | `phase2_adaptive_engine.py` | Code fix | Zero-pad from **first trade date → last trade date** (not full dataset range) |
+| 5 | Add `ATR_SPIKE_FILTER_MULT=3.0` to `.env` (G2) | `backtest_engine.py`, `.env` | Config | Make silent filter configurable; default=3.0, no behaviour change |
+| 6 | Add `expected_sharpe` + `expected_win_rate` + `expected_trades_per_day` to DB + wire kill switch (G4) | `train.py`, `db.py`, `live.py` | Code — do now | **Both** store AND wire `_SmartKillSwitch.__init__()` — not deferred |
+| 7 | Add label TP rate summary log (3A) | `phase2_adaptive_engine.py` | New log | `logger.info("[LABELS] ...")` at end of `engineer_features()` |
+| 8 | Add calibration log — label col + Brier (3F, 3G) | `train.py` | New log | Log label column used for retrain + bin table after isotonic fit |
+| 9 | Add kill switch state-change log (3J) | `live.py` | New log | `logger.info("[KILLSWITCH] ...")` on every state transition |
+| 10 | Add CVaR penalty to `ga_fitness()` (A2) | `phase2_adaptive_engine.py` | Code | ~10 lines; also log `cvar_95` + `skewness` for best genome |
+| 11 | Add ensemble diversity check to `train.py` (A8) | `train.py` | Code | ~5 lines after fold training; log XGB vs RF correlation + disagreement rate |
+| 12 | Add trade quality penalty to `ga_fitness()` (A9) | `phase2_adaptive_engine.py` | Code | ~5 lines; `mean_R < 0.15` progressive penalty |
 
 ### Before going live (paper trade → live capital):
-9. **Implement live calibration tracker** (A1) — most important ongoing monitoring signal
-10. **Implement signal rejection log** (A5) — detects over-filtering after 4–8 weeks of data
-11. **Add parameter stability check** (A3) — required before any model update in live
+13. **Implement live calibration tracker** (A1) — most important ongoing monitoring; needs live trade data to be meaningful
+14. **Implement signal rejection log** (A5) — detects over-filtering after 4–8 weeks of paper trade data
+15. **Add parameter stability check** (A3) — requires 2+ training runs to compare; implement before first live model update
 
-**The system is in a deployable state for paper trading after items 1–5 above and one training run. Items 6–8 are small improvements that take under an hour each and materially improve the optimizer's output quality. Items 9–11 are live-phase additions that grow in value as trade history accumulates.**
+**The system is in a deployable state for paper trading after items 1–6 above and one training run. Items 7–12 are small additions (1 hour total) that materially improve training output quality and observability. Items 13–15 are paper-trade-phase additions that grow in value only as live trade history accumulates.**

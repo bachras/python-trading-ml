@@ -36,8 +36,9 @@ BASE_DIR   = Path(os.getenv("BASE_DIR",   r"F:\trading_ml"))
 DATA_DIR   = Path(os.getenv("DATA_DIR",   str(BASE_DIR / "data")))
 MODEL_DIR  = Path(os.getenv("MODEL_DIR",  str(BASE_DIR / "models")))
 
-BACKTEST_START_DATE = os.getenv("BACKTEST_START_DATE", "2020-01-02")
-ER_MULTIPLIER       = float(os.getenv("ER_MULTIPLIER", "1.25"))
+BACKTEST_START_DATE    = os.getenv("BACKTEST_START_DATE", "2020-01-02")
+ER_MULTIPLIER          = float(os.getenv("ER_MULTIPLIER", "1.25"))
+ATR_SPIKE_FILTER_MULT  = float(os.getenv("ATR_SPIKE_FILTER_MULT", "3.0"))
 SEQ_LEN             = 20   # must match phase2
 
 _LONDON_TZ = ZoneInfo("Europe/London")
@@ -190,8 +191,8 @@ def run_backtest(
     SLIP_FACTOR = 0.1
 
     # ── ATR flash-crash filter (physics — not a behavioral cap) ─────────
-    # Skip entries when ATR > 3× rolling median — market has gapped or spiked.
-    # This is a market-physics filter: execution quality collapses during spikes.
+    # Skip entries when ATR > ATR_SPIKE_FILTER_MULT× rolling median (default 3×).
+    # Configurable via ATR_SPIKE_FILTER_MULT env var. Execution quality collapses during spikes.
     atr_series    = pd.Series(atr_arr)
     atr_roll_med  = atr_series.rolling(100, min_periods=20).median().values
 
@@ -269,10 +270,10 @@ def run_backtest(
         if _is_session_blocked(bar_date):
             continue
 
-        # ATR volatility filter: skip during flash crashes / gaps (ATR > 3× rolling median)
-        # This is a physics filter — execution quality collapses during spikes.
+        # ATR volatility filter: skip during flash crashes / gaps (ATR > N× rolling median).
+        # Multiplier configurable via ATR_SPIKE_FILTER_MULT (default 3.0).
         if (not np.isnan(atr_roll_med[i]) and atr_roll_med[i] > 0 and
-                not np.isnan(atr_arr[i]) and atr_arr[i] > atr_roll_med[i] * 3.0):
+                not np.isnan(atr_arr[i]) and atr_arr[i] > atr_roll_med[i] * ATR_SPIKE_FILTER_MULT):
             continue
 
         sl_dist = atr_arr[i] * sl_atr

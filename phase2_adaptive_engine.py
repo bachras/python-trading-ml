@@ -941,12 +941,13 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
     # ── Minimum trade count penalty — progressive, not a cliff ───────
     # Prevents optimizer finding corner solutions with 15 trades at 12:1 RR.
     # Soft-penalises sparse strategies while preserving optimizer freedom.
-    MIN_CREDIBLE = 100
+    MIN_CREDIBLE  = 100
     trade_penalty = min(n_trades / MIN_CREDIBLE, 1.0)   # 1.0 at 100+ trades
 
     # ── Sharpe from daily equity curve × √252 ─────────────────────────
-    # Matches backtest_engine formula exactly — ensures optimizer ranking
-    # agrees with reporting ranking (no divergence between tools).
+    # G1: include all calendar days between first and last trade date.
+    # Removing zero-return days inflates Sharpe vs backtest_engine (which
+    # builds a full calendar equity curve). Using all days keeps both in sync.
     dates_arr   = np.array([t[0] for t in trade_pnls], dtype="datetime64[D]")
     pnl_arr     = np.array([t[1] for t in trade_pnls])
     day_ints    = (dates_arr - dates_arr[0]).astype(np.int64)
@@ -955,21 +956,38 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
         return (-999.0,)
     daily_pnl = np.zeros(n_days_span)
     np.add.at(daily_pnl, day_ints, pnl_arr)
-    # Build equity curve
-    eq_curve    = 10000.0 + np.cumsum(daily_pnl)
-    # Remove zero-trade days (keep days that had at least one trade)
-    mask        = daily_pnl != 0
-    if mask.sum() < 2:
+    # Equity curve spans first→last trade date; includes zero-return calendar days
+    eq_curve  = 10000.0 + np.cumsum(daily_pnl)
+    daily_ret = np.diff(eq_curve) / (eq_curve[:-1] + 1e-10)
+    if len(daily_ret) < 2:
         return (-999.0,)
-    daily_ret   = np.diff(eq_curve[mask]) / (eq_curve[mask][:-1] + 1e-10)
-    mean_r      = daily_ret.mean()
-    std_r       = daily_ret.std()
-    sharpe      = mean_r / (std_r + 1e-10) * np.sqrt(252)
+    mean_r    = daily_ret.mean()
+    std_r     = daily_ret.std()
+    sharpe    = mean_r / (std_r + 1e-10) * np.sqrt(252)
     if not np.isfinite(sharpe):
         return (-999.0,)
 
-    # Apply trade-count penalty: sparse strategies score proportionally lower
-    fitness = sharpe * trade_penalty
+    # ── R-multiple array (used by A2 and A9 below) ────────────────────
+    r_arr = pnl_arr / (FIXED_RISK + 1e-10)
+
+    # ── CVaR tail risk penalty (A2) ───────────────────────────────────
+    # Two strategies with identical Sharpe may differ in left-tail shape.
+    # Penalise strategies where the worst 5% of trades average below −2R.
+    sorted_r = np.sort(r_arr)
+    cvar_pct = int(len(r_arr) * 0.05)
+    cvar_95  = sorted_r[:cvar_pct].mean() if cvar_pct >= 3 else float(sorted_r[0])
+    # cvar_95 is negative; penalty grows when worse than −2R
+    cvar_penalty = max(0.0, (-cvar_95 - 2.0) / 2.0)
+
+    # ── Trade quality soft penalty (A9) ───────────────────────────────
+    # Guard against strategies that barely cover execution costs.
+    # 0.15R on $100 risk = $15 avg net; typical spread+slip ≈ $7–10.
+    mean_r_trade    = float(r_arr.mean())
+    quality_penalty = (mean_r_trade / 0.15) if mean_r_trade < 0.15 else 1.0
+    quality_penalty = max(0.0, quality_penalty)  # clamp to [0, 1]
+
+    # ── Final fitness ─────────────────────────────────────────────────
+    fitness = sharpe * trade_penalty * max(0.5, 1.0 - cvar_penalty) * quality_penalty
     return (fitness,)
 
 

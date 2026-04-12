@@ -112,6 +112,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("live")
 
+# 3K: startup config log — print all risk gate values so .env misconfiguration is immediately visible.
+log.info(
+    "[CONFIG] Risk gates loaded:\n"
+    f"  max_drawdown_pct : {float(os.getenv('MAX_DRAWDOWN_PCT', '35.0')):.1f}%\n"
+    f"  fixed_risk_amt   : ${FIXED_RISK_AMT:.1f}\n"
+    f"  vol_size_enabled : {VOL_SIZE_ENABLED}\n"
+    f"  session_gate     : 20:30–01:00 London (DST-aware)\n"
+    f"  model_reload_min : {MODEL_RELOAD_INTERVAL_MIN}"
+)
+
 _LONDON_TZ = ZoneInfo("Europe/London")
 
 
@@ -289,11 +299,28 @@ class _SmartKillSwitch:
         self.sharpe = 0.0
         self.wr     = 0.5
 
+        # G4: load expected baselines from DB — enables strategy-specific thresholds.
+        # A conservative strategy (Sharpe=0.8 expected) and an aggressive one (Sharpe=2.0)
+        # should not trigger at the same absolute levels.
+        s = get_strategy(strategy_id)
+        self.expected_sharpe   = float(s.get("expected_sharpe")   or 0.0) if s else 0.0
+        self.expected_win_rate = float(s.get("expected_win_rate") or 0.5) if s else 0.5
+        if self.expected_sharpe > 0:
+            log.info(
+                f"[KILLSWITCH] {strategy_id}: baselines loaded — "
+                f"expected_sharpe={self.expected_sharpe:.2f}, "
+                f"expected_win_rate={self.expected_win_rate:.1%}"
+            )
+        else:
+            log.warning(
+                f"[KILLSWITCH] {strategy_id}: no expected baselines in DB — "
+                f"using absolute thresholds. Run training to populate."
+            )
+
     @staticmethod
     def _binomial_p(wins: int, n: int) -> float:
         """One-sided binomial p-value for H0: p >= 0.5 (test: WR below chance)."""
         from scipy.stats import binom
-        # P(X <= wins | n, 0.5)
         return float(binom.cdf(wins, n, 0.5))
 
     def check(self) -> str:
@@ -313,16 +340,57 @@ class _SmartKillSwitch:
         else:
             self.sharpe = 0.0
 
-        p_val = self._binomial_p(wins, n)
+        p_val      = self._binomial_p(wins, n)
+        prev_state = self.status
 
-        if self.sharpe < -1.0 or p_val < 0.01:
+        # G4: strategy-specific thresholds when baseline is available; else absolute fallback.
+        if self.expected_sharpe > 0:
+            # Relative: trigger when live Sharpe degrades significantly vs training
+            disable_sharpe = -max(0.5, self.expected_sharpe * 0.5)
+            reduce_sharpe  = -max(0.2, self.expected_sharpe * 0.2)
+            warn_sharpe    = 0.0
+        else:
+            disable_sharpe, reduce_sharpe, warn_sharpe = -1.0, -0.5, 0.0
+
+        # Win-rate thresholds relative to expected baseline (10pp / 15pp degradation)
+        wr_delta = self.wr - self.expected_win_rate
+        p_disable = 0.01 if wr_delta < -0.15 else 0.001
+        p_reduce  = 0.05 if wr_delta < -0.10 else 0.01
+        p_warn    = 0.10
+
+        if self.sharpe < disable_sharpe or p_val < p_disable:
             self.status = "disable"
-        elif self.sharpe < -0.5 or p_val < 0.05:
+        elif self.sharpe < reduce_sharpe or p_val < p_reduce:
             self.status = "reduce"
-        elif self.sharpe < 0 or p_val < 0.10:
+        elif self.sharpe < warn_sharpe or p_val < p_warn:
             self.status = "warn"
         else:
             self.status = "ok"
+
+        # 3J: log every check; flag state transitions prominently
+        wr_pct  = self.wr * 100
+        exp_pct = self.expected_win_rate * 100
+        if self.status != prev_state:
+            log.warning(
+                f"[KILLSWITCH] {self.sid}: {prev_state.upper()} → {self.status.upper()} "
+                f"| wins={wins}/{n} ({wr_pct:.1f}%, expected {exp_pct:.1f}%) "
+                f"| sharpe={self.sharpe:.2f} (expected {self.expected_sharpe:.2f}) "
+                f"| p_val={p_val:.4f}"
+            )
+            if self.status == "reduce":
+                log.warning(
+                    f"[KILLSWITCH] {self.sid}: risk halved → ${FIXED_RISK_AMT * 0.5:.0f}/trade"
+                )
+            elif self.status == "disable":
+                log.warning(
+                    f"[KILLSWITCH] {self.sid}: DISABLED — no new orders until manual reset"
+                )
+        else:
+            log.info(
+                f"[KILLSWITCH] {self.sid}: state={self.status.upper()} "
+                f"| wins={wins}/{n} ({wr_pct:.1f}%) "
+                f"| sharpe={self.sharpe:.2f} | p_val={p_val:.4f}"
+            )
         return self.status
 
 

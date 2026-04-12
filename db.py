@@ -81,6 +81,11 @@ def init_db():
             -- SPA bootstrap edge test: p-value for H0: expected trade P&L <= 0
             -- p < 0.05 → statistically significant positive edge
             spa_p_value       REAL,
+            -- Expected performance baselines (from backtest at training time).
+            -- Used by _SmartKillSwitch to compare live metrics against training expectations
+            -- rather than firing on absolute thresholds regardless of strategy character.
+            expected_sharpe   REAL,
+            expected_win_rate REAL,
             -- metadata
             updated_at       TEXT,
             is_active        INTEGER DEFAULT 0   -- 1 = running live
@@ -173,6 +178,8 @@ def init_db():
         _add_column_if_missing(c, "strategy_params", "sensitivity_score", "REAL")
         _add_column_if_missing(c, "strategy_params", "robust",            "INTEGER DEFAULT 0")
         _add_column_if_missing(c, "strategy_params", "spa_p_value",       "REAL")
+        _add_column_if_missing(c, "strategy_params", "expected_sharpe",   "REAL")
+        _add_column_if_missing(c, "strategy_params", "expected_win_rate", "REAL")
 
 
 def _add_column_if_missing(conn, table: str, column: str, col_type: str):
@@ -203,6 +210,8 @@ def upsert_strategy(row: dict):
     row.setdefault("sensitivity_score", None)
     row.setdefault("robust",            0)
     row.setdefault("spa_p_value",       None)
+    row.setdefault("expected_sharpe",   None)
+    row.setdefault("expected_win_rate", None)
     with _conn() as c:
         c.execute("""
             INSERT INTO strategy_params
@@ -214,6 +223,7 @@ def upsert_strategy(row: dict):
                mc_sharpe_p5, mc_sharpe_p50, mc_sharpe_p95,
                mc_dd_p95, mc_profit_p5, mc_pass,
                sensitivity_score, robust, spa_p_value,
+               expected_sharpe, expected_win_rate,
                updated_at, is_active)
             VALUES
               (:strategy_id,:symbol,:tf,:rank,:entry_tf,:htf_tf,
@@ -224,6 +234,7 @@ def upsert_strategy(row: dict):
                :mc_sharpe_p5,:mc_sharpe_p50,:mc_sharpe_p95,
                :mc_dd_p95,:mc_profit_p5,:mc_pass,
                :sensitivity_score,:robust,:spa_p_value,
+               :expected_sharpe,:expected_win_rate,
                :updated_at,:is_active)
             ON CONFLICT(strategy_id) DO UPDATE SET
               entry_tf=excluded.entry_tf, htf_tf=excluded.htf_tf,
@@ -251,6 +262,8 @@ def upsert_strategy(row: dict):
               sensitivity_score=excluded.sensitivity_score,
               robust=excluded.robust,
               spa_p_value=excluded.spa_p_value,
+              expected_sharpe=excluded.expected_sharpe,
+              expected_win_rate=excluded.expected_win_rate,
               updated_at=excluded.updated_at
         """, row)
 

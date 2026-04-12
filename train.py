@@ -262,6 +262,26 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             n         = len(df)
             feat_cols = get_feature_cols(df)
 
+            # ── 3A: Label TP rate summary ──────────────────────────────────
+            # Verify the 75-column label grid has sensible class balance.
+            # TP rate should decrease with tp_mult; be=1/2 should be ≤ be=0 for tp ≥ 2.
+            target_cols = sorted(c for c in df.columns if c.startswith("target_sl"))
+            if target_cols:
+                tp_rates = {c: float(df[c].mean()) for c in target_cols if df[c].notna().any()}
+                if tp_rates:
+                    sample = list(tp_rates.items())[:12]   # log first 12 to avoid flood
+                    rate_str = "  ".join(
+                        f"{k.replace('target_','')}: {v:.1%}" for k, v in sample
+                    )
+                    log.info(f"  [LABELS] {symbol} {tf}m TP rates (sample of {len(tp_rates)}): "
+                             f"{rate_str}")
+                    min_r, max_r = min(tp_rates.values()), max(tp_rates.values())
+                    if max_r == 0 or min_r == max_r:
+                        log.warning(
+                            f"  [LABELS] {symbol} {tf}m: all TP rates identical ({min_r:.1%}) "
+                            f"— check label computation in engineer_features()"
+                        )
+
             log.info(f"  {symbol} {tf}m | {df.index[0].date()} → {df.index[-1].date()} | "
                      f"{n:,} bars | {len(feat_cols)} features")
 
@@ -309,6 +329,27 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 oos_probs_all.extend(((p_xgb_oos + p_rf_oos) / 2.0).tolist())
                 oos_labels_all.extend(y_val.tolist())
 
+                # A8: ensemble diversity check — verify XGB and RF are not duplicating each other.
+                # Low diversity (corr > 0.90) means averaging adds noise without signal.
+                if len(p_xgb_oos) >= 10:
+                    std_x = float(np.std(p_xgb_oos))
+                    std_r = float(np.std(p_rf_oos))
+                    corr  = (float(np.corrcoef(p_xgb_oos, p_rf_oos)[0, 1])
+                             if std_x > 0 and std_r > 0 else 1.0)
+                    disagree = float(np.mean(np.abs(p_xgb_oos - p_rf_oos) > 0.10))
+                    div_tag  = "ADEQUATE" if corr < 0.90 and disagree > 0.15 else "LOW"
+                    if div_tag == "LOW":
+                        log.warning(
+                            f"    [ENSEMBLE] Fold {fold_num} diversity {div_tag}: "
+                            f"corr={corr:.3f} (target<0.90), disagree>{10}%={disagree:.1%} "
+                            f"(target>15%) — ensemble may behave as single model"
+                        )
+                    else:
+                        log.info(
+                            f"    [ENSEMBLE] Fold {fold_num} diversity {div_tag}: "
+                            f"corr={corr:.3f}, disagree>{10}%={disagree:.1%}"
+                        )
+
             # Log cross-fold OOS accuracy summary
             log.info(f"  {symbol} {tf}m walk-forward OOS accuracy | "
                      f"XGB: {np.mean(fold_xgb_scores):.3f} ± {np.std(fold_xgb_scores):.3f} | "
@@ -322,6 +363,41 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 joblib.dump(calibrator, MODEL_DIR / f"calibrator_{key}.pkl")
                 log.info(f"  Calibrator saved → calibrator_{key}.pkl "
                          f"({len(oos_probs_all):,} OOS samples)")
+
+                # 3G: calibration curve — predicted vs actual win rate by probability bin.
+                # After calibration, each bin's predicted and actual should agree within 0.03.
+                try:
+                    probs_arr = np.array(oos_probs_all)
+                    lbls_arr  = np.array(oos_labels_all)
+                    brier_before = float(np.mean((probs_arr - lbls_arr) ** 2))
+                    cal_probs    = calibrator.predict(probs_arr)
+                    brier_after  = float(np.mean((cal_probs  - lbls_arr) ** 2))
+                    log.info(f"  [CALIBRATION] {key} — bin table (predicted→actual Δ):")
+                    max_delta = 0.0
+                    for lo in np.arange(0.50, 0.90, 0.05):
+                        hi    = lo + 0.05
+                        m_bin = (probs_arr >= lo) & (probs_arr < hi)
+                        if m_bin.sum() < 3:
+                            continue
+                        pred_m = float(probs_arr[m_bin].mean())
+                        act_m  = float(lbls_arr[m_bin].mean())
+                        delta  = act_m - pred_m
+                        max_delta = max(max_delta, abs(delta))
+                        flag   = " WARN" if abs(delta) > 0.05 else ""
+                        log.info(f"    [{lo:.2f}–{hi:.2f}]: pred={pred_m:.3f} "
+                                 f"actual={act_m:.3f} Δ={delta:+.3f} n={m_bin.sum():>4}{flag}")
+                    brier_tag = "improved" if brier_after < brier_before else "WARN: degraded"
+                    log.info(f"  [CALIBRATION] Brier: before={brier_before:.4f} "
+                             f"→ after={brier_after:.4f} ({brier_tag}) | "
+                             f"max bin delta={max_delta:.3f}"
+                             + (" ← ALERT" if max_delta > 0.10 else ""))
+                    if brier_after >= brier_before:
+                        log.warning(
+                            f"  [CALIBRATION] Brier did not improve — OOS sample may be too "
+                            f"small ({len(oos_probs_all)} rows) for reliable isotonic fit"
+                        )
+                except Exception as _cal_e:
+                    log.warning(f"  [CALIBRATION] Could not compute calibration curve: {_cal_e}")
 
             # ── Final production model: train on ALL data ─────────────
             # Use the last fold's scaler (fitted on most data) for production
@@ -533,6 +609,9 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     "sensitivity_score": sens.get("sensitivity_score"),
                     "robust":           int(sens.get("robust", False)),
                     "spa_p_value":      spa_p,
+                    # G4: store baselines so _SmartKillSwitch can use strategy-specific thresholds
+                    "expected_sharpe":   trial["sharpe"],
+                    "expected_win_rate": stats["win_rate"] / 100.0,  # convert % to decimal
                     "is_active":        0,
                 })
                 if not bt["equity_df"].empty:
@@ -597,8 +676,29 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                         # Overwrite the generic models in cache and on disk
                         models_cache[f"xgb_{scaler_key}"] = xgb_rt
                         models_cache[f"rf_{scaler_key}"]  = rf_rt
-                        log.info(f"  {symbol} {tf}m: label-matched model saved "
-                                 f"(overwrites generic be=0 model)")
+
+                        # 3F: log label, class balance, OOS accuracy, and Brier for retrained model
+                        try:
+                            X_rt_log  = rt_val_s[rt_feat_cols].values
+                            y_rt_log  = df_rt.iloc[i_va:]["target"].values
+                            rt_xgb_p  = xgb_rt.predict_proba(X_rt_log)[:, 1]
+                            rt_rf_p   = rf_rt.predict_proba(X_rt_log)[:, 1]
+                            rt_ens_p  = (rt_xgb_p + rt_rf_p) / 2.0
+                            rt_acc    = float(((rt_ens_p >= 0.5).astype(int) == y_rt_log).mean())
+                            tp_rate   = float(y_rt_log.mean())
+                            rt_brier  = float(np.mean((rt_ens_p - y_rt_log) ** 2))
+                            log.info(
+                                f"  [RETRAIN] {symbol} {tf}m → label={best_label_col} "
+                                f"| TP rate={tp_rate:.1%} | OOS acc={rt_acc:.3f} "
+                                f"| Brier={rt_brier:.4f}"
+                            )
+                            log.info(
+                                f"  [RETRAIN] saved: xgb_{scaler_key}.pkl, rf_{scaler_key}.pkl"
+                            )
+                        except Exception as _rf_e:
+                            log.warning(f"  [RETRAIN] Could not compute OOS accuracy: {_rf_e}")
+                            log.info(f"  {symbol} {tf}m: label-matched model saved "
+                                     f"(overwrites generic be=0 model)")
                     else:
                         log.warning(f"  {symbol} {tf}m: skipping label retrain "
                                     f"— scaler missing or insufficient bars "
