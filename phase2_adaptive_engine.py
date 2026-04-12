@@ -449,17 +449,39 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         d[f"c_lag{lag}"] = c.shift(lag)
         d[f"r_lag{lag}"] = d["logr1"].shift(lag)
 
-    # ── Triple Barrier Labeling (Lopez de Prado) ───────────────────────
-    # Label each bar by which barrier is touched first in the next bars:
-    #   1 = TP touched first (long wins)  →  bullish label
-    #   0 = SL touched first (long loses) →  bearish label
-    # Parameters: sl_atr=1.5, tp_mult=2.0 (sl_dist = atr14 * 1.5, tp = sl_dist * 2.0)
-    # Max hold: 50 bars (prevents labels from looking far into the future)
-    # Falls back to next-bar direction if ATR unavailable.
-    # NOTE: dropna() below purges the last MAX_HOLD rows that have no label.
-    MAX_HOLD = 50
-    TB_SL_ATR  = 1.5
-    TB_TP_MULT = 2.0
+    # ── Triple Barrier Labeling — 5×5×3 grid (Lopez de Prado) ────────────
+    # Pre-compute labels for a Cartesian grid of sl_atr × tp_mult × be.
+    #
+    # Grid:
+    #   sl_atr  ∈ [1.5, 2.0, 2.5, 3.0, 3.5]   (5 values)
+    #   tp_mult ∈ [1, 2, 3, 4, 5]               (5 values)
+    #   be      ∈ [0, 1, 2]                      (3 values)
+    # = 75 columns.  Column names: target_sl{sl}_tp{tp}_be{be}
+    #   e.g. target_sl2.0_tp3_be1
+    #
+    # BE semantics (D2b — see ANALYSIS_v3.md):
+    #   be=0: no break-even, plain SL/TP triple barrier
+    #   be=1: SL moves to entry+1pt when price reaches entry + 1×sl_dist (+1R)
+    #   be=2: SL moves to entry+1pt when price reaches entry + 2×sl_dist (+2R)
+    #
+    # Label values:
+    #    1.0 = TP hit (price reached TP before any SL)
+    #    0.0 = BE exit (be=1/2 triggered then BE-SL hit) OR timeout
+    #   -1.0 = SL hit (original SL hit before TP and before BE triggered)
+    #   NaN  = unlabelled (shouldn't happen after the loop; dropped by dropna)
+    #
+    # be=0 columns: fully vectorized (unchanged from prior implementation).
+    # be=1/2 columns: per-trade Python loop for correctness — handles the
+    #   state change when BE triggers (SL shifts mid-trade). One-time cost
+    #   at training time, ~30–60s for 50 additional columns.
+    #
+    # ga_fitness() selects the closest column in 3D (sl_atr, tp_mult, be_r)
+    # via _select_label_col(sl_atr, tp_mult, be_r).
+    MAX_HOLD   = 50
+    TB_SL_GRID = [1.5, 2.0, 2.5, 3.0, 3.5]
+    TB_TP_GRID = [1,   2,   3,   4,   5  ]
+    TB_BE_GRID = [0,   1,   2]
+    BE_OFFSET  = 1.0   # SL moves to entry + 1 price unit when BE triggers
 
     if "atr14" in d.columns:
         closes_arr = d["Close"].values.astype(np.float64)
@@ -467,42 +489,106 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         lows_arr   = d["Low"].values.astype(np.float64)
         atr_arr    = d["atr14"].values.astype(np.float64)
         n          = len(d)
-        labels     = np.full(n, np.nan, dtype=np.float32)
 
-        sl_dist = atr_arr * TB_SL_ATR           # (n,)
-        long_tp = closes_arr + sl_dist * TB_TP_MULT
-        long_sl = closes_arr - sl_dist
+        bad_atr = np.isnan(atr_arr) | (atr_arr <= 0)
 
-        # Walk forward bar-by-bar but vectorise across all open positions per step.
-        # At each step k, we check which UNLABELLED bars see TP or SL touched
-        # for the FIRST TIME at exactly this lookahead step.
-        # Correctness: once a bar is labelled it is removed from candidates,
-        # so "first touch" semantics are preserved.
-        unlabelled = np.ones(n, dtype=bool)
-        unlabelled[np.isnan(atr_arr) | (atr_arr <= 0)] = False  # skip bad ATR
+        # ── be=0: vectorized (no state change, same as before) ──────────
+        # Label encoding: 1.0 = TP hit (win), 0.0 = SL hit or timeout (not-win).
+        # Binary encoding for XGBoost/RF: predict_proba gives P(TP hit).
+        for sl_v in TB_SL_GRID:
+            for tp_v in TB_TP_GRID:
+                col     = f"target_sl{sl_v}_tp{tp_v}_be0"
+                labels  = np.full(n, np.nan, dtype=np.float32)
+                sl_dist = atr_arr * sl_v
+                long_tp = closes_arr + sl_dist * tp_v
+                long_sl = closes_arr - sl_dist
 
-        for k in range(1, MAX_HOLD + 1):
-            if not unlabelled[:n - k].any():
-                break
-            # For row i, the bar at position i+k
-            future_high = highs_arr[k:]    # length n-k  (aligned to rows 0..n-k-1)
-            future_low  = lows_arr[k:]
+                unlabelled = np.ones(n, dtype=bool)
+                unlabelled[bad_atr] = False
 
-            cand = unlabelled[:n - k]
-            tp_touched = cand & (future_high >= long_tp[:n - k])
-            sl_touched = cand & (future_low  <= long_sl[:n - k])
-            both       = tp_touched & sl_touched
+                for k in range(1, MAX_HOLD + 1):
+                    if not unlabelled[:n - k].any():
+                        break
+                    future_high = highs_arr[k:]
+                    future_low  = lows_arr[k:]
+                    cand        = unlabelled[:n - k]
+                    tp_hit      = cand & (future_high >= long_tp[:n - k])
+                    sl_hit      = cand & (future_low  <= long_sl[:n - k])
+                    both        = tp_hit & sl_hit
+                    labels[:n - k][sl_hit & ~both] = 0.0   # SL hit → not-win
+                    labels[:n - k][tp_hit]          = 1.0   # TP hit (both→TP wins)
+                    unlabelled[:n - k][tp_hit | sl_hit] = False
 
-            # Both touched in the same bar — award TP (conservative, avoids penalising
-            # setups where the bar spiked both ways before closing in profit direction)
-            labels[:n - k][sl_touched & ~both] = 0.0
-            labels[:n - k][tp_touched]          = 1.0   # includes both → TP wins
-            unlabelled[:n - k][tp_touched | sl_touched] = False
+                # Remaining unlabelled after MAX_HOLD → timeout = 0 (not-win)
+                labels[unlabelled] = 0.0
+                d[col] = labels
 
-        d["target"] = labels
+        # ── be=1, be=2: per-trade Python loop ───────────────────────────
+        # Label encoding: 1.0 = TP hit, 0.0 = everything else.
+        # "Everything else" for BE columns includes:
+        #   • BE exit (BE triggered then BE-SL hit) → neutral outcome ≈ 0R
+        #   • SL hit before BE triggered → full loss = -1R
+        # Both map to 0.0 for binary classification: model predicts "TP or not?"
+        # BE makes some 0.0 outcomes less bad in practice (≈0R vs -1R) —
+        # but the model's job is still "predict TP reach", not quantify loss.
+        for sl_v in TB_SL_GRID:
+            for tp_v in TB_TP_GRID:
+                sl_dist_arr = atr_arr * sl_v   # per-bar SL distance
+
+                for be_v in [1, 2]:
+                    col    = f"target_sl{sl_v}_tp{tp_v}_be{be_v}"
+                    labels = np.full(n, np.nan, dtype=np.float32)
+
+                    for i in range(n):
+                        if bad_atr[i]:
+                            continue
+                        entry   = closes_arr[i]
+                        sl_dist = sl_dist_arr[i]
+                        tp_lvl  = entry + sl_dist * tp_v    # TP level (long)
+                        sl_lvl  = entry - sl_dist           # initial SL (long)
+                        be_trig = entry + sl_dist * be_v    # BE trigger at be_v×R
+                        be_sl   = entry + BE_OFFSET         # SL after BE triggers
+                        be_done = False
+
+                        label = 0.0   # default: timeout → not-win
+                        for k in range(1, MAX_HOLD + 1):
+                            j = i + k
+                            if j >= n:
+                                break
+                            bh = highs_arr[j]
+                            bl = lows_arr[j]
+
+                            # Check BE trigger first (before SL/TP on same bar)
+                            if not be_done and bh >= be_trig:
+                                be_done = True
+                                sl_lvl  = be_sl
+
+                            # TP hit
+                            if bh >= tp_lvl:
+                                label = 1.0
+                                break
+
+                            # SL hit (original SL or BE-stop — both → not-win = 0)
+                            if bl <= sl_lvl:
+                                label = 0.0
+                                break
+
+                        labels[i] = label
+
+                    d[col] = labels
+
+        # Default `target` = be=0 mid-grid column (sl=1.5, tp=2, be=0).
+        # Used by walk-forward fold training (search phase — acceptable approximation).
+        # train.py overwrites this with the rank-1 best-matching label before
+        # saving the final production model, fixing model calibration.
+        d["target"]        = d["target_sl1.5_tp2_be0"]
         d["target_return"] = d["logr1"].shift(-1)
     else:
         # Fallback if ATR not yet computed (should not happen in normal flow)
+        for sl_v in [1.5, 2.0, 2.5, 3.0, 3.5]:
+            for tp_v in [1, 2, 3, 4, 5]:
+                for be_v in [0, 1, 2]:
+                    d[f"target_sl{sl_v}_tp{tp_v}_be{be_v}"] = (c.shift(-1) > c).astype(int)
         d["target"]        = (c.shift(-1) > c).astype(int)
         d["target_return"] = d["logr1"].shift(-1)
 
@@ -553,7 +639,10 @@ EXCLUDE_COLS = {"Open", "High", "Low", "Close", "Volume",
                 "target", "target_return"}
 
 def get_feature_cols(df: pd.DataFrame) -> list:
-    return [c for c in df.columns if c not in EXCLUDE_COLS]
+    # Exclude all 75 triple-barrier label columns (target_sl{sl}_tp{tp}_be{be})
+    # and the default `target` alias — these are targets, not features.
+    return [c for c in df.columns
+            if c not in EXCLUDE_COLS and not c.startswith("target_sl")]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -621,8 +710,11 @@ def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
 GA_BOUNDS = [
     (0, len(PARAM_SEEDS["entry_tf_options"]) - 1),   # entry TF index
     (0, len(PARAM_SEEDS["htf_options"]) - 1),         # HTF index (0 = NONE)
-    (PARAM_SEEDS["sl_atr_min"],    PARAM_SEEDS["sl_atr_max"]),
-    (PARAM_SEEDS["tp_mult_min"],   PARAM_SEEDS["tp_mult_max"]),
+    # sl_atr and tp_mult narrowed to match the 5×5 label grid.
+    # Genomes outside [1.0, 4.0] / [0.5, 6.0] would map to the nearest grid
+    # edge (sl=1.5 or sl=3.5) — wasting evaluations on poorly-labelled space.
+    (1.0, 4.0),    # sl_atr  (grid covers 1.5–3.5, allow 0.25 overhang)
+    (0.5, 6.0),    # tp_mult (grid covers 1–5, allow 0.5 overhang)
     (PARAM_SEEDS["confidence_min"],PARAM_SEEDS["confidence_max"]),
     (PARAM_SEEDS["htf_weight_min"],PARAM_SEEDS["htf_weight_max"]),
     (0, len(PARAM_SEEDS["be_r_options"]) - 1),        # BE trigger index (0/1/2/3R)
@@ -651,13 +743,42 @@ def decode_genome(genome: list) -> dict:
     }
 
 
+def _select_label_col(sl_atr: float, tp_mult: float, be_r: int = 0) -> str:
+    """
+    Return the pre-computed label column name whose (sl_atr, tp_mult) grid
+    point is nearest (Euclidean distance) to the requested values, with
+    be_r mapped to the closest BE label dimension.
+
+    Grid:
+      sl_atr  ∈ [1.5, 2.0, 2.5, 3.0, 3.5]
+      tp_mult ∈ [1, 2, 3, 4, 5]
+      be      ∈ [0, 1, 2]  (be_r=3 maps to be=2 — same label, see D2b)
+    """
+    _SL_GRID = [1.5, 2.0, 2.5, 3.0, 3.5]
+    _TP_GRID = [1,   2,   3,   4,   5  ]
+
+    # Genome be_r=3 shares the be=2 label (both trigger at 2R or beyond;
+    # practically indistinguishable in the triple-barrier scan).
+    be_label = min(be_r, 2)
+
+    best_col  = "target_sl1.5_tp2_be0"
+    best_dist = float("inf")
+    for sv in _SL_GRID:
+        for tv in _TP_GRID:
+            dist = ((sl_atr - sv) ** 2 + (tp_mult - tv) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_col  = f"target_sl{sv}_tp{tv}_be{be_label}"
+    return best_col
+
+
 def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, symbol: str):
     """
     Evaluate genome fitness via quick backtest on validation data.
     Returns (sharpe_ratio,) — DEAP expects a tuple.
     Each genome picks its own entry_tf; we look up the matching scaler/models.
     """
-    params = decode_genome(genome)
+    params   = decode_genome(genome)
     entry_tf = params["entry_tf"]
 
     if entry_tf not in df_dict:
@@ -668,116 +789,188 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
         return (-999.0,)
 
     # Use only the out-of-sample test set (last 15%) to prevent overfitting
-    # to the training data that the models were already trained on
     n_full = len(df_full)
-    df = df_full.iloc[int(n_full * 0.85):]
+    df     = df_full.iloc[int(n_full * 0.85):]
     if len(df) < 50:
         return (-999.0,)
 
-    # Look up per-TF scaler and models
+    # Per-TF scaler and models
     key          = f"{symbol}_{entry_tf}m"
     scaler       = scalers_by_tf.get(key)
     feature_cols = get_feature_cols(df)
-
     if scaler is None:
         return (-999.0,)
 
-    # Quick vectorised backtest
-    scaled = apply_scaler(df, scaler, feature_cols)
-    feat   = scaled[feature_cols].values
-    target = df["target"].values
-    atr    = df["atr14"].values
-    closes = df["Close"].values
-
-    # Get per-TF ensemble models
     xgb_m = models_by_tf.get(f"xgb_{key}")
     rf_m  = models_by_tf.get(f"rf_{key}")
     if xgb_m is None or rf_m is None:
         return (-999.0,)
 
+    # ── Label selection: pick the pre-computed label column whose (sl_atr,
+    # tp_mult, be_r) grid point is nearest to this genome's parameters.
+    # This ensures the fitness evaluation uses labels that match what the
+    # genome actually trades — including the BE dimension.
+    label_col = _select_label_col(
+        params["sl_atr"], params["tp_mult"], params.get("be_r", 0)
+    )
+    if label_col not in df.columns or df[label_col].dropna().empty:
+        label_col = "target_sl1.5_tp2_be0"   # fallback to default mid-grid be=0 column
+    if label_col not in df.columns:
+        label_col = "target"   # final fallback if even the default is missing
+
+    # ── Scale features and generate ensemble signal ────────────────────
+    scaled      = apply_scaler(df, scaler, feature_cols)
+    feat        = scaled[feature_cols].values
+    atr         = df["atr14"].values
+    closes      = df["Close"].values
+    highs       = df["High"].values
+    lows        = df["Low"].values
+
     p_xgb = xgb_m.predict_proba(feat)[:, 1]
     p_rf  = rf_m.predict_proba(feat)[:, 1]
     signal_prob = (p_xgb + p_rf) / 2.0
 
-    # Simulate trades (one at a time — skip bars inside open trade's scan window)
-    balance    = 10000.0
-    peak       = 10000.0
-    returns    = []
-    skip_until = -1   # bar index to skip to after a trade entry
+    # ── HTF nudge: apply same probability adjustment as get_signal() ──
+    # This lets the optimizer actually evaluate whether HTF alignment helps.
+    # htf_tf=0 or htf_weight=0 means HTF is skipped — optimizer can discover this.
+    htf_tf  = params.get("htf_tf", 0)
+    htf_w   = params.get("htf_weight", 0.0)
+    htf_dir_arr = np.zeros(len(df), dtype=np.float32)
+    if htf_tf > 0 and htf_w > 0 and htf_tf in df_dict:
+        htf_full   = df_dict[htf_tf]
+        # Align HTF EMA55 direction to entry-TF index via forward-fill
+        if "ema55" in htf_full.columns and not htf_full.empty:
+            htf_series = ((htf_full["Close"] > htf_full["ema55"]).astype(int) * 2 - 1)
+            htf_series = htf_series.reindex(df.index, method="ffill").fillna(0)
+            htf_dir_arr = htf_series.values.astype(np.float32)
+
+    # Apply HTF nudge to signal probabilities
+    adjusted_prob = signal_prob.copy()
+    if htf_w > 0:
+        bear_htf = htf_dir_arr == -1
+        bull_htf = htf_dir_arr == 1
+        # Bearish HTF reduces long confidence, bullish HTF boosts it
+        adjusted_prob = np.where(
+            bear_htf & (signal_prob > 0.5),
+            signal_prob * (1.0 - htf_w * 0.3),
+            np.where(
+                bull_htf & (signal_prob < 0.5),
+                signal_prob * (1.0 + htf_w * 0.3),
+                signal_prob,
+            )
+        )
+
+    # ── Spread model (Stage 2: market physics visible to optimizer) ───
+    spread_arr = (df["spread_mean"].values
+                  if "spread_mean" in df.columns
+                  else np.zeros(len(df), dtype=np.float64))
+    SLIP_FACTOR = 0.1
+
+    # ── Simulate trades (one at a time, fixed $100 risk per trade) ────
+    FIXED_RISK   = 100.0   # fixed $/trade — matches ER calculation model
+    balance      = 10000.0
+    peak         = 10000.0
+    trade_pnls   = []      # (bar_date, pnl_money) for daily equity curve
+    skip_until   = -1
+
+    sl_atr   = params["sl_atr"]
+    tp_mult  = params["tp_mult"]
+    conf_thr = params["confidence"]
+    be_r     = params.get("be_r", 0)
 
     for i in range(SEQ_LEN, len(df) - 1):
         if i <= skip_until:
             continue
 
-        prob = signal_prob[i]
+        prob      = adjusted_prob[i]
         direction = None
-        if prob >= params["confidence"]:
-            direction = 1    # long
-        elif prob <= (1 - params["confidence"]):
-            direction = -1   # short
-
+        if prob >= conf_thr:
+            direction = 1
+        elif prob <= (1 - conf_thr):
+            direction = -1
         if direction is None:
             continue
 
-        sl_dist = atr[i] * params["sl_atr"]
+        sl_dist = atr[i] * sl_atr
         if sl_dist <= 0 or np.isnan(sl_dist):
             continue
 
-        entry   = closes[i]
-        sl      = entry - direction * sl_dist
-        tp      = entry + direction * sl_dist * params["tp_mult"]
-        risk    = max(balance, 1.0) * HARD_LIMITS["risk_per_trade_pct"] / 100
-        be_r    = params.get("be_r", 0)
+        # Stage 2: include spread + slippage in entry price
+        spread_cost = spread_arr[i] / 2.0 if not np.isnan(spread_arr[i]) else 0.0
+        slip_cost   = atr[i] * SLIP_FACTOR if not np.isnan(atr[i]) else 0.0
+        entry  = closes[i] + direction * (spread_cost + slip_cost)
+        sl     = entry - direction * sl_dist
+        tp     = entry + direction * sl_dist * tp_mult
+        risk   = FIXED_RISK
+
         be_trigger = entry + direction * sl_dist * be_r if be_r > 0 else None
         be_stop    = entry + direction * 1.0 if be_r > 0 else None
         be_done    = False
 
-        # Scan forward bars until TP/SL hit (up to 50 bars)
-        pnl        = 0.0
-        exit_bar   = i + 50   # default: skip 50 bars if trade never closes
+        pnl      = 0.0
+        exit_bar = i + 50
         for j in range(i + 1, min(i + 51, len(df) - 1)):
-            bar_high = df["High"].iloc[j]
-            bar_low  = df["Low"].iloc[j]
+            bh = highs[j]; bl = lows[j]
 
             if be_trigger is not None and not be_done:
-                if direction == 1 and bar_high >= be_trigger:
+                if direction == 1 and bh >= be_trigger:
                     sl = be_stop; be_done = True
-                elif direction == -1 and bar_low <= be_trigger:
+                elif direction == -1 and bl <= be_trigger:
                     sl = be_stop; be_done = True
 
             if direction == 1:
-                if bar_low  <= sl: pnl = (sl - entry) / (sl_dist + 1e-10) * risk; exit_bar = j; break
-                if bar_high >= tp: pnl = (tp - entry) / (sl_dist + 1e-10) * risk; exit_bar = j; break
+                if bl <= sl: pnl = (sl - entry) / (sl_dist + 1e-10) * risk; exit_bar = j; break
+                if bh >= tp: pnl = (tp - entry) / (sl_dist + 1e-10) * risk; exit_bar = j; break
             else:
-                if bar_high >= sl: pnl = (entry - sl) / (sl_dist + 1e-10) * risk; exit_bar = j; break
-                if bar_low  <= tp: pnl = (entry - tp) / (sl_dist + 1e-10) * risk; exit_bar = j; break
+                if bh >= sl: pnl = (entry - sl) / (sl_dist + 1e-10) * risk; exit_bar = j; break
+                if bl <= tp: pnl = (entry - tp) / (sl_dist + 1e-10) * risk; exit_bar = j; break
 
-        skip_until = exit_bar   # block next entry until this trade closes
-
+        skip_until = exit_bar
         if pnl != 0:
             balance += pnl
-            returns.append(pnl / risk)
+            trade_pnls.append((df.index[exit_bar], pnl))
             if balance > peak:
                 peak = balance
-            dd = (peak - balance) / peak
-            if dd > HARD_LIMITS["max_drawdown_pct"] / 100:
+            if (peak - balance) / peak > HARD_LIMITS["max_drawdown_pct"] / 100:
                 break
 
-    if len(returns) < 10:
+    n_trades = len(trade_pnls)
+    if n_trades < 10:
         return (-999.0,)
 
-    r_arr  = np.array(returns)
-    # Annualise by actual trade frequency, not by calendar days.
-    # Using sqrt(252) on per-trade R-multiples treats each trade as one
-    # calendar day — wrong when a strategy trades 2/day or 1/week.
-    # Instead: compute how many trades per year given the OOS date range,
-    # then sqrt(trades_per_year) gives the correct annualisation factor.
-    n_days = max((df.index[-1] - df.index[0]).days, 1)
-    trades_per_year = len(returns) / (n_days / 252.0)
-    sharpe = r_arr.mean() / (r_arr.std() + 1e-10) * np.sqrt(trades_per_year)
+    # ── Minimum trade count penalty — progressive, not a cliff ───────
+    # Prevents optimizer finding corner solutions with 15 trades at 12:1 RR.
+    # Soft-penalises sparse strategies while preserving optimizer freedom.
+    MIN_CREDIBLE = 100
+    trade_penalty = min(n_trades / MIN_CREDIBLE, 1.0)   # 1.0 at 100+ trades
+
+    # ── Sharpe from daily equity curve × √252 ─────────────────────────
+    # Matches backtest_engine formula exactly — ensures optimizer ranking
+    # agrees with reporting ranking (no divergence between tools).
+    dates_arr   = np.array([t[0] for t in trade_pnls], dtype="datetime64[D]")
+    pnl_arr     = np.array([t[1] for t in trade_pnls])
+    day_ints    = (dates_arr - dates_arr[0]).astype(np.int64)
+    n_days_span = int(day_ints[-1]) + 1
+    if n_days_span < 2:
+        return (-999.0,)
+    daily_pnl = np.zeros(n_days_span)
+    np.add.at(daily_pnl, day_ints, pnl_arr)
+    # Build equity curve
+    eq_curve    = 10000.0 + np.cumsum(daily_pnl)
+    # Remove zero-trade days (keep days that had at least one trade)
+    mask        = daily_pnl != 0
+    if mask.sum() < 2:
+        return (-999.0,)
+    daily_ret   = np.diff(eq_curve[mask]) / (eq_curve[mask][:-1] + 1e-10)
+    mean_r      = daily_ret.mean()
+    std_r       = daily_ret.std()
+    sharpe      = mean_r / (std_r + 1e-10) * np.sqrt(252)
     if not np.isfinite(sharpe):
         return (-999.0,)
-    return (sharpe,)
+
+    # Apply trade-count penalty: sparse strategies score proportionally lower
+    fitness = sharpe * trade_penalty
+    return (fitness,)
 
 
 def run_genetic_algo(df_dict: dict, models_by_tf: dict,
@@ -825,6 +1018,7 @@ def run_genetic_algo(df_dict: dict, models_by_tf: dict,
                         halloffame=hof, verbose=False)
 
     best = decode_genome(hof[0])
+    best["best_score"] = float(hof[0].fitness.values[0])   # fix: GA result now participates fairly in GA-vs-Optuna comparison
     log.info(f"  GA best genome: {best}")
     return best
 
@@ -1099,6 +1293,12 @@ def get_signal(symbol: str, params: dict,
         p_rf  = float(rf_m.predict_proba(last_feat)[0][1])
 
     prob = (p_xgb + p_rf) / 2.0
+
+    # Isotonic calibration: maps raw ensemble prob → actual win rate
+    # Fitted on stacked OOS fold predictions in train.py; makes conf threshold meaningful.
+    calibrator = scalers_cache.get(f"calibrator_{key}")
+    if calibrator is not None:
+        prob = float(calibrator.predict([prob])[0])
 
     # HTF filter: if HTF is bearish and signal is long, reduce confidence
     htf_dir = df["htf_bullish"].iloc[-1] if "htf_bullish" in df.columns else 0

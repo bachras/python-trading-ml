@@ -78,6 +78,9 @@ def init_db():
             -- Parameter sensitivity score (0-100, higher = more robust to param nudges)
             sensitivity_score REAL,
             robust            INTEGER DEFAULT 0, -- 1 = score >= 50
+            -- SPA bootstrap edge test: p-value for H0: expected trade P&L <= 0
+            -- p < 0.05 → statistically significant positive edge
+            spa_p_value       REAL,
             -- metadata
             updated_at       TEXT,
             is_active        INTEGER DEFAULT 0   -- 1 = running live
@@ -169,6 +172,7 @@ def init_db():
         _add_column_if_missing(c, "strategy_params", "mc_pass",           "INTEGER DEFAULT 0")
         _add_column_if_missing(c, "strategy_params", "sensitivity_score", "REAL")
         _add_column_if_missing(c, "strategy_params", "robust",            "INTEGER DEFAULT 0")
+        _add_column_if_missing(c, "strategy_params", "spa_p_value",       "REAL")
 
 
 def _add_column_if_missing(conn, table: str, column: str, col_type: str):
@@ -198,6 +202,7 @@ def upsert_strategy(row: dict):
     row.setdefault("mc_pass",           0)
     row.setdefault("sensitivity_score", None)
     row.setdefault("robust",            0)
+    row.setdefault("spa_p_value",       None)
     with _conn() as c:
         c.execute("""
             INSERT INTO strategy_params
@@ -208,7 +213,7 @@ def upsert_strategy(row: dict):
                sortino, calmar, haircut_sharpe,
                mc_sharpe_p5, mc_sharpe_p50, mc_sharpe_p95,
                mc_dd_p95, mc_profit_p5, mc_pass,
-               sensitivity_score, robust,
+               sensitivity_score, robust, spa_p_value,
                updated_at, is_active)
             VALUES
               (:strategy_id,:symbol,:tf,:rank,:entry_tf,:htf_tf,
@@ -218,7 +223,7 @@ def upsert_strategy(row: dict):
                :sortino,:calmar,:haircut_sharpe,
                :mc_sharpe_p5,:mc_sharpe_p50,:mc_sharpe_p95,
                :mc_dd_p95,:mc_profit_p5,:mc_pass,
-               :sensitivity_score,:robust,
+               :sensitivity_score,:robust,:spa_p_value,
                :updated_at,:is_active)
             ON CONFLICT(strategy_id) DO UPDATE SET
               entry_tf=excluded.entry_tf, htf_tf=excluded.htf_tf,
@@ -245,6 +250,7 @@ def upsert_strategy(row: dict):
               mc_pass=excluded.mc_pass,
               sensitivity_score=excluded.sensitivity_score,
               robust=excluded.robust,
+              spa_p_value=excluded.spa_p_value,
               updated_at=excluded.updated_at
         """, row)
 
@@ -390,6 +396,17 @@ def get_open_trades() -> list[dict]:
     with _conn() as c:
         rows = c.execute(
             "SELECT * FROM live_trades WHERE status='open'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_recent_live_trades(strategy_id: str, n: int = 20) -> list[dict]:
+    """Return the last n closed live trades for a strategy, newest first."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM live_trades WHERE strategy_id=? AND status='closed' "
+            "ORDER BY closed_at DESC LIMIT ?",
+            (strategy_id, n)
         ).fetchall()
         return [dict(r) for r in rows]
 

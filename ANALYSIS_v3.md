@@ -172,13 +172,13 @@ When the optimizer selects different values (e.g., `sl_atr=0.8`, `tp_mult=4.0`),
 
 **Severity:** High. The wider the optimizer drifts from the labeling parameters, the worse the model's calibration becomes. A model that is 60% accurate at predicting the 1.5/2.0 outcome may be only 40% accurate at predicting a 0.8/4.0 outcome.
 
-**Suggested fix direction — aligned with the two-stage philosophy:**
-The optimizer should be free to search `sl_atr` and `tp_mult`. But the **labels** need to match what each genome actually trades. Three options:
-- **(A) Per-genome relabeling (ideal but expensive):** During `ga_fitness()`, re-label the target column using the genome's own `sl_atr`/`tp_mult`. This makes the model's training objective match the genome's trading parameters. Cost: adds ~2s per genome evaluation (the vectorized labeling loop is fast).
-- **(B) Multi-label columns (practical):** Pre-compute labels for several `sl_atr`/`tp_mult` combinations (e.g., 3–5 pairs spanning the search range). Each genome picks the closest pre-computed label column. Cost: one-time during feature engineering.
-- **(C) Train multiple models per label set:** Train separate XGB/RF models for each label configuration, let the optimizer select which model + which params to use together. Most aligned with the "let ML decide" philosophy but highest compute cost.
+**Chosen fix — 5×5×3 independent label grid (see D2, D2b for full details):**
+sl_atr, tp_mult, and be_r are three independent outcome dimensions:
+- **sl_atr:** [1.5, 2.0, 2.5, 3.0, 3.5] — SL width (how much breathing room)
+- **tp_mult:** [1, 2, 3, 4, 5] — reward ratio (how far the trade runs to TP)
+- **be:** [0, 1, 2] — break-even policy (no BE / trigger at 1R / trigger at 2R)
 
-Option (B) is the best balance of correctness and compute cost.
+This produces 75 binary label columns (1.0 = TP hit, 0.0 = everything else), pre-computed once during feature engineering (~75–150s). Each genome picks the nearest `(sl_atr, tp_mult)` grid point and maps its `be_r` to the correct BE variant. BE is a label dimension — not just a simulation toggle — because it changes which trades reach TP. With be=1 active, a dynamic SL at entry+1pt can exit trades before TP that a static SL at 900 would have survived, making some trades label=0 under be=1 that would have been label=1 under be=0 (see D2b for the exact example). A model trained on be=0 labels will have miscalibrated P(TP hit) for setups where be=1 is active.
 
 ### B2. `ga_fitness()` Sharpe Formula ≠ `backtest_engine` Sharpe Formula
 
@@ -564,9 +564,9 @@ Once B1 (label alignment), B3 (spread in optimizer), and B5 (HTF in optimizer) a
 
 ### Fix Priority 2: Align Triple Barrier Labels with Optimizer-Selected Parameters
 **File:** `phase2_adaptive_engine.py` — `engineer_features()` lines 460–462
-**What:** Pre-compute labels for 3–5 `sl_atr`/`tp_mult` combinations spanning the search range. Store as separate columns (e.g., `target_tight`, `target_mid`, `target_wide`). Each genome in the optimizer picks the closest label column based on its `sl_atr`/`tp_mult` values.
-**Why:** The ML model must predict the same setup it will actually trade. A model trained on 1.5/2.0 barriers cannot reliably predict outcomes for 0.8/4.0 barriers.
-**Impact:** High — directly fixes the model calibration problem. The optimizer is free to search the full range; it just gets labels that match its genome.
+**What:** Pre-compute a 5×5×3 label grid: sl_atr [1.5, 2.0, 2.5, 3.0, 3.5] × tp_mult [1, 2, 3, 4, 5] × be [0, 1, 2] = 75 columns (e.g., `target_sl1.5_tp2_be0`, `target_sl3.0_tp4_be1`). Each genome picks the nearest grid point by matching `(sl_atr, tp_mult)` via Euclidean distance and mapping `be_r` to the closest BE variant. See **D2** and **D2b** for full grid and BE logic.
+**Why:** sl_atr, tp_mult, and be_r are all independent outcome dimensions. BE changes the label itself — a trade that reaches +1R then reverses has a different outcome (BE exit ≈ 0) than a full SL loss. A model trained on be=0 labels will mispredict outcomes when be=1 or be=2 is active. 75 scans at ~1–2s each = ~75–150s one-time cost. Zero cost during optimization.
+**Impact:** High — fixes model calibration for all three optimizer dimensions simultaneously. Also consider narrowing `GA_BOUNDS` to sl_atr [1.0, 4.0] and tp_mult [0.5, 6.0] to avoid wasting evaluations outside the label grid.
 
 ### Fix Priority 3: Add HTF Nudge to `ga_fitness()`
 **File:** `phase2_adaptive_engine.py` — `ga_fitness()` between lines 700 and 712
@@ -989,36 +989,298 @@ The system currently optimizes the edge (stage 1) and is building the reliabilit
 
 ---
 
+## IMPLEMENTATION DECISIONS (Resolved)
+
+### D1. Scope — Layer 1 + Layer 2 This Session, Layer 3 Later
+
+**Decision:** Implement all of Layer 1 and all of Layer 2 in this session. Layer 3 (meta-labeling, tail risk, block bootstrap, trade feedback loop) is deferred to after live is stable.
+
+**Rationale:** Layer 2 items are small (30–80 lines each, ~170 total) and two are marked Critical. Deploying Layer 1 without probability calibration (I2) means the optimizer tunes thresholds on an uncalibrated scale. Deploying without drift detection (I7) means the model degrades silently in live. These aren't optional polish — they're prerequisites for trusting the Layer 1 output.
+
+### D2. Label Alignment — 5×5 Independent Grid (25 Label Columns)
+
+**Decision:** sl_atr and tp_mult are independent dimensions — the label grid must be a 2D grid, not a 1D line. Pre-compute 25 label columns from the Cartesian product of:
+- **sl_atr:** [1.5, 2.0, 2.5, 3.0, 3.5] (step 0.5 — intraday-appropriate SL widths)
+- **tp_mult:** [1, 2, 3, 4, 5] (step 1 — covers 1:1 through 1:5 RR)
+
+Genome picks the label column minimizing Euclidean distance: `√((genome_sl - label_sl)² + (genome_tp - label_tp)²)`.
+
+**Grid (SL distance / TP distance in ATR units):**
+
+| | tp=1 | tp=2 | tp=3 | tp=4 | tp=5 |
+|---|---|---|---|---|---|
+| **sl=1.5** | SL 1.5 / TP 1.5 | SL 1.5 / TP 3.0 | SL 1.5 / TP 4.5 | SL 1.5 / TP 6.0 | SL 1.5 / TP 7.5 |
+| **sl=2.0** | SL 2.0 / TP 2.0 | SL 2.0 / TP 4.0 | SL 2.0 / TP 6.0 | SL 2.0 / TP 8.0 | SL 2.0 / TP 10.0 |
+| **sl=2.5** | SL 2.5 / TP 2.5 | SL 2.5 / TP 5.0 | SL 2.5 / TP 7.5 | SL 2.5 / TP 10.0 | SL 2.5 / TP 12.5 |
+| **sl=3.0** | SL 3.0 / TP 3.0 | SL 3.0 / TP 6.0 | SL 3.0 / TP 9.0 | SL 3.0 / TP 12.0 | SL 3.0 / TP 15.0 |
+| **sl=3.5** | SL 3.5 / TP 3.5 | SL 3.5 / TP 7.0 | SL 3.5 / TP 10.5 | SL 3.5 / TP 14.0 | SL 3.5 / TP 17.5 |
+
+**Column naming:** `target_sl{sl}_tp{tp}` (e.g., `target_sl1.5_tp2`, `target_sl3.0_tp4`).
+
+**Rationale:**
+- **Independence:** sl_atr controls how much room the trade has to breathe (risk width). tp_mult controls how far the trade needs to run (reward target). These are orthogonal decisions — a genome with tight SL + wide TP (sl=1.5, tp=5) is fundamentally different from wide SL + tight TP (sl=3.5, tp=1). Coupling them into a single dimension (as the previous proposal did) makes it impossible to represent these corner combinations.
+- **Intraday-calibrated:** sl_atr starts at 1.5 (not 0.5 — anything below 1.0 is noise-stopped by spread on US30 CFD). Upper bound 3.5 is the widest reasonable intraday stop. tp_mult 1–5 covers conservative (1:1) through aggressive (1:5) reward, all achievable within a single US30 session.
+- **Grid resolution:** With step 0.5 on sl_atr and step 1 on tp_mult, the maximum distance from any genome to the nearest grid point is (0.25, 0.5) — well within tolerance.
+- **Compute cost:** 25 vectorized triple barrier scans during feature engineering. Each scan is ~1–2s on 1.5M rows. Total: ~30–50s one-time cost per training run. Zero cost during optimization (labels are pre-computed).
+- **Backward compatibility:** `target_sl1.5_tp2` matches the current default (sl_atr=1.5, tp_mult=2.0).
+
+**Search range alignment note:** The optimizer's current `GA_BOUNDS` allow sl_atr [0.3, 5.0] and tp_mult [0.5, 8.0], which extends well beyond the label grid. Genomes at extreme values (e.g., sl_atr=0.3) will use the nearest grid edge (sl_atr=1.5) — the model was trained for 1.5, not 0.3, so fitness will naturally be poor and the optimizer will learn to stay within the grid. Consider narrowing `GA_BOUNDS` to sl_atr [1.0, 4.0] and tp_mult [0.5, 6.0] to avoid wasting evaluations in regions where no matching label exists.
+
+#### D2b. Third Label Dimension — Break-Even (BE) Variants
+
+**Decision:** Break-even is a third independent label dimension. The 5×5 sl_atr × tp_mult grid expands to **5×5×3 = 75 label columns** by adding three BE variants for every sl_atr/tp_mult combination.
+
+**Exact definition of each BE variant (no ambiguity):**
+
+| be value | Trigger: SL moves when… | SL moves to | Reverts to original SL? |
+|----------|-------------------------|-------------|------------------------|
+| `be=0` | Never | Original SL stays | N/A |
+| `be=1` | Price reaches **entry + 1×sl_dist** (= +1R profit) | **Entry + 1 point** in trade direction | No — stays at entry+1pt for remainder |
+| `be=2` | Price reaches **entry + 2×sl_dist** (= +2R profit) | **Entry + 1 point** in trade direction | No — stays at entry+1pt for remainder |
+
+`be=2` trigger is fixed at **2R (2×sl_dist)** — it does not scale with tp_mult. The "2" in be=2 means "2R into profit", same unit as be=1 means "1R into profit".
+
+**Column naming:** `target_sl{sl}_tp{tp}_be{be}` — e.g., `target_sl2.0_tp3_be1`, `target_sl1.5_tp5_be2`.
+
+**Genome-to-label matching:** The genome searches `be_r ∈ [0, 1, 2, 3]`. Mapping to label dimension:
+- `be_r=0` → `be=0` (no BE)
+- `be_r=1` → `be=1` (trigger at 1R)
+- `be_r=2` → `be=2` (trigger at 2R)
+- `be_r=3` → `be=2` (trigger at 2R — `be_r=3` shares this label; practically indistinguishable)
+
+---
+
+**Concrete worked examples — using these fixed values for all tables:**
+- Entry = 1000 (long trade), sl_atr = 2.0, ATR = 50 pts
+- **sl_dist = 100 pts = 1R unit**
+- SL = 900 (entry − sl_dist)
+- be=1 trigger: price reaches **1100** (entry + 1R)
+- be=2 trigger: price reaches **1200** (entry + 2R)
+- After BE triggers: SL moves to **1001** (entry + 1 point)
+
+---
+
+**With tp=1 → TP at 1100 (+1R, +100 pts)**
+
+| Price path | be=0 label | be=1 label | be=2 label | R-multiple (all three) |
+|---|---|---|---|---|
+| Drops to 900 (SL hit) | 0.0 | 0.0 | 0.0 | −1R |
+| Rises to 1100 (TP hit) | 1.0 | 1.0 | 1.0 | +1R |
+
+**Note:** For tp=1, the TP and the be=1 trigger are at the **same level (1100)**. The TP closes the trade before BE can activate. be=2 trigger is at 1200, which is **beyond TP** — it can never trigger. For tp=1, all three BE variants produce identical labels. BE only becomes meaningful when tp ≥ 2.
+
+---
+
+**With tp=3 → TP at 1300 (+3R, +300 pts)**
+
+| Price path | be=0 label | be=1 label | be=2 label | R-multiple (be=0 / be=1 / be=2) |
+|---|---|---|---|---|
+| Drops to 900 (SL), never reached +1R | 0.0 | 0.0 | 0.0 | −1R / −1R / −1R |
+| Rises to 1100 (+1R), reverses to 900 | 0.0 | **0.0** (BE exit at 1001) | 0.0 | **−1R / ~0R / −1R** |
+| Rises to 1200 (+2R), reverses to 900 | 0.0 | **0.0** (BE exit at 1001) | **0.0** (BE exit at 1001) | **−1R / ~0R / ~0R** |
+| Rises to 1300 (TP hit) | 1.0 | 1.0 | 1.0 | +3R / +3R / +3R |
+
+Binary label is 0.0 for both SL hit (−1R) and BE exit (~0R) — the model only distinguishes TP hit vs everything else. The R-multiple difference (−1R vs ~0R) is `ga_fitness()`'s job, computed via the runtime BE simulation.
+
+---
+
+**With tp=5 → TP at 1500 (+5R, +500 pts)**
+
+| Price path | be=0 label | be=1 label | be=2 label | R-multiple (be=0 / be=1 / be=2) |
+|---|---|---|---|---|
+| Drops to 900 (SL), never reached +1R | 0.0 | 0.0 | 0.0 | −1R / −1R / −1R |
+| Rises to 1100 (+1R), reverses to 900 | 0.0 | **0.0** (BE exit at 1001) | 0.0 | **−1R / ~0R / −1R** |
+| Rises to 1200 (+2R), reverses to 900 | 0.0 | **0.0** (BE exit at 1001) | **0.0** (BE exit at 1001) | **−1R / ~0R / ~0R** |
+| Rises to 1400 (+4R), reverses to 1001 (BE SL) | 0.0 (full SL: 900) | **0.0** (BE exit at 1001) | **0.0** (BE exit at 1001) | **−1R / ~0R / ~0R** |
+| Rises to 1500 (TP hit) | 1.0 | 1.0 | 1.0 | +5R / +5R / +5R |
+
+---
+
+**Critical rule: label is binary (1.0 = TP hit, 0.0 = everything else), NOT three-class, NOT the R-multiple**
+
+The label column is the ML model's binary classification target. XGBoost and RF output `predict_proba[:,1]` = `P(TP hit | features)`. That probability is compared against `confidence_threshold`. The distinction between a full SL loss (−1R) and a BE exit (~0R) matters for financial P&L, but **not for the model's training target** — both are "did not reach TP" from the model's perspective.
+
+| Event | Label stored | R-multiple at simulation time |
+|---|---|---|
+| TP hit (tp=1) | **1.0** | **+1R** |
+| TP hit (tp=3) | **1.0** | **+3R** |
+| TP hit (tp=5) | **1.0** | **+5R** |
+| SL hit (no BE active) | **0.0** | **−1R** |
+| BE exit (BE triggered, then dynamic SL hit) | **0.0** | **~0R** |
+| Timeout (MAX_HOLD bars, no barrier hit) | **0.0** | ~0R |
+
+The R-multiple is computed at simulation time in `ga_fitness()` using the genome's actual `tp_mult` and BE mechanics — not from the label.
+
+**Why binary labels still produce genuinely different columns between be variants:**
+
+The label only asks "did TP get hit?" But the be variant changes *which trades* reach TP. With be=1 active, the dynamic SL at entry+1pt can stop trades that the original SL would not have stopped — meaning some trades labeled 1 under be=0 become labeled 0 under be=1:
+
+> Bar 1: high=1100 (+1R hit, BE triggers, SL moves to 1001), low=950 — trade survives under both
+> Bar 2: low=920 — be=0: 920 > SL(900), trade continues. be=1: 920 < SL(1001), **BE exit, trade closes**
+> Bar 3: high=1300 — **TP only reachable under be=0**
+
+Under be=0: bar 3 hits TP → **label = 1.0**
+Under be=1: trade exited at bar 2 → **label = 0.0**
+
+Same feature vector, different label. The model trained on be=1 labels learns the harder prediction task — reaching TP despite a more sensitive dynamic floor after +1R. Its `P(TP hit)` output is correctly calibrated for that specific trade setup.
+
+---
+
+**Why BE must be a label dimension — not just a simulation toggle:**
+
+This is the core reason the 5×5×3 grid exists. With binary labels (1.0 = TP hit, 0.0 = everything else), the difference appears when the dynamic SL of be=1 stops a trade that the original SL would not have stopped. Concrete example with sl=2.0, tp=3, be=1 active (entry=1000, SL=900, be trigger=1100, TP=1300):
+
+- Bar 1: high=1100 → BE triggers, SL moves to 1001. Low=950 — trade survives either way.
+- Bar 2: low=920 → **be=0: 920 > SL(900), trade survives.** **be=1: 920 < SL(1001), BE exit.**
+- Bar 3: high=1300 → TP only reachable under be=0.
+
+Under be=0: trade reaches TP → **label = 1.0**
+Under be=1: trade exited at bar 2 → **label = 0.0**
+
+Same feature vector. Different binary label. The model trained on be=0 labels learned P(TP hit with SL at 900). The model trained on be=1 labels learned P(TP hit with dynamic SL that tightens after +1R). These are different probability estimates for the same entry signal. Using the wrong model gives a miscalibrated `confidence_threshold` — the optimizer tuned the threshold on one probability scale, but live trading operates on a different one.
+
+---
+
+**Triple barrier scan modification for BE:**
+
+The existing vectorized loop checks `high[i] ≥ tp` or `low[i] ≤ sl` for each bar. For BE variants, add two states:
+
+```
+be_triggered = False
+for each bar i:
+    if not be_triggered:
+        if high[i] >= be_trigger_level:   # 1100 for be=1, 1200 for be=2
+            be_triggered = True
+            sl = entry + 1 * direction    # move SL to entry+1pt
+    if high[i] >= tp:
+        label = 1; break
+    if low[i] <= sl:
+        label = 0 if be_triggered else -1; break
+else:
+    label = 0  # timeout
+```
+
+For be=0, skip the `be_triggered` block entirely. This is a minimal change to the existing loop — one boolean flag and one conditional SL update.
+
+---
+
+**Compute cost:** 75 vectorized triple barrier scans × ~1–2s each = **75–150s one-time** during feature engineering per training run. Zero cost during optimization (all 75 label columns are pre-computed and stored).
+
+**Context:** The `be_r` parameter existed in the original codebase but was removed. This is the correct re-implementation. BE must be a label dimension — not just a `ga_fitness()` simulation parameter — because it changes what the ML model is trained to predict.
+
+---
+
+**Resolved implementation decisions for D2b:**
+
+**Which model is trained on which label (Q1):**
+
+Two phases in `train.py`:
+
+- **Phase 1 — Search phase (walk-forward folds + GA/Optuna):** All fold models train on the default label `target_sl1.5_tp2_be0`. The optimizer compares candidates against each other using this consistent baseline. Slight miscalibration is acceptable here — the optimizer is ranking candidates, and the relative ordering remains directionally correct.
+- **Phase 2 — Final production model:** After GA/Optuna identifies the best `(sl_atr, tp_mult, be_r)`, `train.py` sets `df["target"] = best_matching_label_col` (e.g., `target_sl2.5_tp3_be1`) and **retrains the final model on that label**. This is the model saved to disk and loaded by `live.py`. The deployed model was trained on the exact label matching what it will actually trade.
+
+This avoids retraining per label combination per fold (prohibitively expensive) while ensuring the deployed model is correctly calibrated. The `best_params` dict returned by the optimizer must include a `label_col` key alongside `sl_atr`, `tp_mult`, `be_r`.
+
+**Role of `label_col` in `ga_fitness()` (Q2):**
+
+The runtime BE simulation in `ga_fitness()` already computes correct per-trade P&L — do not change it. `label_col` is **not used for P&L computation**. Its only role is downstream: `train.py` reads it from `best_params` to select the training label for the final model retrain. Inside `ga_fitness()`, `label_col` can be logged for debugging or passed through as a return value. It does not feed any calculation.
+
+**Vectorization strategy for BE label columns (Q3):**
+
+- **be=0 columns (25 total):** Keep the existing fully vectorized numpy scan — unchanged.
+- **be=1 and be=2 columns (50 total):** Use a **per-trade Python loop** (option A). Correctness over speed. The one-time cost of ~30–60s for 50 columns on a 50K-bar dataset is acceptable for a training run that happens once before deployment. Option B vectorization using cummax/argmax has subtle edge cases (TP and BE trigger hitting the same bar, off-by-one in argmax indexing, direction asymmetry for shorts) that are easy to get silently wrong. Wrong labels are worse than slow labels — a miscalibrated model from a wrong label is undetectable until live P&L degrades. Use the pseudocode in D2b directly as a Python loop for the 50 BE columns.
+
+### D3. Sharpe Formula — Daily Equity Curve via Numpy (No Pandas)
+
+**Decision:** Build a mini daily equity curve inside `ga_fitness()` using pure numpy. Compute Sharpe from daily returns × `√252`, matching `backtest_engine`.
+
+**Implementation approach:** Assign each trade to a day index via integer division on bar timestamps. Use `np.bincount` to sum per-day PnL. Compute `daily_returns = daily_pnl / running_equity`. Standard `mean/std × √252`.
+
+**Rationale:** The trade-frequency formula (`√trades_per_year`) creates rank-order disagreements with the reporting engine, especially for strategies that vary in trade frequency. The numpy-only approach adds ~20μs per genome. At 12,000 evaluations = 0.24s total — negligible overhead for full consistency.
+
+### D4. Behavioral Constraints — What Stays Where
+
+**Decision:**
+
+| Constraint | `ga_fitness()` | `backtest_engine.py` | `live.py` |
+|------------|---------------|---------------------|-----------|
+| Fixed $100/trade risk | Yes (always) | Yes (always) | Yes (default) |
+| Session gate (20:30–01:00) | N/A (data filtered) | N/A (data filtered) | Yes (hardcoded) |
+| Max DD 35% | N/A (no equity tracking) | Reported only | Yes (hardcoded) |
+| Daily trade cap (6) | **Remove** | **Remove** | **Remove** |
+| Consecutive loss cooldown | **Remove** | **Remove** | **Remove** |
+| Vol-sizing band | **Remove** | **Remove** | **Keep code, disabled by default (toggle)** |
+| Spread filter (2× median) | **Remove** | **Remove** | **Remove** |
+
+**Rationale:**
+- **Daily cap:** Confidence threshold controls trade frequency. If the model wants 8 trades on a volatile day, let it.
+- **Cooldown:** With fixed $100/trade, cooldown has no mechanism to act (it changes risk sizing, but risk is fixed). Even conceptually, each trade is independent given the edge (Mark Douglas).
+- **Vol-sizing:** Superseded by fixed $100. Keep the code in `live.py` behind a toggle (`VOL_SIZING_ENABLED = False` in `.env`) so it can be re-enabled later when switching to scaled risk. Remove from `backtest_engine` and `ga_fitness` entirely — the ER calculation must use the same fixed risk model.
+- **Spread filter:** The spread cost is already priced into entry via the cost model. A separate hard cutoff double-counts it. The optimizer, seeing real spread costs in `ga_fitness()`, will naturally discover that high-spread entries are unprofitable.
+
+**Future scaling note:** When moving from fixed $100 to scaled risk (e.g., 1% of equity), re-enable vol-sizing in `live.py`, add it to `backtest_engine`, and re-optimize. ER calculation must then switch to percentage-based normalization. This is a future session — first prove the edge with clean fixed-risk ER.
+
+### D5. Daily Cap / Cooldown — Remove (Option A), Not Searchable
+
+**Decision:** Remove daily cap and cooldown entirely (Option A). Do not add them as optimizer-searchable parameters (Option B).
+
+**Rationale:** Adding 2 dimensions to `GA_BOUNDS` without increasing the trial budget (currently ~12,000 GA + 500 Optuna) worsens convergence on the parameters that actually matter (`sl_atr`, `tp_mult`, `confidence`). The confidence threshold is already the ML-native answer to "how many trades per day" — a model at confidence=0.78 naturally trades 2–4 times/day. A searchable `daily_cap ∈ [4, 50]` either lands at 50 (redundant) or at a restrictive value that the confidence threshold would have discovered anyway. Pure overhead, no signal.
+
+### D6. Layer 2 Items — All Four In Scope
+
+**Decision:** Implement all four Layer 2 items:
+
+| Item | Lines | Files | Notes |
+|------|-------|-------|-------|
+| I2 — Probability calibration | ~30–40 | `train.py`, `phase2_adaptive_engine.py` | Isotonic regression on OOS fold. Store calibrator with model. Apply in `get_signal()`. |
+| I1 — SPA test | ~40 | `train.py` | Bootstrap test on top-N strategies after optimization. Gate: reject if p > 0.05. |
+| I7 — Drift detection | ~60–80 | `live.py` | PSI on top-10 features (by importance). Graduated response: log → reduce → disable. |
+| I10 — Smart kill switch | ~50 | `live.py` | Rolling 20-trade Sharpe + binomial win rate test. Shares infrastructure with I7. |
+
+**Implementation order:** I2 first (calibration feeds into everything else), then I1 (SPA test is a training-time gate), then I7 + I10 together (both are live.py monitoring with shared state).
+
+### D7. Session-Level Volume Profile — In Scope
+
+**Decision:** Yes. Change `add_volume_profile_features()` from rolling window to per-session (daily) groupby, matching the pattern `add_vwap_features()` already uses.
+
+**Rationale:** We're doing a full retrain after all changes — zero incremental cost. The fix improves feature quality at session open (the first 60–90 minutes), which is when many institutional entries occur and when the current rolling window is worst (95% previous-day data). The implementation pattern already exists in the same file.
+
+---
+
 ## FINAL VERDICT
 
 **The system's design philosophy is correct: give ML maximum freedom to discover optimal parameters, then layer on only real-world physics.** This is how the best quantitative firms operate. The tick data pipeline, institutional features, triple barrier labeling, walk-forward validation, tiered robustness gating, and ER-based ranking are all genuinely institutional-grade implementations.
 
-**The remaining work falls into three layers:**
+**The implementation plan (this session):**
 
-**Layer 1 — Internal consistency (fix now, 2–3 days):**
-1. Stage 2 implementation — spread+slippage in `ga_fitness()` (highest single impact)
-2. Label alignment — multi-label columns matching optimizer's sl_atr/tp_mult search range
-3. HTF visibility — apply HTF nudge in `ga_fitness()` so optimizer can evaluate it
-4. Remove behavioral constraints (daily cap, cooldown, vol-sizing) from `backtest_engine`
+**Layer 1 — Internal consistency:**
+1. Spread+slippage in `ga_fitness()` — Stage 2 implementation
+2. 5×5×3 label grid — sl_atr [1.5–3.5] × tp_mult [1–5] × be [0,1,2] = 75 columns (D2, D2b)
+3. HTF nudge in `ga_fitness()` — optimizer sees what live trades
+4. Daily-equity Sharpe in `ga_fitness()` via numpy — matches `backtest_engine`
+5. Return `best_score` from GA — fixes GA-never-wins bug
+6. Remove behavioral constraints from `backtest_engine` — clean fixed $100 ER
+7. Remove behavioral constraints from `live.py` — daily cap, cooldown gone; vol-sizing toggled off
+8. Remove `bfill()` from `institutional_features.py` — no lookahead
+9. Session-level volume profile — matches VWAP pattern
 
-**Layer 2 — Edge reliability (fix before live, 3–5 days):**
-5. Probability calibration (I2) — isotonic regression on OOS predictions, makes confidence threshold meaningful
-6. Edge validation (I1) — SPA test after optimization, proves edge is real not lucky
-7. Concept drift detection (I7) — PSI on top features, auto-disable on degradation
-8. Smart kill switch (I10) — rolling performance vs expected, graduated response before 35% DD
+**Layer 2 — Edge reliability:**
+10. Probability calibration (I2) — isotonic regression, makes confidence threshold meaningful
+11. SPA test (I1) — statistical proof that edge beats null
+12. Concept drift detection (I7) — PSI monitoring, auto-disable on degradation
+13. Smart kill switch (I10) — graduated response before 35% DD
 
-**Layer 3 — Edge amplification (fix after live is stable):**
-9. Meta-labeling (I6) — two-model architecture, biggest remaining edge boost
-10. Tail risk metrics (I3) — skewness/CVaR in fitness function or gating
-11. Block bootstrap MC (I5) — preserves autocorrelation in Monte Carlo
-12. Trade quality feedback loop (I12) — live calibration curve over time
+**Layer 3 — Deferred (after live is stable):**
+- Meta-labeling (I6), tail risk metrics (I3), block bootstrap MC (I5), trade feedback loop (I12)
 
 **Estimated timeline:**
-- Layer 1: 2–3 days of code changes + 1 day training
-- Layer 2: 3–5 days of code changes (can overlap with paper trading)
+- Layer 1 + Layer 2: implementation in this session
+- Training run: 1 day after code changes
 - Paper trading: 2–4 weeks
-- Layer 3: ongoing improvements after live is stable
-- Total to credible live: 4–6 weeks
+- Layer 3: ongoing improvements after live validation
+- Total to credible live: 3–5 weeks
+
+**Risk model:** Fixed $100/trade for optimization and initial live deployment. Vol-sizing available as a toggle in `live.py` for future scaled-risk phase. ER remains the primary ranking metric, measured in consistent $100 units.
 
 **The foundation is strong. The three intentional hardcoded constraints (session gate, 35% max DD, fixed $100/trade) are correctly placed and well-reasoned. The core philosophy — let ML discover, constrain only physics — is correct. The remaining work is (a) making the optimization pipeline honest, (b) proving the edge is real and not lucky, and (c) knowing when it stops working.**
 

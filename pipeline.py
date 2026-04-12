@@ -330,6 +330,14 @@ def load_models_from_disk(symbol: str, tf_feat: dict) -> tuple[dict, dict]:
         if sc_path.exists():
             scalers_cache[key] = joblib.load(sc_path)
 
+        calib_path = MODEL_DIR / f"calibrator_{key}.pkl"
+        if calib_path.exists():
+            scalers_cache[f"calibrator_{key}"] = joblib.load(calib_path)
+
+        drift_path = MODEL_DIR / f"drift_ref_{key}.pkl"
+        if drift_path.exists():
+            scalers_cache[f"drift_ref_{key}"] = joblib.load(drift_path)
+
         xgb_path = MODEL_DIR / f"xgb_{key}.pkl"
         rf_path  = MODEL_DIR / f"rf_{key}.pkl"
         if xgb_path.exists():
@@ -337,7 +345,8 @@ def load_models_from_disk(symbol: str, tf_feat: dict) -> tuple[dict, dict]:
         if rf_path.exists():
             models_cache[f"rf_{key}"]  = joblib.load(rf_path)
         if xgb_path.exists() and rf_path.exists():
-            log.info(f"  Loaded ensemble: {symbol} {tf}m")
+            log.info(f"  Loaded ensemble: {symbol} {tf}m"
+                     + (" [calibrated]" if calib_path.exists() else ""))
 
     params = load_params(symbol)
     log.info(f"  Params : entry_tf={params.get('entry_tf')}m  "

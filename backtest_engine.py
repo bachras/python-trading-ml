@@ -189,17 +189,11 @@ def run_backtest(
     # Slippage: fixed 0.1 × ATR per side (conservative for CFDs at market close price)
     SLIP_FACTOR = 0.1
 
-    # ── Hard filter pre-computation ─────────────────────────────────────
-    # Spread filter threshold: 2× the median spread (skip if spread is unusually wide)
-    spread_median = np.nanmedian(spread_arr[spread_arr > 0]) if (spread_arr > 0).any() else 0.0
-    SPREAD_MAX    = spread_median * 2.0 if spread_median > 0 else np.inf
-    # ATR volatility filter: skip if ATR > 3× its 100-bar rolling median (flash crash / gap)
+    # ── ATR flash-crash filter (physics — not a behavioral cap) ─────────
+    # Skip entries when ATR > 3× rolling median — market has gapped or spiked.
+    # This is a market-physics filter: execution quality collapses during spikes.
     atr_series    = pd.Series(atr_arr)
     atr_roll_med  = atr_series.rolling(100, min_periods=20).median().values
-    DAILY_TRADE_CAP = 6   # max entries per calendar day
-    CONSEC_LOSS_CAP = 4   # after this many consecutive losses → reduce risk
-    CONSEC_LOSS_RISK_PCT = 0.5  # reduced risk % during cooldown
-    CONSEC_COOL_TRADES   = 6    # number of trades to hold reduced risk after trigger
 
     # ── Simulate trades ──────────────────────────────────────────────
     balance  = start_balance
@@ -209,20 +203,8 @@ def run_backtest(
     in_trade = False
     open_trade = {}
 
-    # Filter state
-    consec_losses      = 0
-    cooldown_remaining = 0
-    current_day        = None
-    daily_trade_count  = 0
-
     for i in range(SEQ_LEN, len(df) - 1):
         bar_date = dates[i]
-
-        # Daily trade counter reset
-        bar_day = bar_date.date() if hasattr(bar_date, "date") else None
-        if bar_day != current_day:
-            current_day       = bar_day
-            daily_trade_count = 0
 
         # Check open trade
         if in_trade:
@@ -270,17 +252,6 @@ def run_backtest(
                 in_trade = False
                 equity_records.append((bar_date, balance))
 
-                # Update consecutive loss tracker
-                if pnl_r < 0:
-                    consec_losses += 1
-                    if consec_losses >= CONSEC_LOSS_CAP and cooldown_remaining == 0:
-                        cooldown_remaining = CONSEC_COOL_TRADES
-                else:
-                    consec_losses = 0
-
-                if cooldown_remaining > 0:
-                    cooldown_remaining -= 1
-
             continue
 
         # Check for signal
@@ -298,15 +269,8 @@ def run_backtest(
         if _is_session_blocked(bar_date):
             continue
 
-        # Daily trade cap
-        if daily_trade_count >= DAILY_TRADE_CAP:
-            continue
-
-        # Spread filter: skip if spread is more than 2× the median
-        if not np.isnan(spread_arr[i]) and spread_arr[i] > SPREAD_MAX:
-            continue
-
         # ATR volatility filter: skip during flash crashes / gaps (ATR > 3× rolling median)
+        # This is a physics filter — execution quality collapses during spikes.
         if (not np.isnan(atr_roll_med[i]) and atr_roll_med[i] > 0 and
                 not np.isnan(atr_arr[i]) and atr_arr[i] > atr_roll_med[i] * 3.0):
             continue
@@ -315,36 +279,17 @@ def run_backtest(
         if sl_dist <= 0 or np.isnan(sl_dist):
             continue
 
-        # Entry with spread + slippage cost
-        # spread_cost = half the bid/ask spread (we cross on entry, not exit)
-        # slip_cost   = 0.1 × ATR (execution delay / market impact)
-        spread_cost = spread_arr[i] / 2.0
+        # Entry with spread + slippage cost (market physics — not optional)
+        spread_cost = spread_arr[i] / 2.0 if not np.isnan(spread_arr[i]) else 0.0
         slip_cost   = atr_arr[i] * SLIP_FACTOR if not np.isnan(atr_arr[i]) else 0.0
-        total_cost  = spread_cost + slip_cost
-        # Longs pay above close, shorts receive below close
-        entry       = closes[i] + direction * total_cost
+        entry       = closes[i] + direction * (spread_cost + slip_cost)
         sl          = entry - direction * sl_dist
         tp          = entry + direction * sl_dist * tp_mult
 
-        # Volatility-adjusted position sizing (0.5–2% band inversely scaled by ATR)
-        # When ATR is elevated, risk less; when ATR is low, risk slightly more.
-        # normalised_atr = current ATR / rolling 100-bar median ATR
-        # risk_pct = base_risk / normalised_atr, clamped to [0.5, 2.0]
-        VOL_SIZE_MIN = 0.5
-        VOL_SIZE_MAX = 2.0
-        if (not np.isnan(atr_roll_med[i]) and atr_roll_med[i] > 0 and
-                not np.isnan(atr_arr[i]) and atr_arr[i] > 0):
-            norm_atr = atr_arr[i] / atr_roll_med[i]
-            vol_adjusted_pct = np.clip(risk_pct / norm_atr, VOL_SIZE_MIN, VOL_SIZE_MAX)
-        else:
-            vol_adjusted_pct = risk_pct
-
-        # Consecutive loss cooldown overrides vol sizing (always the stricter cap)
-        effective_risk_pct = CONSEC_LOSS_RISK_PCT if cooldown_remaining > 0 else vol_adjusted_pct
-        if risk_mode == "fixed":
-            risk = fixed_amt
-        else:
-            risk = max(balance, 1.0) * effective_risk_pct / 100.0
+        # Fixed $100/trade risk — consistent with ER calculation model.
+        # ER = profit / max_drawdown, both in $100 units → order-independent,
+        # scale-independent, and distortion-free as account grows.
+        risk = fixed_amt
 
         open_trade = {
             "dir":        direction,
@@ -359,7 +304,6 @@ def run_backtest(
             "session":    _detect_session(df.iloc[i]),
         }
         in_trade = True
-        daily_trade_count += 1
         equity_records.append((bar_date, balance))
 
     # ── Build daily equity curve ─────────────────────────────────────

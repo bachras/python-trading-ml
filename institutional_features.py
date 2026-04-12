@@ -222,12 +222,12 @@ def compute_volume_profile(prices: np.ndarray, volumes: np.ndarray,
 
 def add_volume_profile_features(df: pd.DataFrame,
                                  session_bars: int = 390) -> pd.DataFrame:
-    # Need at least 20 bars for a meaningful profile (compute_volume_profile
-    # requires >= 10, but fewer than 20 gives unreliable results).
-    session_bars = max(session_bars, 20)
     """
-    Rolling volume profile computed over `session_bars` lookback.
-    For US30: 390 bars = ~1 trading day on 1m, ~78 bars on 5m.
+    Session-level volume profile: resets at each calendar day open.
+
+    For each bar, only bars from the same calendar day up to (and including)
+    the current bar contribute — matches VWAP's groupby-date pattern.
+    No rolling window bleed across sessions.
 
     ML features derived from profile:
       - Distance to POC (normalised by ATR)
@@ -255,43 +255,51 @@ def add_volume_profile_features(df: pd.DataFrame,
     val_dist = np.full(n, np.nan)
     hvn_dist = np.full(n, np.nan)
     lvn_dist = np.full(n, np.nan)
-    poc_migr = np.full(n, np.nan)   # POC migration speed
     in_va    = np.full(n, np.nan)   # 1=inside value area, 0=outside
 
-    for i in range(session_bars, n):
-        start  = i - session_bars
-        p_slice = (h[start:i] + l[start:i]) / 2.0   # mid prices for profiling
-        v_slice = v[start:i]
+    # Group bar indices by calendar date — same pattern as VWAP
+    dates        = d.index.date
+    unique_dates = sorted(set(dates))
 
-        profile = compute_volume_profile(p_slice, v_slice)
-        if not profile:
+    for day in unique_dates:
+        day_idxs = np.where(dates == day)[0]
+        if len(day_idxs) < 10:
             continue
 
-        poc = profile["poc"]
-        vah = profile["vah"]
-        val = profile["val"]
-        a   = atr[i] if atr[i] > 0 else c[i] * 0.001
+        # Accumulate within session: profile grows as the day progresses.
+        # Profile at bar k uses only bars [0..k] of this session — zero lookahead.
+        for k, idx in enumerate(day_idxs):
+            seg = day_idxs[:k + 1]
+            if len(seg) < 10:
+                continue
+            p_slice = (h[seg] + l[seg]) / 2.0
+            v_slice = v[seg]
 
-        poc_arr[i] = poc
-        vah_arr[i] = vah
-        val_arr[i] = val
-        va_width[i] = (vah - val) / a
-        poc_dist[i] = (c[i] - poc) / a
-        vah_dist[i] = (c[i] - vah) / a
-        val_dist[i] = (c[i] - val) / a
-        in_va[i]    = 1.0 if val <= c[i] <= vah else 0.0
+            profile = compute_volume_profile(p_slice, v_slice)
+            if not profile:
+                continue
 
-        # Nearest HVN distance (above and below)
-        hvns = profile.get("hvn_prices", [])
-        if hvns:
-            dists = [abs(c[i] - p) / a for p in hvns]
-            hvn_dist[i] = min(dists)
+            poc = profile["poc"]
+            vah = profile["vah"]
+            val = profile["val"]
+            a   = atr[idx] if atr[idx] > 0 else c[idx] * 0.001
 
-        # Nearest LVN distance
-        lvns = profile.get("lvn_prices", [])
-        if lvns:
-            dists = [abs(c[i] - p) / a for p in lvns]
-            lvn_dist[i] = min(dists)
+            poc_arr[idx] = poc
+            vah_arr[idx] = vah
+            val_arr[idx] = val
+            va_width[idx] = (vah - val) / a
+            poc_dist[idx] = (c[idx] - poc) / a
+            vah_dist[idx] = (c[idx] - vah) / a
+            val_dist[idx] = (c[idx] - val) / a
+            in_va[idx]    = 1.0 if val <= c[idx] <= vah else 0.0
+
+            hvns = profile.get("hvn_prices", [])
+            if hvns:
+                hvn_dist[idx] = min(abs(c[idx] - p) / a for p in hvns)
+
+            lvns = profile.get("lvn_prices", [])
+            if lvns:
+                lvn_dist[idx] = min(abs(c[idx] - p) / a for p in lvns)
 
     d["vp_poc"]       = poc_arr
     d["vp_vah"]       = vah_arr
@@ -775,11 +783,13 @@ def add_institutional_features(df: pd.DataFrame,
     d = _check_step(d, add_session_open_range(d, open_range_bars=open_range_bars), "ORB")
 
     # Forward-fill NaNs introduced by rolling lookbacks (e.g. first N bars of
-    # anchored VWAP, ORB before market open) then back-fill any leading NaNs.
+    # anchored VWAP, ORB before market open) then zero-fill any remaining NaNs
+    # in indicator columns.  bfill() was removed — it propagates future values
+    # into past rows (lookahead violation).
     # Only hard-drop rows where core OHLCV columns are missing.
     rows_before = len(d)
     d.ffill(inplace=True)
-    d.bfill(inplace=True)
+    d.fillna(0, inplace=True)
     core_cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in d.columns]
     d.dropna(subset=core_cols, inplace=True)
     rows_after = len(d)

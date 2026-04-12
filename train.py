@@ -43,6 +43,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import joblib
+from sklearn.isotonic import IsotonicRegression
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -69,6 +70,7 @@ from phase2_adaptive_engine import (
     train_ensemble,
     run_genetic_algo, run_optuna, run_per_tf_optimization,
     save_params, load_params,
+    _select_label_col,
     INSTRUMENTS, PARAM_SEEDS, HARD_LIMITS,
     MODEL_DIR, LOG_DIR, PARAMS_DIR, SEQ_LEN, MIN_BARS,
     OPTUNA_TRIALS,
@@ -106,6 +108,31 @@ logging.basicConfig(
 log = logging.getLogger("train")
 
 PURGE_BARS = 10   # bars to drop at each train/OOS boundary to prevent leakage
+
+
+def _spa_bootstrap_test(pnls: list, n_boot: int = 2000) -> float:
+    """
+    Bootstrap test for H0: E[trade_pnl] <= 0 (no positive edge).
+
+    Procedure:
+      1. Center the trade P&L series under H0 (subtract observed mean).
+      2. Resample N bootstrap draws from the centered series.
+      3. p-value = fraction of bootstrap means >= observed mean.
+
+    Returns p-value in [0, 1].  p < 0.05 → reject H0, significant edge.
+    Returns 1.0 when there is insufficient data (<20 trades) or no edge.
+    """
+    arr = np.array(pnls, dtype=float)
+    if len(arr) < 20:
+        return 1.0
+    actual_mean = float(arr.mean())
+    if actual_mean <= 0:
+        return 1.0
+    # Center data so bootstrap distribution represents H0: mean = 0
+    arr_c = arr - actual_mean
+    rng = np.random.default_rng(42)
+    boot_means = rng.choice(arr_c, size=(n_boot, len(arr)), replace=True).mean(axis=1)
+    return float((boot_means >= actual_mean).mean())
 
 
 def _walk_forward_folds(df: pd.DataFrame):
@@ -246,6 +273,8 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
 
             fold_xgb_scores = []
             fold_rf_scores  = []
+            oos_probs_all   = []   # stacked OOS ensemble probs for calibration
+            oos_labels_all  = []
             for fold_num, (train_df, val_df, oos_label) in enumerate(folds, 1):
                 log.info(f"    Fold {fold_num}/{len(folds)} | OOS={oos_label} | "
                          f"train={len(train_df):,} val={len(val_df):,}")
@@ -274,10 +303,25 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 fold_xgb_scores.append((xgb_fold.predict(X_val) == y_val).mean())
                 fold_rf_scores.append( (rf_fold.predict(X_val)  == y_val).mean())
 
+                # Collect OOS ensemble probs for isotonic calibration
+                p_xgb_oos = xgb_fold.predict_proba(X_val)[:, 1]
+                p_rf_oos  = rf_fold.predict_proba(X_val)[:, 1]
+                oos_probs_all.extend(((p_xgb_oos + p_rf_oos) / 2.0).tolist())
+                oos_labels_all.extend(y_val.tolist())
+
             # Log cross-fold OOS accuracy summary
             log.info(f"  {symbol} {tf}m walk-forward OOS accuracy | "
                      f"XGB: {np.mean(fold_xgb_scores):.3f} ± {np.std(fold_xgb_scores):.3f} | "
                      f"RF: {np.mean(fold_rf_scores):.3f} ± {np.std(fold_rf_scores):.3f}")
+
+            # Fit isotonic calibrator on all stacked OOS predictions
+            # Makes confidence threshold meaningful: calibrated prob ≈ actual win rate
+            if len(oos_probs_all) >= 50:
+                calibrator = IsotonicRegression(out_of_bounds="clip")
+                calibrator.fit(oos_probs_all, oos_labels_all)
+                joblib.dump(calibrator, MODEL_DIR / f"calibrator_{key}.pkl")
+                log.info(f"  Calibrator saved → calibrator_{key}.pkl "
+                         f"({len(oos_probs_all):,} OOS samples)")
 
             # ── Final production model: train on ALL data ─────────────
             # Use the last fold's scaler (fitted on most data) for production
@@ -294,6 +338,25 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             models_cache[f"rf_{key}"]  = rf_m
             joblib.dump(final_scaler, MODEL_DIR / f"scaler_{key}.pkl")
             log.info(f"  Scaler saved → scaler_{key}.pkl")
+
+            # ── Drift reference: feature histograms for top-10 features ──
+            # Saved as drift_ref_{key}.pkl — loaded by live.py for PSI monitoring.
+            try:
+                importances = xgb_m.feature_importances_
+                top10_idx   = np.argsort(importances)[::-1][:10]
+                top10_cols  = [feat_cols[i] for i in top10_idx]
+                ref_data    = apply_scaler(df, final_scaler, feat_cols)
+                drift_ref   = {}
+                for col in top10_cols:
+                    vals = ref_data[col].dropna().values
+                    counts, bin_edges = np.histogram(vals, bins=20)
+                    pct = counts / (counts.sum() + 1e-10)
+                    drift_ref[col] = {"bin_edges": bin_edges, "pct": pct}
+                joblib.dump(drift_ref, MODEL_DIR / f"drift_ref_{key}.pkl")
+                log.info(f"  Drift reference saved → drift_ref_{key}.pkl "
+                         f"(top {len(top10_cols)} features)")
+            except Exception as e:
+                log.warning(f"  Could not save drift reference for {key}: {e}")
 
 
         # ── Global GA + Optuna (picks best TF across all) ─────────────
@@ -404,6 +467,20 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                         log.warning(f"  {strategy_id}: MC worst-case DD={mc['mc_dd_p95']:.1f}% "
                                     f"— catastrophic tail risk in some orderings")
 
+                # ── SPA bootstrap edge test ────────────────────────────────────
+                spa_p = None
+                if bt.get("trades"):
+                    trade_pnls = [t.get("pnl", 0) for t in bt["trades"]]
+                    spa_p = _spa_bootstrap_test(trade_pnls)
+                    spa_tag = f"p={spa_p:.3f}"
+                    if spa_p < 0.05:
+                        log.info(f"  {strategy_id}: SPA edge CONFIRMED ({spa_tag}) — rejects H0 at 5%")
+                    elif spa_p < 0.10:
+                        log.warning(f"  {strategy_id}: SPA edge MARGINAL ({spa_tag}) — borderline signal")
+                    else:
+                        log.warning(f"  {strategy_id}: SPA edge WEAK ({spa_tag}) — cannot reject H0, "
+                                    f"strategy may have no real edge")
+
                 # ── Parameter sensitivity ──────────────────────────────────────
                 sens = {}
                 if _sens_models_ok:
@@ -455,6 +532,7 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     "mc_pass":          int(mc.get("mc_pass", False)),
                     "sensitivity_score": sens.get("sensitivity_score"),
                     "robust":           int(sens.get("robust", False)),
+                    "spa_p_value":      spa_p,
                     "is_active":        0,
                 })
                 if not bt["equity_df"].empty:
@@ -479,28 +557,76 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     "mc_dd95":   mc.get("mc_dd_p95", 0),
                     "sens":      sens.get("sensitivity_score", 0),
                     "robust":    "Y" if sens.get("robust") else "N",
+                    "spa":       f"{spa_p:.3f}" if spa_p is not None else "n/a",
                 })
+
+            # ── Retrain rank-1 final model on its best-matching label ─────────
+            # The walk-forward folds and optimizer used the default be=0 label.
+            # Now that we know the rank-1 params (sl_atr, tp_mult, be_r), retrain
+            # the production model on the exact label column those params match.
+            # This is the model that goes live — it predicts the outcome it will
+            # actually trade (including BE semantics), fixing model miscalibration.
+            if top_trials and tf_feat.get(tf) is not None:
+                rank1_params   = top_trials[0]["params"]
+                best_label_col = _select_label_col(
+                    rank1_params["sl_atr"],
+                    rank1_params["tp_mult"],
+                    rank1_params.get("be_r", 0),
+                )
+                df_full       = tf_feat[tf]
+                # feat_cols may not be set if we resumed from disk (skipped walk-forward)
+                rt_feat_cols  = get_feature_cols(df_full)
+                scaler_key    = f"{symbol}_{tf}m"
+                retrain_scaler = scalers_cache.get(scaler_key)
+
+                if best_label_col in df_full.columns and best_label_col != "target_sl1.5_tp2_be0":
+                    log.info(f"  {symbol} {tf}m: retraining final model on label "
+                             f"'{best_label_col}' (rank-1 params: "
+                             f"sl={rank1_params['sl_atr']} tp={rank1_params['tp_mult']} "
+                             f"be={rank1_params.get('be_r',0)})")
+                    # Copy and swap target so train_ensemble trains on the correct label
+                    df_rt = df_full.copy()
+                    df_rt["target"] = df_rt[best_label_col]
+                    df_rt.dropna(subset=["target"], inplace=True)
+
+                    if retrain_scaler is not None and len(df_rt) > MIN_BARS:
+                        i_va        = int(len(df_rt) * 0.85)
+                        rt_train_s  = apply_scaler(df_rt.iloc[:i_va], retrain_scaler, rt_feat_cols)
+                        rt_val_s    = apply_scaler(df_rt.iloc[i_va:], retrain_scaler, rt_feat_cols)
+                        xgb_rt, rf_rt = train_ensemble(rt_train_s, rt_val_s, rt_feat_cols, symbol, tf)
+                        # Overwrite the generic models in cache and on disk
+                        models_cache[f"xgb_{scaler_key}"] = xgb_rt
+                        models_cache[f"rf_{scaler_key}"]  = rf_rt
+                        log.info(f"  {symbol} {tf}m: label-matched model saved "
+                                 f"(overwrites generic be=0 model)")
+                    else:
+                        log.warning(f"  {symbol} {tf}m: skipping label retrain "
+                                    f"— scaler missing or insufficient bars "
+                                    f"({len(df_rt)} bars)")
+                else:
+                    log.info(f"  {symbol} {tf}m: label retrain not needed "
+                             f"— rank-1 maps to default label (be=0, mid-grid)")
 
             # ── Post-TF summary table ──────────────────────────────────────────
             if tf_summary_rows:
-                log.info(f"\n  ┌─ {symbol} {tf}m — Strategy Summary ({'─'*38}┐")
+                log.info(f"\n  ┌─ {symbol} {tf}m — Strategy Summary ({'─'*42}┐")
                 log.info(f"  │ {'Strategy':<22} {'N':>5} {'WR%':>5} {'Sharpe':>7} "
                          f"{'Sortino':>7} {'Calmar':>6} {'HC_SR':>6} "
                          f"{'ER':>8} {'DD%':>5} {'MC':>4} {'MCp5':>6} {'MCdd95':>6} "
-                         f"{'Sens':>5} {'Rob':>3} │")
+                         f"{'Sens':>5} {'Rob':>3} {'SPA-p':>6} │")
                 log.info(f"  │ {'─'*22} {'─'*5} {'─'*5} {'─'*7} "
                          f"{'─'*7} {'─'*6} {'─'*6} "
                          f"{'─'*8} {'─'*5} {'─'*4} {'─'*6} {'─'*6} "
-                         f"{'─'*5} {'─'*3} │")
+                         f"{'─'*5} {'─'*3} {'─'*6} │")
                 for r in tf_summary_rows:
                     log.info(
                         f"  │ {r['id']:<22} {r['trades']:>5} {r['wr']:>5.1f} "
                         f"{r['sharpe']:>7.2f} {r['sortino']:>7.2f} {r['calmar']:>6.2f} "
                         f"{r['hc']:>6.2f} {r['er']:>8.2f} {r['dd']:>5.1f} "
                         f"{r['mc']:>4} {r['mc_p5']:>6.2f} {r['mc_dd95']:>6.1f} "
-                        f"{r['sens']:>5.0f} {r['robust']:>3} │"
+                        f"{r['sens']:>5.0f} {r['robust']:>3} {r['spa']:>6} │"
                     )
-                log.info(f"  └{'─'*100}┘")
+                log.info(f"  └{'─'*104}┘")
 
         _activate_best_strategy(symbol)
 

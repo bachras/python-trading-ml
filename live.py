@@ -25,9 +25,6 @@ Retraining while live:
 
 import os, sys, time, json, logging, warnings
 
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")
-
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -80,7 +77,7 @@ from phase2_adaptive_engine import (
 )
 from db import (
     init_db, get_all_strategies, get_strategy,
-    get_capital_at_risk, get_open_trades,
+    get_capital_at_risk, get_open_trades, get_recent_live_trades,
     log_live_trade, update_trade_be, close_live_trade,
 )
 
@@ -93,7 +90,9 @@ RISK_PCT        = float(os.getenv("RISK_PER_TRADE_PCT",  "1.0"))
 FIXED_RISK_AMT  = float(os.getenv("FIXED_RISK_AMOUNT",   "100.0"))
 RISK_CAP_PCT    = float(os.getenv("RISK_CAP_PCT",        "2.0"))
 RISK_CAP_AMOUNT = float(os.getenv("RISK_CAP_AMOUNT",     "200.0"))
-EXTRA_STRATEGIES = [s.strip() for s in os.getenv("EXTRA_STRATEGIES","").split(",") if s.strip()]
+EXTRA_STRATEGIES   = [s.strip() for s in os.getenv("EXTRA_STRATEGIES","").split(",") if s.strip()]
+# Vol-sizing: disabled by default. Enable only when running scaled-risk phase.
+VOL_SIZE_ENABLED   = os.getenv("VOL_SIZE_ENABLED", "false").lower() == "true"
 
 # Hot-reload: check for newer model files every this many minutes
 MODEL_RELOAD_INTERVAL_MIN = int(os.getenv("MODEL_RELOAD_INTERVAL_MIN", "60"))
@@ -182,63 +181,6 @@ def _get_active_strategies() -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Hard filter state (consecutive losses + daily trade cap)
-# ─────────────────────────────────────────────────────────────────────
-
-class _FilterState:
-    """Per-symbol filter state for consecutive loss cooldown and daily cap."""
-    CONSEC_LOSS_CAP      = 4     # trigger cooldown after this many consecutive losses
-    CONSEC_COOL_TRADES   = 6     # reduced-risk trades after trigger
-    CONSEC_COOL_RISK_PCT = 0.5   # risk % during cooldown
-    DAILY_TRADE_CAP      = 6     # max entries per calendar day
-
-    def __init__(self):
-        self.consec_losses      = 0
-        self.cooldown_remaining = 0
-        self.current_day        = None
-        self.daily_trades       = 0
-
-    def reset_day(self):
-        today = datetime.now(tz=_LONDON_TZ).date()
-        if today != self.current_day:
-            self.current_day  = today
-            self.daily_trades = 0
-
-    def daily_cap_reached(self) -> bool:
-        self.reset_day()
-        return self.daily_trades >= self.DAILY_TRADE_CAP
-
-    def effective_risk_pct(self, base_pct: float) -> float:
-        return self.CONSEC_COOL_RISK_PCT if self.cooldown_remaining > 0 else base_pct
-
-    def record_trade_open(self):
-        self.reset_day()
-        self.daily_trades += 1
-
-    def record_trade_close(self, win: bool):
-        if win:
-            self.consec_losses = 0
-        else:
-            self.consec_losses += 1
-            if (self.consec_losses >= self.CONSEC_LOSS_CAP and
-                    self.cooldown_remaining == 0):
-                self.cooldown_remaining = self.CONSEC_COOL_TRADES
-                log.warning(f"[FilterState] {self.consec_losses} consecutive losses "
-                            f"— reducing risk to {self.CONSEC_COOL_RISK_PCT}% "
-                            f"for next {self.CONSEC_COOL_TRADES} trades")
-        if self.cooldown_remaining > 0:
-            self.cooldown_remaining -= 1
-
-# Per-symbol filter state (initialised lazily)
-_filter_states: dict[str, _FilterState] = {}
-
-def _get_filter_state(symbol: str) -> _FilterState:
-    if symbol not in _filter_states:
-        _filter_states[symbol] = _FilterState()
-    return _filter_states[symbol]
-
-
-# ─────────────────────────────────────────────────────────────────────
 # Risk cap (BE-aware)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -256,6 +198,132 @@ def _check_risk_cap(new_risk: float, balance: float) -> bool:
                  f"> cap={cap:.2f} — skipping (open BE-exempt positions don't count)")
         return False
     return True
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Concept drift detection — PSI on top-10 features
+# ─────────────────────────────────────────────────────────────────────
+
+class _DriftMonitor:
+    """
+    Population Stability Index (PSI) drift monitor.
+
+    Compares the current live data window against the reference histograms
+    saved during training.  Graduated response:
+      PSI < 0.10  — stable, no action
+      0.10–0.25   — moderate drift, log warning
+      ≥ 0.25      — major drift, reduce sizing / flag for retrain
+    """
+    PSI_MOD   = 0.10   # moderate drift threshold
+    PSI_MAJOR = 0.25   # major drift threshold
+    WINDOW    = 500    # number of recent bars to compare against reference
+
+    def __init__(self, key: str, drift_ref: dict):
+        self.key      = key
+        self.ref      = drift_ref   # {col: {"bin_edges": ..., "pct": ...}}
+        self.status   = "ok"        # "ok" | "moderate" | "major"
+        self.avg_psi  = 0.0
+
+    def _psi_one(self, col: str, live_vals: np.ndarray) -> float:
+        ref   = self.ref[col]
+        edges = ref["bin_edges"]
+        exp   = ref["pct"]
+        counts, _ = np.histogram(live_vals, bins=edges)
+        act = counts / (counts.sum() + 1e-10)
+        # Avoid log(0): clip both to a small floor
+        act = np.clip(act, 1e-6, None)
+        exp = np.clip(exp, 1e-6, None)
+        return float(np.sum((act - exp) * np.log(act / exp)))
+
+    def check(self, df: pd.DataFrame, feature_cols: list) -> str:
+        """
+        Compute PSI for each reference feature and return status string.
+        Reads the last WINDOW rows from df.
+        """
+        if df is None or len(df) < 50:
+            return self.status
+        window = df[feature_cols].dropna().tail(self.WINDOW)
+        psi_vals = []
+        for col, ref_data in self.ref.items():
+            if col not in window.columns:
+                continue
+            vals = window[col].dropna().values
+            if len(vals) < 20:
+                continue
+            psi_vals.append(self._psi_one(col, vals))
+
+        if not psi_vals:
+            return self.status
+
+        self.avg_psi = float(np.mean(psi_vals))
+        if self.avg_psi >= self.PSI_MAJOR:
+            self.status = "major"
+        elif self.avg_psi >= self.PSI_MOD:
+            self.status = "moderate"
+        else:
+            self.status = "ok"
+        return self.status
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Smart kill switch — rolling 20-trade Sharpe + binomial win rate test
+# ─────────────────────────────────────────────────────────────────────
+
+class _SmartKillSwitch:
+    """
+    Monitors the last 20 closed live trades for a strategy.
+
+    Graduated response:
+      Sharpe < 0 or binomial WR p < 0.10  → "warn"  (log warning)
+      Sharpe < -0.5 or binomial WR p < 0.05 → "reduce" (cut sizing to 50%)
+      Sharpe < -1.0 or very poor WR (p < 0.01) → "disable"
+
+    Uses binomial one-sided p-value (H0: win rate ≥ 50%, H1: WR < 50%).
+    Hard 35% DD circuit breaker handled separately by RiskGate.
+    """
+    N_TRADES  = 20
+
+    def __init__(self, strategy_id: str):
+        self.sid    = strategy_id
+        self.status = "ok"        # "ok" | "warn" | "reduce" | "disable"
+        self.sharpe = 0.0
+        self.wr     = 0.5
+
+    @staticmethod
+    def _binomial_p(wins: int, n: int) -> float:
+        """One-sided binomial p-value for H0: p >= 0.5 (test: WR below chance)."""
+        from scipy.stats import binom
+        # P(X <= wins | n, 0.5)
+        return float(binom.cdf(wins, n, 0.5))
+
+    def check(self) -> str:
+        trades = get_recent_live_trades(self.sid, n=self.N_TRADES)
+        if len(trades) < 10:
+            self.status = "ok"
+            return self.status
+
+        pnls = np.array([t.get("pnl", 0) or 0 for t in trades], dtype=float)
+        wins = int((pnls > 0).sum())
+        n    = len(pnls)
+        self.wr = wins / n
+
+        # Trade-level Sharpe (no annualisation — relative measure)
+        if pnls.std() > 0:
+            self.sharpe = float(pnls.mean() / pnls.std())
+        else:
+            self.sharpe = 0.0
+
+        p_val = self._binomial_p(wins, n)
+
+        if self.sharpe < -1.0 or p_val < 0.01:
+            self.status = "disable"
+        elif self.sharpe < -0.5 or p_val < 0.05:
+            self.status = "reduce"
+        elif self.sharpe < 0 or p_val < 0.10:
+            self.status = "warn"
+        else:
+            self.status = "ok"
+        return self.status
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -281,16 +349,6 @@ def _monitor_open_positions():
         if not ticket:
             continue
         if ticket not in pos_map:
-            # Trade closed — determine win/loss from stored trade data
-            entry_p = trade.get("entry_price", 0)
-            tp_p    = trade.get("tp_price", 0)
-            sl_p    = trade.get("sl_price", 0)
-            dir_    = trade.get("direction", 1)
-            # Approximate: if TP > entry for longs, it was a win; use stored prices
-            # A proper determination would query closed deals — this is a heuristic
-            is_win  = (dir_ == 1 and tp_p > sl_p) or (dir_ == -1 and tp_p < sl_p)
-            sym_    = trade.get("symbol", "")
-            _get_filter_state(sym_).record_trade_close(is_win)
             close_live_trade(ticket, pnl=0.0)
             continue
         pos   = pos_map[ticket]
@@ -401,6 +459,14 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
             live_cache[f"{symbol}_{tf}m"] = df
     log.info(f"Pre-loaded {len(live_cache)} data frames")
 
+    # Initialise drift monitors and kill switches (keyed by strategy_id)
+    _drift_monitors: dict[str, _DriftMonitor]   = {}
+    _kill_switches:  dict[str, _SmartKillSwitch] = {}
+    _drift_check_interval = 60 * 60   # check drift every 60 minutes
+    _last_drift_check:    dict[str, float] = {}
+    _kill_check_interval  = 60 * 60   # check kill switch every 60 minutes
+    _last_kill_check:     dict[str, float] = {}
+
     active_strategies = _get_active_strategies()
     log.info(f"Active strategies ({len(active_strategies)}):")
     for s in active_strategies:
@@ -461,14 +527,57 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
                     "be_r":       strategy.get("be_r", 0),
                 }
 
-                # Refresh live data
                 entry_key = f"{symbol}_{entry_tf}m"
+
+                # Refresh live data
                 live_cache[entry_key] = refresh_live_data(
                     symbol, entry_tf, live_cache.get(entry_key, pd.DataFrame()), is_tick)
                 if htf_tf > 0:
                     htf_key = f"{symbol}_{htf_tf}m"
                     live_cache[htf_key] = refresh_live_data(
                         symbol, htf_tf, live_cache.get(htf_key, pd.DataFrame()), is_tick)
+
+                # ── Initialise drift monitor (once per strategy, lazily) ──────
+                if sid not in _drift_monitors:
+                    drift_ref = scalers_cache.get(f"drift_ref_{entry_key}")
+                    if drift_ref:
+                        _drift_monitors[sid]     = _DriftMonitor(entry_key, drift_ref)
+                        _last_drift_check[sid]   = 0.0
+                if sid not in _kill_switches:
+                    _kill_switches[sid]      = _SmartKillSwitch(sid)
+                    _last_kill_check[sid]    = 0.0
+
+                # ── Periodic drift check ───────────────────────────────────────
+                now_ts = time.time()
+                if (sid in _drift_monitors and
+                        now_ts - _last_drift_check.get(sid, 0) >= _drift_check_interval):
+                    dm      = _drift_monitors[sid]
+                    df_live = live_cache.get(entry_key)
+                    feat_c  = [c for c in (df_live.columns if df_live is not None else [])
+                               if c in dm.ref]
+                    d_stat  = dm.check(df_live, feat_c if feat_c else list(dm.ref.keys()))
+                    _last_drift_check[sid] = now_ts
+                    if d_stat == "major":
+                        log.warning(f"[{sid}] DRIFT MAJOR: avg PSI={dm.avg_psi:.3f} "
+                                    f"— model may be stale, consider retraining")
+                    elif d_stat == "moderate":
+                        log.info(f"[{sid}] Drift moderate: avg PSI={dm.avg_psi:.3f}")
+
+                # ── Periodic kill switch check ─────────────────────────────────
+                if now_ts - _last_kill_check.get(sid, 0) >= _kill_check_interval:
+                    ks_stat = _kill_switches[sid].check()
+                    _last_kill_check[sid] = now_ts
+                    ks      = _kill_switches[sid]
+                    if ks_stat == "disable":
+                        log.warning(f"[{sid}] KILL SWITCH DISABLE: Sharpe={ks.sharpe:.2f} "
+                                    f"WR={ks.wr:.1%} — strategy auto-disabled")
+                        continue   # skip signal — no new entries
+                    elif ks_stat == "reduce":
+                        log.warning(f"[{sid}] Kill switch REDUCE: Sharpe={ks.sharpe:.2f} "
+                                    f"WR={ks.wr:.1%} — risk halved")
+                    elif ks_stat == "warn":
+                        log.info(f"[{sid}] Kill switch WARN: Sharpe={ks.sharpe:.2f} "
+                                 f"WR={ks.wr:.1%}")
 
                 # Generate signal
                 signal = get_signal(
@@ -486,43 +595,40 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
                     log.debug(f"{sid}: blocked by session gate (20:30-01:00 UK)")
                     continue
 
-                # Daily trade cap
-                fstate = _get_filter_state(symbol)
-                if fstate.daily_cap_reached():
-                    log.debug(f"{sid}: daily trade cap reached ({_FilterState.DAILY_TRADE_CAP})")
-                    continue
-
                 # Hard risk gate
                 allowed, reason = risk_gate.can_trade()
                 if not allowed:
                     log.warning(f"[{sid}] Blocked by risk gate: {reason}")
                     continue
 
-                # Volatility-adjusted position sizing (0.5–2% band inversely scaled by ATR)
-                # Uses ATR from live data cache: when ATR is high, risk less; low ATR → risk more.
-                VOL_SIZE_MIN = 0.5
-                VOL_SIZE_MAX = 2.0
-                balance      = get_account_balance()
-                base_pct     = RISK_PCT
-                entry_key_s  = f"{symbol}_{signal['entry_tf']}m"
-                df_live      = live_cache.get(entry_key_s, pd.DataFrame())
-                if not df_live.empty and "atr14" in df_live.columns:
-                    recent_atr  = df_live["atr14"].dropna()
-                    if len(recent_atr) >= 20:
-                        cur_atr  = float(recent_atr.iloc[-1])
-                        med_atr  = float(recent_atr.rolling(100, min_periods=20).median().iloc[-1])
-                        if med_atr > 0 and cur_atr > 0:
-                            norm_atr = cur_atr / med_atr
-                            base_pct = float(np.clip(RISK_PCT / norm_atr,
-                                                     VOL_SIZE_MIN, VOL_SIZE_MAX))
+                balance    = get_account_balance()
+                trade_risk = FIXED_RISK_AMT
 
-                # Consecutive loss cooldown overrides vol sizing (stricter cap wins)
-                eff_pct    = fstate.effective_risk_pct(base_pct)
-                trade_risk = (FIXED_RISK_AMT if RISK_MODE == "fixed"
-                              else max(balance, 1.0) * eff_pct / 100.0)
-                if fstate.cooldown_remaining:
-                    log.info(f"  [{sid}] Cooldown active ({fstate.cooldown_remaining} trades left) "
-                             f"— risk reduced to {eff_pct:.1f}%")
+                # Kill switch reduce: halve risk for degraded strategies
+                if _kill_switches.get(sid) and _kill_switches[sid].status == "reduce":
+                    trade_risk = FIXED_RISK_AMT * 0.5
+
+                # Drift major: also halve risk (independent of kill switch)
+                if _drift_monitors.get(sid) and _drift_monitors[sid].status == "major":
+                    trade_risk *= 0.5
+
+                # Volatility-adjusted sizing (disabled by default; enable via VOL_SIZE_ENABLED=true)
+                if VOL_SIZE_ENABLED:
+                    VOL_SIZE_MIN = 0.5
+                    VOL_SIZE_MAX = 2.0
+                    base_pct     = RISK_PCT
+                    entry_key_s  = f"{symbol}_{signal['entry_tf']}m"
+                    df_live      = live_cache.get(entry_key_s, pd.DataFrame())
+                    if not df_live.empty and "atr14" in df_live.columns:
+                        recent_atr = df_live["atr14"].dropna()
+                        if len(recent_atr) >= 20:
+                            cur_atr  = float(recent_atr.iloc[-1])
+                            med_atr  = float(recent_atr.rolling(100, min_periods=20).median().iloc[-1])
+                            if med_atr > 0 and cur_atr > 0:
+                                norm_atr   = cur_atr / med_atr
+                                eff_pct    = float(np.clip(RISK_PCT / norm_atr,
+                                                           VOL_SIZE_MIN, VOL_SIZE_MAX))
+                                trade_risk = max(balance, 1.0) * eff_pct / 100.0
 
                 # BE-aware risk cap
                 if not _check_risk_cap(trade_risk, balance):
@@ -547,7 +653,6 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
                 )
 
                 if result["success"]:
-                    fstate.record_trade_open()
                     log_trade({
                         "symbol":    symbol, "direction": signal["direction"],
                         "entry":     signal["entry_price"], "sl": signal["sl_price"],
