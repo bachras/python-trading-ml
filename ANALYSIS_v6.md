@@ -250,33 +250,59 @@ def _check_calibration_stability(oos_probs_raw: np.ndarray,
 
 The current `fill_prob` model (S1, already implemented) captures whether an order fills at all. This is about *when* it fills — a filled order on the next bar instead of the current bar changes the entry price and therefore the realised R.
 
-**Fix — probabilistic next-bar execution in `ga_fitness()` trade loop:**
+**Gap threshold decision — use MT5 deviation limit, not % of SL:**
+
+The live system already answers the "extreme gap" question: `live.py` places orders with `IOC` fill policy and `20-deviation`. If the market moves more than 20 points from the requested price, MT5 **rejects the order entirely** — it does not fill at a worse price. Therefore:
+
+- Filling at any next-bar open (Option A) is *more optimistic than live* for large gaps — it fills trades MT5 would reject
+- Using `sl_dist * 0.50` as threshold (Option B) creates asymmetric optimizer incentives: wide-SL genomes tolerate 87-point gaps while tight-SL genomes skip anything over 30 points, even though the live MT5 behaviour is identical for both
+
+**The physically correct model** uses the same fixed deviation limit as the live system. The `MT5_DEVIATION_PTS` env var (default 20, matching live `20-deviation`) is the threshold. No % of SL needed.
+
+**Implementation — add to `ga_fitness()` trade loop, after `fill_prob` passes:**
 
 ```python
-# After fill_prob check passes (trade will be filled):
-# Model execution latency: 70% immediate (current bar close price),
-# 30% delayed to next bar open price.
-# For breakout/momentum strategies this matters most — they enter on current-bar close.
-if rng.random() < 0.30 and i + 1 < len(bars):
-    # Delayed fill: use next bar open as actual entry
-    actual_entry = bars["open"].iloc[i + 1]
-    entry_slippage = abs(actual_entry - entry_price)  # additional slippage from delay
-    entry_price = actual_entry
-    extra_slip = min(entry_slippage, sl_pts * 0.15)   # cap: delay can't consume >15% of SL
+# Execution latency model:
+# EXEC_DELAY_PROB fraction of trades experience a processing delay (MT5 pathway ~200-800ms).
+# Delayed trades fill at next bar open instead of current bar close.
+# If the gap between close and next open exceeds MT5_DEVIATION_PTS, MT5 would reject
+# the IOC order in live — model as a missed fill (same as fill_prob rejection).
+if rng.random() < EXEC_DELAY_PROB and i + 1 < n_bars:
+    next_open   = opens[i + 1]          # opens[] precomputed array alongside closes[]
+    gap_pts     = abs(next_open - entry_price)
+    if gap_pts > MT5_DEVIATION_PTS:
+        continue                         # gap too large → order rejected, missed fill
+    # Delayed fill: entry moves to next open, SL/TP recalculate from new entry
+    entry_price = next_open             # SL/TP are direction * distance from entry,
+                                        # so they shift automatically with entry_price
+    extra_slip  = gap_pts               # full actual slippage, no artificial cap
 else:
     extra_slip = 0.0
 
 total_cost = spread_cost + slip_cost + extra_slip
 ```
 
-**Expected effect on optimizer:** Strategies that require pinpoint entry at the exact signal bar (e.g., breakout at a specific price level) will be penalised. Strategies with wider SL relative to ATR will be preferred — consistent with reality where wider SL absorbs execution delay noise. This reinforces the `sl_atr ≥ 2.0` preference already seen in the current optimizer output.
+**Required setup additions in `ga_fitness()`:**
+```python
+# Alongside existing: closes = df["Close"].values, atr = df["ATR14"].values
+opens          = df["Open"].values                                 # add this
+EXEC_DELAY_PROB = float(os.getenv("EXEC_DELAY_PROB", "0.30"))    # module-level constant
+MT5_DEVIATION_PTS = float(os.getenv("MT5_DEVIATION_PTS", "20"))  # module-level constant
+```
 
-**Configuration:** Add to `.env`:
+**Expected effect on optimizer:** Strategies requiring pinpoint entry (tight breakout setups) lose more trades to gap rejection than wide-SL strategies — correctly penalising them. The `sl_atr ≥ 2.0` preference already seen in optimizer output is reinforced. Genomes that cluster near news candles (high-ATR bars) will have higher missed-fill rates, consistent with live experience.
+
+**Configuration — add to `.env`:**
 ```
-# Fraction of trades that execute at next-bar open price (execution delay model)
-# 0.0 = instant fill only; 0.30 = realistic for MT5/broker pathway
+# ── EXECUTION LATENCY MODEL ──────────────────────────────────────────────────
+# Fraction of trades subject to next-bar-open fill (MT5 processing delay ~200-800ms)
 EXEC_DELAY_PROB=0.30
+# Max gap (points) between signal-bar close and next-bar open before order is rejected.
+# Matches live.py IOC order with 20-deviation. US30 CFD: 20 pts is typical broker limit.
+MT5_DEVIATION_PTS=20
 ```
+
+**Verification after implementation:** The `[GA]` best genome's `n_trades` should drop ~5–10% vs pre-E3 (delayed fills that become gap-rejections). If it drops more than 20%, `MT5_DEVIATION_PTS` may be too tight for the dataset's ATR range — raise to 25 or 30.
 
 ---
 
@@ -319,7 +345,7 @@ These require live trade data. Implement from day 1 of paper trading.
 ### Before scaling capital (Section 3 items):
 - [ ] E1: Add `[REGIME]` fold divergence report to `train.py` (~25 lines)
 - [ ] E2: Add `[CAL-STABILITY]` volatility-bin calibration check to `train.py` (~30 lines)
-- [ ] E3: Add execution latency model to `ga_fitness()` + `EXEC_DELAY_PROB=0.30` to `.env` (~10 lines)
+- [ ] E3: Add execution latency model to `ga_fitness()` + `EXEC_DELAY_PROB=0.30` + `MT5_DEVIATION_PTS=20` to `.env` (~15 lines). Gap > `MT5_DEVIATION_PTS` → missed fill; gap ≤ limit → fill at next open with full slippage, no cap
 
 ### Environment verification:
 - [x] `MAX_DRAWDOWN_PCT=35` ✅

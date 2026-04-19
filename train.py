@@ -215,6 +215,78 @@ def _spa_bootstrap_test(pnls: list, n_boot: int = 2000) -> float:
     return float((boot_means >= actual_mean).mean())
 
 
+def _compute_fold_regime_stats(df_fold: pd.DataFrame) -> dict:
+    """Compute regime fingerprint for a walk-forward OOS fold."""
+    rets = df_fold["Close"].pct_change().dropna()
+    atr  = (df_fold["High"] - df_fold["Low"]).rolling(14).mean().dropna()
+    if len(rets) < 4 or len(atr) < 2:
+        return {"atr_mean": 0.0, "atr_std": 0.0, "kurtosis": 0.0, "vol_clust": 0.0, "n_bars": len(df_fold)}
+    abs_rets = np.abs(rets.values)
+    acf1 = float(np.corrcoef(abs_rets[1:], abs_rets[:-1])[0, 1]) if len(abs_rets) > 2 else 0.0
+    return {
+        "atr_mean":  float(atr.mean()),
+        "atr_std":   float(atr.std()),
+        "kurtosis":  float(rets.kurt()),
+        "vol_clust": acf1,
+        "n_bars":    len(df_fold),
+    }
+
+
+def _log_fold_regime_divergence(fold_stats: list, symbol: str, tf: int) -> None:
+    """Log regime divergence between adjacent OOS folds. Never blocks training."""
+    if len(fold_stats) < 2:
+        return
+    for i in range(len(fold_stats) - 1):
+        a, b = fold_stats[i], fold_stats[i + 1]
+        drift = (
+            abs(a["atr_mean"] - b["atr_mean"]) / (a["atr_mean"] + 1e-9)
+            + abs(a["kurtosis"] - b["kurtosis"]) / (abs(a["kurtosis"]) + 1)
+            + abs(a["vol_clust"] - b["vol_clust"])
+        ) / 3.0
+        level = "HIGH" if drift > 0.30 else "OK"
+        log.info(
+            f"[REGIME] {symbol}/{tf}m fold_{i}->fold_{i+1} drift={drift:.3f} ({level}) | "
+            f"atr_mean: {a['atr_mean']:.1f}->{b['atr_mean']:.1f}, "
+            f"kurtosis: {a['kurtosis']:.2f}->{b['kurtosis']:.2f}, "
+            f"vol_clust: {a['vol_clust']:.3f}->{b['vol_clust']:.3f}"
+        )
+    atr_vals = [s["atr_mean"] for s in fold_stats]
+    atr_cv   = float(np.std(atr_vals) / (np.mean(atr_vals) + 1e-9))
+    log.info(
+        f"[REGIME] {symbol}/{tf}m ATR CV across folds: {atr_cv:.3f} "
+        f"({'HIGH - regime shift present' if atr_cv > 0.25 else 'OK'})"
+    )
+
+
+def _check_calibration_stability(
+    oos_probs_raw: list, oos_probs_cal: list,
+    oos_labels: list, oos_atr: list, key: str,
+) -> None:
+    """Brier score by ATR tertile — detects calibration degrading in tail volatility regimes."""
+    from sklearn.metrics import brier_score_loss
+    arr_raw = np.array(oos_probs_raw)
+    arr_cal = np.array(oos_probs_cal)
+    arr_lbl = np.array(oos_labels)
+    arr_atr = np.array(oos_atr)
+    tertiles  = np.percentile(arr_atr, [33, 67])
+    bin_names = ["low_vol", "mid_vol", "high_vol"]
+    masks = [
+        arr_atr <= tertiles[0],
+        (arr_atr > tertiles[0]) & (arr_atr <= tertiles[1]),
+        arr_atr > tertiles[1],
+    ]
+    log.info(f"[CAL-STABILITY] {key} — Brier by ATR tertile (raw -> calibrated):")
+    for name, mask in zip(bin_names, masks):
+        n = int(mask.sum())
+        if n < 10:
+            log.warning(f"  [CAL-STABILITY] {name}: too few samples ({n}) to evaluate")
+            continue
+        b_raw = brier_score_loss(arr_lbl[mask], arr_raw[mask])
+        b_cal = brier_score_loss(arr_lbl[mask], arr_cal[mask])
+        flag  = " WEAK" if b_cal >= b_raw else ""
+        log.info(f"  {name}: {b_raw:.4f} -> {b_cal:.4f}{flag} (n={n})")
+
+
 def _walk_forward_folds(df: pd.DataFrame):
     """
     Build 3 anchored expanding walk-forward folds.
@@ -377,10 +449,15 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 log.warning(f"  {symbol} {tf}m: insufficient data for walk-forward — skipping")
                 continue
 
+            # E1: Regime divergence across OOS test periods
+            fold_regime_stats = [_compute_fold_regime_stats(vdf) for _, vdf, _ in folds]
+            _log_fold_regime_divergence(fold_regime_stats, symbol, tf)
+
             fold_xgb_scores = []
             fold_rf_scores  = []
             oos_probs_all   = []   # stacked OOS ensemble probs for calibration
             oos_labels_all  = []
+            oos_atr_all     = []   # E2: ATR per OOS bar for calibration stability check
             for fold_num, (train_df, val_df, oos_label) in enumerate(folds, 1):
                 log.info(f"    Fold {fold_num}/{len(folds)} | OOS={oos_label} | "
                          f"train={len(train_df):,} val={len(val_df):,}")
@@ -414,6 +491,9 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 p_rf_oos  = rf_fold.predict_proba(X_val)[:, 1]
                 oos_probs_all.extend(((p_xgb_oos + p_rf_oos) / 2.0).tolist())
                 oos_labels_all.extend(y_val.tolist())
+                # E2: collect unscaled ATR for calibration stability binning
+                if "atr14" in val_df.columns:
+                    oos_atr_all.extend(val_df["atr14"].tolist())
 
                 # A8: ensemble diversity check — verify XGB and RF are not duplicating each other.
                 # Low diversity (corr > 0.90) means averaging adds noise without signal.
@@ -482,6 +562,15 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                             f"  [CALIBRATION] Brier did not improve — OOS sample may be too "
                             f"small ({len(oos_probs_all)} rows) for reliable isotonic fit"
                         )
+                    # E2: calibration stability by ATR volatility tertile
+                    if len(oos_atr_all) == len(oos_probs_all):
+                        try:
+                            _check_calibration_stability(
+                                oos_probs_all, cal_probs.tolist(),
+                                oos_labels_all, oos_atr_all, key,
+                            )
+                        except Exception as _cs_e:
+                            log.warning(f"  [CAL-STABILITY] Could not run: {_cs_e}")
                 except Exception as _cal_e:
                     log.warning(f"  [CALIBRATION] Could not compute calibration curve: {_cal_e}")
 

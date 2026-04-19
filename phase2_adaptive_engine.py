@@ -230,6 +230,10 @@ SPREAD_BASE_PTS  = float(os.getenv("SPREAD_BASE_PTS",  "1.5"))
 SPREAD_ATR_COEFF = float(os.getenv("SPREAD_ATR_COEFF", "0.04"))
 SPREAD_OPEN_MULT = float(os.getenv("SPREAD_OPEN_MULT", "2.0"))
 SPREAD_OPEN_BARS = int(os.getenv("SPREAD_OPEN_BARS",   "5"))
+# E3: Execution latency model — fraction of trades that fill at next-bar open.
+# MT5_DEVIATION_PTS must match the deviation= parameter in live.py's IOC order call.
+EXEC_DELAY_PROB   = float(os.getenv("EXEC_DELAY_PROB",    "0.30"))
+MT5_DEVIATION_PTS = float(os.getenv("MT5_DEVIATION_PTS",  "30"))
 
 # R6: Features confirmed to use future bars (SWING_LOOKBACK = 10 bars each side).
 # These are whitelisted for the leakage check — training proceeds with a WARNING
@@ -941,6 +945,7 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
     closes      = df["Close"].values
     highs       = df["High"].values
     lows        = df["Low"].values
+    opens       = df["Open"].values
 
     p_xgb = xgb_m.predict_proba(feat)[:, 1]
     p_rf  = rf_m.predict_proba(feat)[:, 1]
@@ -1035,7 +1040,17 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
         if rng.random() > fill_prob:
             continue
 
-        entry  = closes[i] + direction * (spread_cost + slip_cost)
+        # E3: Execution latency — 30% of trades fill at next-bar open (MT5 pathway delay).
+        # If the open gap exceeds MT5_DEVIATION_PTS the IOC order is rejected, same as live.
+        if rng.random() < EXEC_DELAY_PROB and i + 1 < len(df) - 1:
+            gap_pts = abs(opens[i + 1] - closes[i])
+            if gap_pts > MT5_DEVIATION_PTS:
+                continue  # gap exceeds MT5 deviation limit — missed fill
+            fill_price = opens[i + 1]
+        else:
+            fill_price = closes[i]
+
+        entry  = fill_price + direction * (spread_cost + slip_cost)
         sl     = entry - direction * sl_dist
         tp     = entry + direction * sl_dist * tp_mult
         risk   = FIXED_RISK
