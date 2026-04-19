@@ -448,7 +448,47 @@ def _monitor_open_positions():
         if not ticket:
             continue
         if ticket not in pos_map:
-            close_live_trade(ticket, pnl=0.0)
+            # [TRADE] CLOSE — position disappeared; fetch actual PnL from MT5 deal history
+            _actual_pnl = 0.0
+            _exit_price = None
+            _close_time = None
+            _open_time  = trade.get("timestamp")
+            _reason     = "unknown"
+            try:
+                _deals = mt5.history_deals_get(position=ticket)
+                if _deals:
+                    _actual_pnl = sum(d.profit for d in _deals)
+                    # Last deal is the closing deal
+                    _close_deal  = max(_deals, key=lambda d: d.time)
+                    _exit_price  = _close_deal.price
+                    _close_time  = datetime.fromtimestamp(_close_deal.time, tz=timezone.utc)
+                    # Determine reason from deal entry type
+                    _reason = (
+                        "TP" if _close_deal.entry == mt5.DEAL_ENTRY_OUT and _actual_pnl > 0 else
+                        "SL" if _close_deal.entry == mt5.DEAL_ENTRY_OUT and _actual_pnl < 0 else
+                        "manual"
+                    )
+            except Exception:
+                pass
+            close_live_trade(ticket, pnl=_actual_pnl)
+            _risk_amt = trade.get("risk_amount", 0) or 100.0
+            _r_mult   = round(_actual_pnl / max(_risk_amt, 1.0), 2)
+            # Duration
+            _dur_str = ""
+            if _open_time and _close_time:
+                try:
+                    _open_dt = datetime.fromisoformat(_open_time).replace(tzinfo=timezone.utc)
+                    _dur_m   = int((_close_time - _open_dt).total_seconds() / 60)
+                    _dur_str = f" | duration={_dur_m}m"
+                except Exception:
+                    pass
+            log.info(
+                f"[TRADE] CLOSE | id={ticket} | "
+                + (f"exit={_exit_price} | " if _exit_price else "")
+                + f"pnl={_actual_pnl:+.2f} ({_r_mult:+.2f}R)"
+                + _dur_str
+                + f" | reason={_reason}"
+            )
             continue
         pos   = pos_map[ticket]
         entry = trade.get("entry_price", 0)
@@ -456,10 +496,18 @@ def _monitor_open_positions():
         if not trade.get("be_done"):
             if direction == 1 and pos.sl >= entry:
                 update_trade_be(ticket, True)
-                log.info(f"  BE: ticket={ticket} SL={pos.sl:.2f} ≥ entry={entry:.2f} — risk freed")
+                log.info(
+                    f"[TRADE] BE    | id={ticket} | "
+                    f"price={pos.price:.2f} (+{pos.sl - entry:.1f} pts = +1R) "
+                    f"→ SL moved to {pos.sl:.2f}"
+                )
             elif direction == -1 and pos.sl > 0 and pos.sl <= entry:
                 update_trade_be(ticket, True)
-                log.info(f"  BE: ticket={ticket} SL={pos.sl:.2f} ≤ entry={entry:.2f} — risk freed")
+                log.info(
+                    f"[TRADE] BE    | id={ticket} | "
+                    f"price={pos.price:.2f} ({entry - pos.sl:.1f} pts = +1R) "
+                    f"→ SL moved to {pos.sl:.2f}"
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -685,9 +733,32 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
                     live_data_cache=live_cache,
                 )
 
+                # [SIGNAL] — structured log for every evaluated signal (PASS and SKIP)
+                _conf_thresh = params.get("confidence", 0.65)
+                _htf_state   = (
+                    "BULL" if signal.get("htf_dir", 0) == 1 else
+                    "BEAR" if signal.get("htf_dir", 0) == -1 else "NEUTRAL"
+                )
                 if signal["direction"] == 0:
-                    log.debug(f"{sid}: no signal — {signal.get('reason','')}")
+                    log.info(
+                        f"[SIGNAL] {symbol}/{signal.get('entry_tf', entry_tf)}m | "
+                        f"prob_raw={signal.get('prob_raw', 0):.3f} "
+                        f"prob_cal={signal.get('prob_cal', 0):.3f} | "
+                        f"htf={_htf_state} htf_adj={signal.get('htf_adj', 0):+.3f} | "
+                        f"prob_final={signal['confidence']:.3f} | "
+                        f"conf_thresh={_conf_thresh:.3f} → SKIP (below threshold)"
+                    )
                     continue
+
+                _sig_dir_str = "LONG" if signal["direction"] == 1 else "SHORT"
+                log.info(
+                    f"[SIGNAL] {symbol}/{signal.get('entry_tf', entry_tf)}m | "
+                    f"prob_raw={signal.get('prob_raw', 0):.3f} "
+                    f"prob_cal={signal.get('prob_cal', 0):.3f} | "
+                    f"htf={_htf_state} htf_adj={signal.get('htf_adj', 0):+.3f} | "
+                    f"prob_final={signal['confidence']:.3f} | "
+                    f"conf_thresh={_conf_thresh:.3f} → PASS | direction={_sig_dir_str}"
+                )
 
                 # Session time gate — block entries 20:30–01:00 UK time
                 if _is_session_blocked():
@@ -735,12 +806,6 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
 
                 lot = risk_gate.position_size(sl_pips=signal["sl_pips"], symbol=symbol)
 
-                dir_str = "LONG" if signal["direction"] == 1 else "SHORT"
-                log.info(f"SIGNAL [{sid}] ► {symbol} {dir_str} | "
-                         f"conf:{signal['confidence']:.3f} | "
-                         f"TF:{signal['entry_tf']}m HTF:{signal['htf_used']}m | "
-                         f"lot:{lot} | SL:{signal['sl_price']} TP:{signal['tp_price']}")
-
                 if DRY_RUN:
                     log.info(f"  [DRY RUN] Order NOT placed.")
                     continue
@@ -752,6 +817,15 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
                 )
 
                 if result["success"]:
+                    _sl_pts = abs(signal["entry_price"] - signal["sl_price"])
+                    _tp_pts = abs(signal["tp_price"] - signal["entry_price"])
+                    log.info(
+                        f"[TRADE] OPEN  | id={result['ticket']} {symbol} {_sig_dir_str} | "
+                        f"entry={signal['entry_price']} sl={signal['sl_price']} "
+                        f"tp={signal['tp_price']} | "
+                        f"sl_pts={_sl_pts:.1f} tp_pts={_tp_pts:.1f} | "
+                        f"risk=${trade_risk:.0f} | prob={signal['confidence']:.3f}"
+                    )
                     log_trade({
                         "symbol":    symbol, "direction": signal["direction"],
                         "entry":     signal["entry_price"], "sl": signal["sl_price"],

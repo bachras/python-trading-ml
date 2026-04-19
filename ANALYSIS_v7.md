@@ -92,51 +92,68 @@ MT5_DEVIATION_PTS=20
 ```
 [DATA] US30/1m
   rows=86400  start=2022-01-03  end=2024-12-31
-  missing_bars=312  (0.36%)
+  expected_sessions=522  missing_sessions=3 (0.6%)  thin_sessions=2
   duplicate_ts=0
   zero_volume_pct=0.02%
   negative_spread_rows=1841
-  session_coverage=98.7%  (expected 98-100%)
   max_gap_minutes=185  (on 2023-09-04 — Labor Day)
 ```
 | Check | Healthy | ⚠️ Red flag |
 |-------|---------|------------|
 | `rows` | Consistent with date range × bars/session | `< 30,000` for 1–2 year dataset → suspicious; check parquet |
-| `missing_bars` | `< 1%` | `> 3%` → significant gaps; check tick aggregation for that date range |
-| `duplicate_ts` | `0` | `> 0` → **critical**; duplicates produce lookahead in rolling features; deduplicate before training |
+| `missing_sessions` | `< 1%` of expected Mon–Fri sessions | `> 3%` → significant day-level gaps; check data download coverage for those dates |
+| `thin_sessions` | `0–5` | `> 10` → many partial sessions; tick aggregation producing incomplete days |
+| `duplicate_ts` | `0` | `> 0` → **critical**; duplicates produce look-ahead in all rolling features; deduplicate before training |
 | `zero_volume_pct` | `< 0.1%` | `> 1%` → tick data gaps masquerading as bars; check tick pipeline |
-| `negative_spread_rows` | Present but small — expected (Dukascopy raw) | `0` → synthetic spread not being applied (all data paths need it) |
-| `session_coverage` | `98–100%` | `< 95%` → many session days are missing entirely; gap in data download |
-| `max_gap_minutes` | Explainable by known holidays/weekends | `> 240` on a trading day → full session missing; strategy trained on incomplete history |
+| `negative_spread_rows` | Present but manageable — expected (Dukascopy raw bid/ask artefact) | `0` → synthetic spread model may not be reaching bars that need it |
+| `max_gap_minutes` | Explainable by known holidays/weekends | `> 240` on a Mon–Fri non-holiday → full trading session missing; check data download |
 
 **Implementation — add at start of training pipeline in `train.py`:**
 ```python
 def _log_data_integrity(df: pd.DataFrame, symbol: str, tf: int) -> None:
-    n = len(df)
+    n   = len(df)
     idx = df.index
-    expected_bars = pd.date_range(idx[0], idx[-1], freq=f"{tf}min")
-    # Count only bars that fall within session hours (rough proxy)
-    missing = len(expected_bars) - n
-    missing_pct = 100 * missing / max(len(expected_bars), 1)
-    dupes = int(idx.duplicated().sum())
-    zero_vol = 100 * (df["Volume"] == 0).mean() if "Volume" in df.columns else 0.0
-    neg_spread = int((df.get("spread", pd.Series(dtype=float)) < 0).sum())
-    gaps = idx.to_series().diff().dt.total_seconds().div(60).dropna()
-    max_gap = gaps.max()
+
+    # --- Missing session count (meaningful for US30 CFD) ---
+    # Use Mon-Fri calendar days rather than minute-frequency date_range:
+    # raw minute count would always show ~75% "missing" due to overnight/weekend hours.
+    all_dates       = pd.bdate_range(idx[0].date(), idx[-1].date())  # Mon-Fri only
+    dates_in_data   = set(idx.normalize().date)
+    expected_sess   = len(all_dates)
+    missing_sess    = sum(1 for d in all_dates if d.date() not in dates_in_data)
+    # Thin session: day present but < 50% of median bars-per-day
+    bars_per_day    = pd.Series(idx.date).value_counts()
+    median_bars     = bars_per_day.median()
+    thin_sess       = int((bars_per_day < 0.5 * median_bars).sum())
+
+    dupes       = int(idx.duplicated().sum())
+    zero_vol    = 100 * (df["Volume"] == 0).mean() if "Volume" in df.columns else 0.0
+    neg_spread  = int((df.get("spread", pd.Series(dtype=float)) < 0).sum())
+    gaps        = idx.to_series().diff().dt.total_seconds().div(60).dropna()
+    max_gap     = gaps.max()
     max_gap_date = idx[gaps.argmax() + 1].date() if len(gaps) else "N/A"
+
     log.info(
         f"[DATA] {symbol}/{tf}m\n"
         f"  rows={n}  start={idx[0].date()}  end={idx[-1].date()}\n"
-        f"  missing_bars={missing} ({missing_pct:.2f}%)\n"
+        f"  expected_sessions={expected_sess}  "
+        f"missing_sessions={missing_sess} ({100*missing_sess/max(expected_sess,1):.1f}%)  "
+        f"thin_sessions={thin_sess}\n"
         f"  duplicate_ts={dupes}\n"
         f"  zero_volume_pct={zero_vol:.2f}%\n"
         f"  negative_spread_rows={neg_spread}\n"
         f"  max_gap_minutes={max_gap:.0f}  (on {max_gap_date})"
     )
     if dupes > 0:
-        raise ValueError(f"[DATA] ABORT — {dupes} duplicate timestamps in {symbol}/{tf}m. Deduplicate before training.")
-    if missing_pct > 5.0:
-        log.warning(f"[DATA] HIGH missing bar rate ({missing_pct:.1f}%) — results may be unreliable.")
+        raise ValueError(
+            f"[DATA] ABORT — {dupes} duplicate timestamps in {symbol}/{tf}m. "
+            f"Deduplicate before training."
+        )
+    if missing_sess / max(expected_sess, 1) > 0.05:
+        log.warning(
+            f"[DATA] HIGH missing session rate ({missing_sess}/{expected_sess}) — "
+            f"model trained on incomplete history."
+        )
 ```
 
 ---
@@ -255,25 +272,25 @@ def _log_feature_sanity(df: pd.DataFrame, symbol: str, tf: int,
 
 ### 3.7 CLASS BALANCE — `[CLASS]`
 
-**When emitted:** `train.py` immediately after `[LABELS]`, for the selected final label column only (and optionally a sample from the grid).
+**When emitted:** `train.py` right before `[RETRAIN]` begins — after GA/Optuna has selected `best_label_col` but before the final model is trained on it. Logging it here means "selected label" is accurate rather than always showing the default label.
 
-**Why it matters:** TP rate in `[LABELS]` is the raw label balance. After feature-based filtering (e.g., HTF rejection during walk-forward, bars excluded due to ATR spike filter), the actual class balance seen by the model may differ. Extreme imbalance (`< 10%` positives) makes XGBoost/RF default thresholds meaningless and inflates apparent accuracy.
+**Why it matters:** TP rate in `[LABELS]` is the raw label balance over all bars. The class balance at training time may differ after ATR spike filter exclusions and session gate filtering. Extreme imbalance (`< 10%` positives) makes XGBoost/RF default thresholds meaningless and can inflate apparent accuracy while providing no real edge.
 
 ```
 [CLASS] Selected label: target_sl2.5_tp3_be1
-  positives  = 6284  (28.4%)
-  negatives  = 15836 (71.6%)
+  total_bars = 66000  positives = 18744 (28.4%)  negatives = 47256 (71.6%)
   ratio      = 2.51:1 (acceptable)
-[CLASS] Sample grid balance:
-  target_sl1.5_tp1_be0: pos=42.3%  (near-balanced — low tp_mult expected)
-  target_sl3.5_tp5_be2: pos= 8.1%  (skewed — high hurdle; model may underfit)
+  vs [LABELS] raw TP rate: 29.1%  (delta = -0.7% — consistent ✅)
+[CLASS] Grid extremes (for reference):
+  target_sl1.5_tp1_be0: pos=42.3%  (near-balanced, expected for low tp_mult)
+  target_sl3.5_tp5_be2: pos= 8.1%  (skewed, expected for wide TP + BE)
 ```
 | Check | Healthy | ⚠️ Red flag |
 |-------|---------|------------|
-| `positives` pct for selected label | `15%–50%` | `< 10%` → severely imbalanced; XGBoost `scale_pos_weight` should be set | `> 60%` → TP too easy; `sl_atr` probably too wide for the `tp_mult` |
-| Matches `[LABELS]` TP rate | Within ±2% | Large difference → some bars are included in label generation but excluded from features; check pipeline boundary |
-| High `tp_mult` + `be_r=2` columns | Low positives expected (`< 15%`) | `> 30%` for `tp_mult=5, be_r=2` → label computation error; BE should make TP harder |
-| Grid extremes | Wide variation across the 75 columns (tight labels 40%+, wide labels 8%+) | All columns near 25–35% → grid not spanning meaningful different outcomes; check TB_SL_GRID ranges |
+| `positives` pct for selected label | `15%–50%` | `< 10%` → severely imbalanced; XGBoost `scale_pos_weight` needs adjusting | `> 60%` → TP too easy; `sl_atr` probably too wide for the `tp_mult` chosen |
+| Delta vs `[LABELS]` raw TP rate | `< ±3%` | `> ±5%` → ATR filter or session gate removing a biased subset of bars; investigate which bars are excluded |
+| High `tp_mult` + `be_r=2` columns | Low positives expected (`< 15%`) | `> 30%` for `tp_mult=5, be_r=2` → label computation error; BE should make TP harder at high multiples |
+| Grid extremes | Wide variation across 75 columns (tight labels 40%+, wide labels 8%+) | All columns near 25–35% → grid not spanning meaningfully different outcomes; check TB_SL_GRID ranges |
 
 ---
 
@@ -300,12 +317,18 @@ def _log_feature_sanity(df: pd.DataFrame, symbol: str, tf: int,
 
 ### 3.9 WALK-FORWARD FOLDS — `[FOLD]`
 
-**When emitted:** `train.py` after each fold trains, once per fold.
+**When emitted:** `train.py` after each fold trains, once per fold. Add to `train.py` after each fold's XGB and RF are fit:
+```python
+log.info(f"[FOLD] {symbol}/{tf}m fold={fold_idx}/{n_folds} | "
+         f"train_bars={len(train_df)} oos_bars={len(val_df)} | "
+         f"XGB auc={xgb_auc:.3f} RF auc={rf_auc:.3f} | "
+         f"label={label_col} pos_rate={val_df[label_col].mean():.1%}")
+```
 
 ```
-[FOLD] US30/1m fold=0/3 | train_bars=42000 oos_bars=8000 | XGB auc=0.574 RF auc=0.561
-[FOLD] US30/1m fold=1/3 | train_bars=50000 oos_bars=8000 | XGB auc=0.581 RF auc=0.568
-[FOLD] US30/1m fold=2/3 | train_bars=58000 oos_bars=8000 | XGB auc=0.572 RF auc=0.560
+[FOLD] US30/1m fold=0/3 | train_bars=42000 oos_bars=8000 | XGB auc=0.574 RF auc=0.561 | label=target_sl1.5_tp2_be0 pos_rate=28.3%
+[FOLD] US30/1m fold=1/3 | train_bars=50000 oos_bars=8000 | XGB auc=0.581 RF auc=0.568 | label=target_sl1.5_tp2_be0 pos_rate=27.9%
+[FOLD] US30/1m fold=2/3 | train_bars=58000 oos_bars=8000 | XGB auc=0.572 RF auc=0.560 | label=target_sl1.5_tp2_be0 pos_rate=28.8%
 ```
 | Check | Healthy | ⚠️ Red flag |
 |-------|---------|------------|
@@ -313,6 +336,7 @@ def _log_feature_sanity(df: pd.DataFrame, symbol: str, tf: int,
 | `oos_bars` | Roughly equal across folds | Very unequal → dataset boundary issue |
 | XGB/RF AUC | `0.53–0.62` for noisy intraday data | `> 0.65` → likely overfit or leakage; `< 0.52` → model learns nothing; check features |
 | AUC trend across folds | Stable ± 0.02 | Monotonic *decrease* → model degrades on recent data; consider shrinking train window |
+| `pos_rate` per fold | Stable ± 2% across folds | Large variation → class distribution differs by period; most recent fold's balance is what matters for live |
 
 ---
 
@@ -334,7 +358,24 @@ def _log_feature_sanity(df: pd.DataFrame, symbol: str, tf: int,
 
 ### 3.11 PREDICTED PROBABILITY DISTRIBUTION — `[PRED]`
 
-**When emitted:** `train.py` immediately after isotonic calibration is fitted, using the full stacked OOS calibrated probabilities.
+**When emitted:** `train.py` immediately after isotonic calibration is fitted. Add after `calibrator.fit(...)`:
+```python
+cal_probs = calibrator.predict(np.array(oos_probs_all))
+p = np.array(cal_probs)
+conf = best_params.get("confidence_threshold", 0.65)   # from earlier in the flow
+log.info(
+    f"[PRED] {symbol}/{tf}m — OOS calibrated probability distribution (n={len(p)}):\n"
+    f"  mean={p.mean():.3f}  std={p.std():.3f}\n"
+    f"  p10={np.percentile(p,10):.3f}  p25={np.percentile(p,25):.3f}  "
+    f"p50={np.percentile(p,50):.3f}  p75={np.percentile(p,75):.3f}  "
+    f"p90={np.percentile(p,90):.3f}\n"
+    f"  %>{conf:.2f} = {100*(p>conf).mean():.1f}%   "
+    f"  %>0.70 = {100*(p>0.70).mean():.1f}%\n"
+    f"  %<0.30 = {100*(p<0.30).mean():.1f}%"
+)
+shape = "COLLAPSED" if p.std() < 0.04 else ("OVERCONFIDENT" if p.std() > 0.18 else "NORMAL")
+log.info(f"[PRED] shape={shape} (std={p.std():.3f})")
+```
 
 **Why it matters:** Calibration quality (Brier score) tells you if the mapping is accurate. This tells you the *shape* of the prediction distribution — which directly explains optimizer behaviour. A collapsed distribution (all probs near 0.5) means the model has no signal; an overconfident distribution means calibration didn't compress the extremes. Without this, you cannot diagnose why GA picks unusual thresholds or why trade count is off.
 
@@ -588,10 +629,16 @@ When debugging, look for:
 
 ### 3.23 EXPECTED BASELINES SAVED — `[BASELINES]`
 
-**When emitted:** `train.py` after saving to DB.
+**When emitted:** `train.py` immediately after `upsert_strategy()` completes. Add one line:
+```python
+log.info(f"[BASELINES] {symbol}/{tf}m saved to DB: "
+         f"expected_sharpe={params['expected_sharpe']:.3f} "
+         f"expected_win_rate={params['expected_win_rate']:.3f} "
+         f"expected_trades_per_day={params['expected_trades_per_day']:.2f}")
+```
 
 ```
-[BASELINES] US30/1m saved to DB: expected_sharpe=1.92 expected_win_rate=0.58 expected_trades_per_day=3.4
+[BASELINES] US30/1m saved to DB: expected_sharpe=1.920 expected_win_rate=0.580 expected_trades_per_day=3.40
 ```
 | Check | Healthy | ⚠️ Red flag |
 |-------|---------|------------|
@@ -618,7 +665,17 @@ When debugging, look for:
 
 ### 3.25 LIVE SIGNAL — `[SIGNAL]`
 
-**When emitted:** `live.py` every time a signal is evaluated (including rejections).
+**When emitted:** `live.py` every time a signal is evaluated (including rejections). Requires `get_signal()` to return a dict with `prob_raw`, `prob_cal`, `htf_state`, `htf_adj`, `prob_final`, and `direction` — not just the final probability. Add structured logging after the signal decision:
+```python
+sig = get_signal(df, model, calibrator, params)
+action = "PASS" if sig["prob_final"] >= params["confidence_threshold"] else "SKIP"
+log.info(
+    f"[SIGNAL] {symbol}/{tf}m | prob_raw={sig['prob_raw']:.3f} prob_cal={sig['prob_cal']:.3f} | "
+    f"htf={sig['htf_state']} htf_adj={sig['htf_adj']:+.3f} | "
+    f"prob_final={sig['prob_final']:.3f} | conf={params['confidence_threshold']:.3f} → {action}"
+    + (f" | direction={sig['direction']}" if action == "PASS" else "")
+)
+```
 
 ```
 [SIGNAL] US30/1m | prob_raw=0.681 prob_cal=0.664 | htf=BULL htf_adj=+0.028 | prob_final=0.692 | conf_thresh=0.668 → PASS | direction=LONG
@@ -636,6 +693,19 @@ When debugging, look for:
 
 **When emitted:** `live.py` on trade open, BE trigger, and close.
 
+**⚠️ CRITICAL BUG IN CURRENT CODE — fix before paper trading:**
+`_monitor_open_positions()` calls `close_live_trade(ticket, pnl=0.0)` with a hardcoded zero when a position disappears from MT5. This means:
+- Every closed trade is stored in the DB with `pnl=0.0`
+- The kill switch's rolling Sharpe calculation reads these zero values → it is comparing expected Sharpe against a sequence of zeros → kill switch is non-functional as a P&L monitor
+
+**Fix:** Before calling `close_live_trade()`, fetch actual P&L from MT5 deal history:
+```python
+deals = mt5.history_deals_get(position=ticket)
+actual_pnl = sum(d.profit for d in deals) if deals else 0.0
+close_live_trade(ticket, pnl=actual_pnl)
+```
+`history_deals_get(position=ticket)` is a fast, targeted lookup — one API call per close event.
+
 ```
 [TRADE] OPEN  | id=4821 US30 LONG | entry=44821.5 sl=44771.5 tp=44971.5 | sl_pts=50.0 tp_pts=150.0 | risk=$100 | prob=0.692
 [TRADE] BE    | id=4821 | price=44871.5 (+50 pts = +1R) → SL moved to 44822.5
@@ -646,8 +716,9 @@ When debugging, look for:
 | `sl_pts` / `tp_pts` ratio | `tp_pts / sl_pts ≈ tp_mult` from params | Ratio mismatch → SL/TP computation using wrong ATR value |
 | `risk` | Always `$100.00` | Any other value → fixed risk override not working |
 | BE trigger | `+1R` from entry for `be_r=1` | Triggers at wrong price → BE logic using entry_price incorrectly |
-| `reason=TP` rate | Roughly matches label TP rate for the deployed label column | Much lower than label TP rate → live conditions harder (spread, slippage) than backtest; expected but check magnitude |
-| `pnl` for TP | `≈ risk × tp_mult` | Very different → position sizing or TP calculation error |
+| `pnl` for TP | `≈ risk × tp_mult` (e.g., `tp_mult=2` → `pnl ≈ +$200`) | Very different → position sizing or TP calculation error; or pnl=0.0 for all trades → bug above not fixed |
+| `reason=TP` rate over time | Roughly matches `[BASELINES]` expected_win_rate | Much lower → live spread/slippage harder than backtest; expected some gap but > 15% drop needs investigation |
+| `pnl` ever exactly `0.0` on CLOSE | Should not happen after bug fix | All CLOSEs show `pnl=0.0` → `history_deals_get` fix not applied; kill switch is blind |
 
 ---
 
@@ -690,7 +761,8 @@ After the full training log, verify these numbers are internally consistent:
 
 | Cross-check | How to verify |
 |-------------|--------------|
-| `[DATA]` `duplicate_ts=0` | Hard requirement before any other check; duplicates corrupt rolling features |
+| `[DATA]` `duplicate_ts=0` | Hard requirement before any other check; duplicates corrupt rolling features — code raises `ValueError` if non-zero |
+| `[TRADE]` CLOSE `pnl ≠ 0.0` | Confirm `history_deals_get` bug fix was applied; if all CLOSEs show `pnl=0.0`, kill switch Sharpe calculation is computing against zeros → non-functional |
 | `[DATA]` `missing_bars` pct vs `[REGIME]` ATR CV | High missing bars in one period + high ATR CV → that period may be the regime break; check if it's in train or OOS |
 | `[FEATURES]` frozen/exploding → `[IMPORTANCE]` top feature | If a frozen feature (`std ≈ 0`) somehow appears in `[IMPORTANCE]` top-10, that's a sorting/indexing bug |
 | `[CLASS]` positives pct vs `[BASELINES]` expected_win_rate | Should match within ±5%; large gap means the strategy's win rate assumption is wrong at the class level |

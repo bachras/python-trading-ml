@@ -892,10 +892,12 @@ def _select_label_col(sl_atr: float, tp_mult: float, be_r: int = 0) -> str:
     return best_col
 
 
-def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, symbol: str):
+def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, symbol: str,
+               track_stats: bool = False):
     """
     Evaluate genome fitness via quick backtest on validation data.
     Returns (sharpe_ratio,) — DEAP expects a tuple.
+    When track_stats=True (called post-GA on best genome), also returns execution stats dict.
     Each genome picks its own entry_tf; we look up the matching scaler/models.
     """
     params   = decode_genome(genome)
@@ -1009,6 +1011,10 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
     trade_pnls   = []      # (bar_date, pnl_money) for daily equity curve
     skip_until   = -1
 
+    # track_stats accumulators (used when called post-GA for [EXECUTION] log)
+    _ts_spread, _ts_slip, _ts_total_cost = [], [], []
+    _ts_n_signals = _ts_fill_miss = _ts_gap_skip = _ts_delayed = _ts_fills = 0
+
     sl_atr   = params["sl_atr"]
     tp_mult  = params["tp_mult"]
     conf_thr = params["confidence"]
@@ -1027,6 +1033,8 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
         if direction is None:
             continue
 
+        _ts_n_signals += 1
+
         sl_dist = atr[i] * sl_atr
         if sl_dist <= 0 or np.isnan(sl_dist):
             continue
@@ -1038,17 +1046,27 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
         # S1: Fill probability — wide spread relative to SL reduces fill chance
         fill_prob = float(np.clip(1.0 - (spread_cost / (sl_dist + 1e-10)) * 0.5, 0.80, 1.0))
         if rng.random() > fill_prob:
+            _ts_fill_miss += 1
             continue
 
         # E3: Execution latency — 30% of trades fill at next-bar open (MT5 pathway delay).
         # If the open gap exceeds MT5_DEVIATION_PTS the IOC order is rejected, same as live.
+        _delayed_this = False
         if rng.random() < EXEC_DELAY_PROB and i + 1 < len(df) - 1:
+            _ts_delayed += 1
+            _delayed_this = True
             gap_pts = abs(opens[i + 1] - closes[i])
             if gap_pts > MT5_DEVIATION_PTS:
+                _ts_gap_skip += 1
                 continue  # gap exceeds MT5 deviation limit — missed fill
             fill_price = opens[i + 1]
         else:
             fill_price = closes[i]
+
+        _ts_fills += 1
+        _ts_spread.append(spread_cost * 2)   # full spread (cost was half-spread)
+        _ts_slip.append(slip_cost)
+        _ts_total_cost.append(spread_cost + slip_cost)
 
         entry  = fill_price + direction * (spread_cost + slip_cost)
         sl     = entry - direction * sl_dist
@@ -1140,7 +1158,26 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
 
     # ── Final fitness ─────────────────────────────────────────────────
     fitness = sharpe * trade_penalty * max(0.5, 1.0 - cvar_penalty) * quality_penalty
-    return (fitness,)
+
+    if not track_stats:
+        return (fitness,)
+
+    # Build execution stats dict for [EXECUTION] log (only when called post-GA on best genome)
+    n_fills = max(_ts_fills, 1)
+    exec_stats = {
+        "avg_spread":        float(np.mean(_ts_spread))    if _ts_spread  else 0.0,
+        "p50_spread":        float(np.median(_ts_spread))  if _ts_spread  else 0.0,
+        "p95_spread":        float(np.percentile(_ts_spread, 95)) if len(_ts_spread) >= 2 else 0.0,
+        "avg_slip":          float(np.mean(_ts_slip))      if _ts_slip    else 0.0,
+        "p95_slip":          float(np.percentile(_ts_slip, 95))   if len(_ts_slip) >= 2 else 0.0,
+        "fill_rate":         _ts_fills / max(_ts_n_signals, 1),
+        "gap_skip_rate":     _ts_gap_skip / max(_ts_delayed, 1),
+        "delay_rate":        _ts_delayed  / max(_ts_n_signals, 1),
+        "avg_total_cost":    float(np.mean(_ts_total_cost)) if _ts_total_cost else 0.0,
+        "n_signals":         _ts_n_signals,
+        "n_fills":           _ts_fills,
+    }
+    return (fitness, exec_stats)
 
 
 def run_genetic_algo(df_dict: dict, models_by_tf: dict,
@@ -1189,6 +1226,7 @@ def run_genetic_algo(df_dict: dict, models_by_tf: dict,
 
     best = decode_genome(hof[0])
     best["best_score"] = float(hof[0].fitness.values[0])   # fix: GA result now participates fairly in GA-vs-Optuna comparison
+    best["_raw_genome"] = list(hof[0])  # stored for post-GA [EXECUTION] stats call
     log.info(f"  GA best genome: {best}")
     return best
 
@@ -1462,21 +1500,25 @@ def get_signal(symbol: str, params: dict,
     if rf_m is not None:
         p_rf  = float(rf_m.predict_proba(last_feat)[0][1])
 
-    prob = (p_xgb + p_rf) / 2.0
+    prob_raw = (p_xgb + p_rf) / 2.0
 
     # Isotonic calibration: maps raw ensemble prob → actual win rate
     # Fitted on stacked OOS fold predictions in train.py; makes conf threshold meaningful.
     calibrator = scalers_cache.get(f"calibrator_{key}")
+    prob_cal   = prob_raw
     if calibrator is not None:
-        prob = float(calibrator.predict([prob])[0])
+        prob_cal = float(calibrator.predict([prob_raw])[0])
+    prob = prob_cal
 
     # HTF filter: if HTF is bearish and signal is long, reduce confidence
-    htf_dir = df["htf_bullish"].iloc[-1] if "htf_bullish" in df.columns else 0
+    htf_dir    = df["htf_bullish"].iloc[-1] if "htf_bullish" in df.columns else 0
+    prob_before_htf = prob
     if htf_tf > 0 and htf_w > 0:
         if htf_dir == -1 and prob > 0.5:
             prob *= (1 - htf_w * 0.3)
         elif htf_dir == 1 and prob < 0.5:
             prob *= (1 + htf_w * 0.3)
+    htf_adj = round(prob - prob_before_htf, 4)
 
     # Determine direction
     direction = 0
@@ -1486,8 +1528,13 @@ def get_signal(symbol: str, params: dict,
         direction = -1  # short
 
     if direction == 0:
-        return {"direction": 0, "confidence": prob,
-                "reason": f"prob {prob:.3f} below threshold {conf_thr:.3f}"}
+        return {
+            "direction": 0, "confidence": round(prob, 4),
+            "prob_raw":  round(prob_raw, 4), "prob_cal": round(prob_cal, 4),
+            "htf_adj":   htf_adj, "htf_dir": int(htf_dir),
+            "entry_tf":  entry_tf,
+            "reason":    f"prob {prob:.3f} below threshold {conf_thr:.3f}",
+        }
 
     # Compute SL / TP
     last_row = df.iloc[-1]
@@ -1500,6 +1547,10 @@ def get_signal(symbol: str, params: dict,
     return {
         "direction":   direction,
         "confidence":  round(prob, 4),
+        "prob_raw":    round(prob_raw, 4),
+        "prob_cal":    round(prob_cal, 4),
+        "htf_adj":     htf_adj,
+        "htf_dir":     int(htf_dir),
         "entry_price": round(close, 5),
         "sl_price":    round(sl, 5),
         "tp_price":    round(tp, 5),
@@ -1507,7 +1558,6 @@ def get_signal(symbol: str, params: dict,
         "tp_mult":     round(tp_mult, 2),
         "entry_tf":    entry_tf,
         "htf_used":    htf_tf,
-        "htf_dir":     int(htf_dir),
         "reason":      "signal confirmed",
     }
 

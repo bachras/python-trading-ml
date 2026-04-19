@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import roc_auc_score
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -71,6 +72,7 @@ from phase2_adaptive_engine import (
     get_feature_cols, fit_scaler, apply_scaler,
     train_ensemble,
     run_genetic_algo, run_optuna, run_per_tf_optimization,
+    ga_fitness,
     save_params, load_params,
     _select_label_col, _check_leakage,
     INSTRUMENTS, PARAM_SEEDS, HARD_LIMITS,
@@ -213,6 +215,91 @@ def _spa_bootstrap_test(pnls: list, n_boot: int = 2000) -> float:
     rng = np.random.default_rng(42)
     boot_means = rng.choice(arr_c, size=(n_boot, len(arr)), replace=True).mean(axis=1)
     return float((boot_means >= actual_mean).mean())
+
+
+def _log_data_integrity(df: pd.DataFrame, symbol: str, tf: int) -> None:
+    """
+    [DATA] — log bar count, duplicate timestamps, zero volume, session gaps.
+    Uses missing_sessions (Mon-Fri days with zero bars) and thin_sessions
+    (days with < 50% of the median daily bar count) instead of raw minute counts.
+    Raises RuntimeError on duplicate timestamps — duplicates corrupt rolling features.
+    """
+    idx  = df.index
+    n    = len(df)
+    dupes = int(idx.duplicated().sum())
+
+    # Gap analysis
+    gaps_min = idx.to_series().diff().dt.total_seconds().div(60).dropna()
+    max_gap  = float(gaps_min.max()) if len(gaps_min) else 0.0
+    max_gap_date = idx[gaps_min.argmax() + 1].date() if len(gaps_min) else "N/A"
+
+    # Session analysis using bdate_range (Mon-Fri) — avoids false "missing" from overnight hours
+    all_bdates     = pd.bdate_range(idx[0].date(), idx[-1].date())
+    expected_sess  = len(all_bdates)
+    dates_in_data  = set(idx.normalize().date)
+    missing_sess   = sum(1 for d in all_bdates if d.date() not in dates_in_data)
+    bars_per_day   = pd.Series(idx.date).value_counts()
+    median_bars    = bars_per_day.median()
+    thin_sess      = int((bars_per_day < 0.5 * median_bars).sum())
+
+    # Quality metrics
+    zero_vol_pct = 100.0 * (df["Volume"] == 0).mean() if "Volume" in df.columns else 0.0
+    _spread_col  = df.get("spread_mean", df.get("spread", pd.Series(dtype=float)))
+    neg_spread   = int((_spread_col < 0).sum())
+
+    log.info(
+        f"[DATA] {symbol}/{tf}m\n"
+        f"  rows={n}  start={idx[0].date()}  end={idx[-1].date()}\n"
+        f"  expected_sessions={expected_sess}  "
+        f"missing_sessions={missing_sess} ({100*missing_sess/max(expected_sess,1):.1f}%)  "
+        f"thin_sessions={thin_sess}\n"
+        f"  duplicate_ts={dupes}\n"
+        f"  zero_volume_pct={zero_vol_pct:.2f}%\n"
+        f"  negative_spread_rows={neg_spread}\n"
+        f"  max_gap_minutes={max_gap:.0f}  (on {max_gap_date})"
+    )
+    if dupes > 0:
+        raise ValueError(
+            f"[DATA] ABORT — {dupes} duplicate timestamps in {symbol}/{tf}m. "
+            f"Deduplicate before training."
+        )
+    if missing_sess / max(expected_sess, 1) > 0.05:
+        log.warning(
+            f"[DATA] HIGH missing session rate ({missing_sess}/{expected_sess}) — "
+            f"model trained on incomplete history."
+        )
+
+
+def _log_feature_sanity(df: pd.DataFrame, symbol: str, tf: int, n_top: int = 10) -> None:
+    """[FEATURES] — distribution sanity: frozen (std≈0) and exploding (p99>1000 or high NaN)."""
+    feat_cols = get_feature_cols(df)
+    if not feat_cols:
+        return
+    sub = df[feat_cols]
+    means    = sub.mean()
+    stds     = sub.std()
+    p1s      = sub.quantile(0.01)
+    p99s     = sub.quantile(0.99)
+    nan_cnts = sub.isna().sum()
+
+    frozen    = [c for c in feat_cols if stds[c] < 0.01]
+    exploding = [c for c in feat_cols if abs(p99s[c]) > 1000 or nan_cnts[c] > len(df) * 0.001]
+
+    log.info(f"[FEATURES] {symbol}/{tf}m distribution sanity ({len(feat_cols)} features, {len(df)} bars):")
+    top_cols = p99s.abs().nlargest(n_top).index
+    for col in top_cols:
+        log.info(
+            f"  {col:<28}: mean={means[col]:+.2f}  std={stds[col]:.2f}"
+            f"  p1={p1s[col]:+.2f}  p99={p99s[col]:+.2f}  nan={int(nan_cnts[col])}"
+        )
+    if frozen:
+        log.warning(f"[FEATURES] FROZEN features (std < 0.01): {frozen}")
+    else:
+        log.info("[FEATURES] Frozen features: none")
+    if exploding:
+        log.warning(f"[FEATURES] EXPLODING/HIGH-NAN features: {exploding}")
+    else:
+        log.info("[FEATURES] Exploding features: none")
 
 
 def _compute_fold_regime_stats(df_fold: pd.DataFrame) -> dict:
@@ -414,6 +501,12 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             n         = len(df)
             feat_cols = get_feature_cols(df)
 
+            # [DATA] — data integrity check before any feature computation
+            _log_data_integrity(df, symbol, tf)
+
+            # [FEATURES] — distribution sanity after features are loaded
+            _log_feature_sanity(df, symbol, tf)
+
             # ── 3A: Label TP rate summary ──────────────────────────────────
             # Verify the 75-column label grid has sensible class balance.
             # TP rate should decrease with tp_mult; be=1/2 should be ≤ be=0 for tp ≥ 2.
@@ -458,6 +551,7 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             oos_probs_all   = []   # stacked OOS ensemble probs for calibration
             oos_labels_all  = []
             oos_atr_all     = []   # E2: ATR per OOS bar for calibration stability check
+            fold_top10_sets = []   # [IMPORTANCE] cross-fold Jaccard tracking
             for fold_num, (train_df, val_df, oos_label) in enumerate(folds, 1):
                 log.info(f"    Fold {fold_num}/{len(folds)} | OOS={oos_label} | "
                          f"train={len(train_df):,} val={len(val_df):,}")
@@ -483,14 +577,49 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 xgb_fold, rf_fold = train_ensemble(train_s, val_s, feat_cols, symbol, tf)
                 X_val = val_s[feat_cols].values
                 y_val = val_df["target"].values
-                fold_xgb_scores.append((xgb_fold.predict(X_val) == y_val).mean())
-                fold_rf_scores.append( (rf_fold.predict(X_val)  == y_val).mean())
 
                 # Collect OOS ensemble probs for isotonic calibration
                 p_xgb_oos = xgb_fold.predict_proba(X_val)[:, 1]
                 p_rf_oos  = rf_fold.predict_proba(X_val)[:, 1]
                 oos_probs_all.extend(((p_xgb_oos + p_rf_oos) / 2.0).tolist())
                 oos_labels_all.extend(y_val.tolist())
+
+                # [FOLD] AUC per fold
+                try:
+                    xgb_auc = roc_auc_score(y_val, p_xgb_oos) if len(np.unique(y_val)) > 1 else 0.5
+                    rf_auc  = roc_auc_score(y_val, p_rf_oos)  if len(np.unique(y_val)) > 1 else 0.5
+                except Exception:
+                    xgb_auc = rf_auc = 0.5
+                fold_xgb_scores.append(xgb_auc)
+                fold_rf_scores.append(rf_auc)
+                label_col_fold = next(
+                    (c for c in val_df.columns if c.startswith("target_sl")), "target"
+                )
+                pos_rate = float(val_df[label_col_fold].mean()) if label_col_fold in val_df.columns else float(y_val.mean())
+                log.info(
+                    f"    [FOLD] {symbol}/{tf}m fold={fold_num}/{len(folds)} | "
+                    f"train_bars={len(train_df)} oos_bars={len(val_df)} | "
+                    f"XGB auc={xgb_auc:.3f} RF auc={rf_auc:.3f} | "
+                    f"label={label_col_fold} pos_rate={pos_rate:.1%}"
+                )
+
+                # [IMPORTANCE] per-fold XGB feature importance
+                try:
+                    imp = xgb_fold.feature_importances_
+                    top10_idx  = np.argsort(imp)[::-1][:10]
+                    top10_cols = [feat_cols[i] for i in top10_idx]
+                    fold_top10_sets.append(set(top10_cols))
+                    log.info(f"    [IMPORTANCE] {symbol}/{tf}m fold={fold_num} (XGB gain, top 10):")
+                    for rank_i, (ci, col) in enumerate(zip(top10_idx, top10_cols), 1):
+                        log.info(f"      {rank_i:2}. {col:<28} {imp[ci]:.4f}")
+                    if imp[top10_idx[0]] > 0.40:
+                        log.warning(
+                            f"    [IMPORTANCE] Top feature dominates ({imp[top10_idx[0]]:.3f} > 0.40) "
+                            f"— potential leakage: {top10_cols[0]}"
+                        )
+                except Exception as _ie:
+                    log.debug(f"    [IMPORTANCE] Could not log importance fold {fold_num}: {_ie}")
+
                 # E2: collect unscaled ATR for calibration stability binning
                 if "atr14" in val_df.columns:
                     oos_atr_all.extend(val_df["atr14"].tolist())
@@ -516,10 +645,34 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                             f"corr={corr:.3f}, disagree>{10}%={disagree:.1%}"
                         )
 
-            # Log cross-fold OOS accuracy summary
-            log.info(f"  {symbol} {tf}m walk-forward OOS accuracy | "
+            # Log cross-fold OOS AUC summary
+            log.info(f"  {symbol} {tf}m walk-forward OOS AUC | "
                      f"XGB: {np.mean(fold_xgb_scores):.3f} ± {np.std(fold_xgb_scores):.3f} | "
                      f"RF: {np.mean(fold_rf_scores):.3f} ± {np.std(fold_rf_scores):.3f}")
+
+            # [IMPORTANCE] cross-fold Jaccard similarity
+            if len(fold_top10_sets) >= 2:
+                jaccards = []
+                jaccard_parts = []
+                for i in range(len(fold_top10_sets) - 1):
+                    a, b = fold_top10_sets[i], fold_top10_sets[i + 1]
+                    j = len(a & b) / max(len(a | b), 1)
+                    jaccards.append(j)
+                    jaccard_parts.append(f"fold{i}↔{i+1}={j:.2f}")
+                avg_j = float(np.mean(jaccards))
+                j_tag = "OK" if avg_j >= 0.60 else "LOW — model uses different features per fold"
+                log.info(
+                    f"  [IMPORTANCE] {symbol}/{tf}m cross-fold Jaccard: "
+                    f"{', '.join(jaccard_parts)}, avg={avg_j:.2f} ({j_tag})"
+                )
+                # Log consistent top-3 across all folds
+                consistent = fold_top10_sets[0].copy()
+                for s in fold_top10_sets[1:]:
+                    consistent &= s
+                if consistent:
+                    log.info(
+                        f"  [IMPORTANCE] Consistent across all folds: {sorted(consistent)}"
+                    )
 
             # Fit isotonic calibrator on all stacked OOS predictions
             # Makes confidence threshold meaningful: calibrated prob ≈ actual win rate
@@ -571,6 +724,31 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                             )
                         except Exception as _cs_e:
                             log.warning(f"  [CAL-STABILITY] Could not run: {_cs_e}")
+
+                    # [PRED] — OOS calibrated probability distribution
+                    try:
+                        p = cal_probs
+                        p_std = float(p.std())
+                        shape = (
+                            "COLLAPSED" if p_std < 0.04 else
+                            "OVERCONFIDENT" if p_std > 0.18 else "NORMAL"
+                        )
+                        log.info(
+                            f"  [PRED] {key} — OOS calibrated probability distribution "
+                            f"(n={len(p)}):\n"
+                            f"    mean={p.mean():.3f}  std={p_std:.3f}\n"
+                            f"    p10={np.percentile(p,10):.3f}  p25={np.percentile(p,25):.3f}  "
+                            f"p50={np.percentile(p,50):.3f}  p75={np.percentile(p,75):.3f}  "
+                            f"p90={np.percentile(p,90):.3f}\n"
+                            f"    %>0.70={100*(p>0.70).mean():.1f}%  "
+                            f"  %>0.65={100*(p>0.65).mean():.1f}%  "
+                            f"  %>0.60={100*(p>0.60).mean():.1f}%\n"
+                            f"    %<0.30={100*(p<0.30).mean():.1f}%\n"
+                            f"  [PRED] shape={shape} (std={p_std:.3f})"
+                        )
+                    except Exception as _pe:
+                        log.debug(f"  [PRED] Could not compute distribution: {_pe}")
+
                 except Exception as _cal_e:
                     log.warning(f"  [CALIBRATION] Could not compute calibration curve: {_cal_e}")
 
@@ -797,6 +975,19 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     ) if stats["n_trades"] > 0 and not bt["equity_df"].empty else None,
                     "is_active":        0,
                 })
+                # [BASELINES] — confirm what was saved to DB for kill switch
+                _etpd = (
+                    round(stats["n_trades"] / max(
+                        (bt["equity_df"].index[-1] - bt["equity_df"].index[0]).days
+                        * (252 / 365) if not bt["equity_df"].empty else 252, 1
+                    ), 2) if stats["n_trades"] > 0 and not bt["equity_df"].empty else 0.0
+                )
+                log.info(
+                    f"  [BASELINES] {strategy_id} saved to DB: "
+                    f"expected_sharpe={trial['sharpe']:.3f} "
+                    f"expected_win_rate={stats['win_rate']/100:.3f} "
+                    f"expected_trades_per_day={_etpd:.2f}"
+                )
                 if not bt["equity_df"].empty:
                     save_equity_curve(strategy_id, bt["equity_df"])
                 if bt["monthly_pnl"]:
@@ -821,6 +1012,106 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     "robust":    "Y" if sens.get("robust") else "N",
                     "spa":       f"{spa_p:.3f}" if spa_p is not None else "n/a",
                 })
+
+            # [EXECUTION] — market realism stats using best rank-1 genome
+            if top_trials and _sens_models_ok:
+                try:
+                    _r1_params = top_trials[0]["params"]
+                    _tf_idx  = PARAM_SEEDS["entry_tf_options"].index(_r1_params["entry_tf"])
+                    _htf_idx = PARAM_SEEDS["htf_options"].index(_r1_params["htf_tf"])
+                    _be_idx  = PARAM_SEEDS["be_r_options"].index(_r1_params.get("be_r", 0))
+                    _genome  = [
+                        _tf_idx, _htf_idx,
+                        _r1_params["sl_atr"], _r1_params["tp_mult"],
+                        _r1_params["confidence"], _r1_params["htf_weight"],
+                        _be_idx,
+                    ]
+                    _exec_result = ga_fitness(
+                        _genome, tf_feat, models_cache, scalers_cache,
+                        symbol, track_stats=True,
+                    )
+                    if len(_exec_result) == 2:
+                        _, _es = _exec_result
+                        log.info(
+                            f"  [EXECUTION] {symbol}/{tf}m — market realism summary "
+                            f"(rank-1 genome, n_fills={_es['n_fills']}):\n"
+                            f"    avg_spread={_es['avg_spread']:.2f} pts  "
+                            f"p50={_es['p50_spread']:.2f}  p95={_es['p95_spread']:.2f}\n"
+                            f"    avg_slippage={_es['avg_slip']:.2f} pts  "
+                            f"p95={_es['p95_slip']:.2f}\n"
+                            f"    fill_rate={_es['fill_rate']:.1%}  "
+                            f"gap_skip_rate={_es['gap_skip_rate']:.1%}  "
+                            f"delay_rate={_es['delay_rate']:.1%}\n"
+                            f"    avg_total_cost={_es['avg_total_cost']:.2f} pts per trade"
+                        )
+                        if _es["avg_spread"] < 0.5:
+                            log.warning(
+                                f"  [EXECUTION] avg_spread < 0.5 pts — spread model may not be active; "
+                                f"check SPREAD_BASE_PTS in .env"
+                            )
+                        if _es["fill_rate"] < 0.60:
+                            log.warning(
+                                f"  [EXECUTION] fill_rate={_es['fill_rate']:.1%} < 60% — "
+                                f"very selective; check spread vs SL distance"
+                            )
+                except Exception as _ee:
+                    log.warning(f"  [EXECUTION] Could not compute execution stats: {_ee}")
+
+            # [CLASS] — class balance of selected label, logged right before retrain
+            if top_trials and tf_feat.get(tf) is not None:
+                _r1p = top_trials[0]["params"]
+                _best_lbl = _select_label_col(
+                    _r1p["sl_atr"], _r1p["tp_mult"], _r1p.get("be_r", 0)
+                )
+                _df_cls = tf_feat[tf]
+                if _best_lbl in _df_cls.columns:
+                    _cls_vals = _df_cls[_best_lbl].dropna()
+                    _pos = int(_cls_vals.sum())
+                    _neg = int(len(_cls_vals) - _pos)
+                    _pos_pct = 100.0 * _pos / max(len(_cls_vals), 1)
+                    _ratio = _neg / max(_pos, 1)
+                    _ratio_tag = "acceptable" if 1.2 <= _ratio <= 6.0 else "WARNING: extreme"
+                    # Delta vs raw TP rate from [LABELS] block (full-dataset mean before any filtering)
+                    _raw_tp_rate = 100.0 * float(_df_cls[_best_lbl].mean())
+                    _delta = _pos_pct - _raw_tp_rate
+                    _delta_tag = "consistent ✅" if abs(_delta) <= 3.0 else "WARN: filter bias ⚠️"
+                    log.info(
+                        f"  [CLASS] Selected label: {_best_lbl}\n"
+                        f"    total_bars={len(_cls_vals)}  positives={_pos} ({_pos_pct:.1f}%)  "
+                        f"negatives={_neg} ({100-_pos_pct:.1f}%)\n"
+                        f"    ratio={_ratio:.2f}:1 ({_ratio_tag})\n"
+                        f"    vs [LABELS] raw TP rate: {_raw_tp_rate:.1f}%  "
+                        f"(delta = {_delta:+.1f}% — {_delta_tag})"
+                    )
+                    if abs(_delta) > 5.0:
+                        log.warning(
+                            f"  [CLASS] Large delta ({_delta:+.1f}%) vs [LABELS] raw TP rate — "
+                            f"ATR spike filter or session gate removing biased bar subset"
+                        )
+                    if _pos_pct < 10.0:
+                        log.warning(
+                            f"  [CLASS] Severely imbalanced ({_pos_pct:.1f}% positives) — "
+                            f"XGBoost scale_pos_weight may need adjustment"
+                        )
+                    elif _pos_pct > 60.0:
+                        log.warning(
+                            f"  [CLASS] High positive rate ({_pos_pct:.1f}%) — "
+                            f"TP too easy; check sl_atr vs tp_mult combination"
+                        )
+                    # Grid extremes — widest and tightest label for reference
+                    _target_cols = [c for c in _df_cls.columns if c.startswith("target_sl")]
+                    if _target_cols:
+                        _tp_map = {c: float(_df_cls[c].mean()) for c in _target_cols if _df_cls[c].notna().any()}
+                        if _tp_map:
+                            _max_col = max(_tp_map, key=_tp_map.get)
+                            _min_col = min(_tp_map, key=_tp_map.get)
+                            log.info(
+                                f"  [CLASS] Grid extremes:\n"
+                                f"    {_max_col}: pos={_tp_map[_max_col]:.1%}  "
+                                f"(near-balanced, expected for low tp_mult)\n"
+                                f"    {_min_col}: pos={_tp_map[_min_col]:.1%}  "
+                                f"(skewed, expected for wide TP + BE)"
+                            )
 
             # ── Retrain rank-1 final model on its best-matching label ─────────
             # The walk-forward folds and optimizer used the default be=0 label.
