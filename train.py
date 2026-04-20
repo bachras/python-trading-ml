@@ -172,9 +172,19 @@ def _check_feature_parity(symbol: str, tf: int, train_df: pd.DataFrame) -> None:
         l_vals = np.nan_to_num(l_vals, nan=0.0)
         diff   = np.abs(t_vals - l_vals)
 
-        max_diff      = float(diff.max())
-        worst_col_idx = int(diff.max(axis=0).argmax())
-        worst_col     = common_cols[worst_col_idx]
+        # obv_norm is a cumulative sum over the full history. When re-run on a
+        # 2000-row tail slice the cumulative baseline shifts by a large constant C.
+        # The z-score formula cancels C algebraically but float64 loses precision
+        # (C ~ 2e8 for 2.1M bars), causing diff ~ 0.007. This is pure floating-point
+        # noise, not a real pipeline divergence — exclude from the strict threshold.
+        _PATH_DEPENDENT = {"obv_norm"}
+        strict_mask  = np.array([c not in _PATH_DEPENDENT for c in common_cols])
+        diff_strict  = diff[:, strict_mask]
+        strict_cols  = [c for c, m in zip(common_cols, strict_mask) if m]
+
+        max_diff      = float(diff_strict.max()) if diff_strict.size else 0.0
+        worst_col_idx = int(diff_strict.max(axis=0).argmax()) if diff_strict.size else 0
+        worst_col     = strict_cols[worst_col_idx] if strict_cols else "n/a"
 
         log.info(f"  [PARITY] {symbol} {tf}m: max_diff={max_diff:.2e}, "
                  f"mean_diff={float(diff.mean()):.2e}, worst_feature={worst_col}")
@@ -288,8 +298,9 @@ def _log_feature_sanity(df: pd.DataFrame, symbol: str, tf: int, n_top: int = 10)
     nan_cnts = sub.isna().sum()
 
     # Pct/ratio/return features legitimately have absolute std << 0.01
-    # (e.g. ret1 ~ 0.0001 for US30). Exclude them from FROZEN check.
-    _small_ok = ("ret", "logr", "_pct", "dist", "htf_bull", "htf_str", "co_pct", "hl_pct")
+    # (e.g. ret1 ~ 0.0001 for US30, p_vs_21 ~ 0.001, bb_w ~ 0.005). Exclude from FROZEN.
+    _small_ok = ("ret", "logr", "_pct", "dist", "htf_bull", "htf_str",
+                 "co_pct", "hl_pct", "r_lag", "_vs_", "bb_w")
     frozen    = [c for c in feat_cols
                  if stds[c] < 0.01 and not any(c.startswith(p) or p in c for p in _small_ok)]
     # Raw price-level features (EMAs, VWAP) have p99 ~ 50 000 for US30 — not bugs.

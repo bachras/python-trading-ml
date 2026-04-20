@@ -125,12 +125,15 @@ def add_vwap_features(df: pd.DataFrame) -> pd.DataFrame:
     d["vwap_anch_dist_pct"] = (c - d["vwap_anchored"]) / (d["vwap_anchored"] + 1e-10)
 
     # ── VWAP reclaim / rejection signals ─────────────────
-    # 1 = price crossed above VWAP this bar (bullish reclaim)
-    # -1 = price crossed below VWAP (bearish rejection)
-    # 0 = no cross
+    # vwap_crossed: crossing EVENT this bar
+    #   +1 = crossed above VWAP (bullish reclaim)
+    #   -1 = crossed below VWAP (bearish rejection)
+    #    0 = no cross
+    # Named "vwap_crossed" (not "vwap_cross") to avoid collision with
+    # tick_pipeline's vwap_cross = np.sign(vwap_dist) (position above/below).
     above_now  = (c >= d["vwap_session"]).astype(int)
     above_prev = above_now.shift(1)
-    d["vwap_cross"] = (above_now - above_prev).fillna(0).astype(int)
+    d["vwap_crossed"] = (above_now - above_prev).fillna(0).astype(int)
 
     return d
 
