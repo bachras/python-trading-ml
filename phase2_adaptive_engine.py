@@ -239,10 +239,20 @@ MT5_DEVIATION_PTS = float(os.getenv("MT5_DEVIATION_PTS",  "30"))
 # These are whitelisted for the leakage check — training proceeds with a WARNING
 # rather than RuntimeError. Remediation (backward-only swing detection) is L3.
 KNOWN_LOOKAHEAD_FEATURES = frozenset({
+    # Swing detection: N-bar symmetric lookback — needs N future bars to confirm a pivot.
+    # Accepted: the approximation is valid during live trading where full context exists.
     "is_swing_high", "is_swing_low",
     "dist_swing_high", "dist_swing_low",
     "equal_high", "equal_low",
     "stop_hunt_up", "stop_hunt_down",
+    # ORB: opening-range value is broadcast to ALL session bars (inc. pre-market).
+    # When the leakage pivot falls before NYSE open, the opening bars are "future",
+    # so shuffling them changes the ORB for pre-pivot pre-market bars of that session.
+    # Accepted: ORB is a session constant known to all participants by 9:35 AM ET;
+    # the model only acts on it during regular-hours trading, not pre-market.
+    "orb_high", "orb_low", "orb_range",
+    "orb_dist_high", "orb_dist_low",
+    "orb_above", "orb_below", "orb_inside",
 })
 
 
