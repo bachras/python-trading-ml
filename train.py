@@ -523,6 +523,18 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     continue
 
             df        = tf_feat[tf]
+
+            # Exclude Dec 24–Jan 3 (Christmas/New Year illiquidity).
+            # Live trading blocks entries in this window, so training on it
+            # would teach the model patterns it will never trade.
+            _xmas = ((df.index.month == 12) & (df.index.day >= 24)) | \
+                    ((df.index.month == 1)  & (df.index.day <= 3))
+            if _xmas.any():
+                _n_before = len(df)
+                df = df[~_xmas]
+                log.info(f"  [DATA] Christmas filter: removed {_n_before - len(df):,} bars "
+                         f"(Dec 24–Jan 3) → {len(df):,} bars remain")
+
             n         = len(df)
             feat_cols = get_feature_cols(df)
 

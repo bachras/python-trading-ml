@@ -709,6 +709,14 @@ def _check_leakage(symbol: str, tf: int, df: pd.DataFrame) -> None:
         log.warning(f"[LEAKAGE] {symbol}/{tf}m: too few rows ({len(df)}) to check — skipping")
         return
 
+    # Avoid OOM on 1m (2.1M rows). The leakage check only needs a representative
+    # window: ~1500 warm-up rows before the pivot + ~1500 future rows to shuffle.
+    # Slice to the midpoint of the full dataset so features are well warmed-up.
+    LEAKAGE_WINDOW = 3000
+    if len(df) > LEAKAGE_WINDOW:
+        mid = len(df) // 2
+        df  = df.iloc[mid - LEAKAGE_WINDOW // 2 : mid + LEAKAGE_WINDOW // 2]
+
     pivot = max(100, len(df) // 2)
     # Rows before pivot: these are the "safe" region we compare
     check_slice = slice(pivot - 50, pivot)

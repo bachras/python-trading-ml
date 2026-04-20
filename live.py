@@ -161,6 +161,23 @@ def _our_london_time(dt_utc: datetime) -> datetime:
     return london_wall
 
 
+def _is_christmas_blocked(ts: datetime | None = None) -> bool:
+    """
+    Block entries Dec 24 – Jan 3 inclusive (Our London Time calendar date).
+
+    US30 trades on severely reduced liquidity over the Christmas–New Year window.
+    Live trading is suspended entirely; training also excludes these bars so the
+    model is never trained on data it will never be asked to trade.
+    """
+    if ts is None:
+        ts = datetime.now(tz=timezone.utc)
+    elif getattr(ts, "tzinfo", None) is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    olt  = _our_london_time(ts)
+    m, d = olt.month, olt.day
+    return (m == 12 and d >= 24) or (m == 1 and d <= 3)
+
+
 def _is_session_blocked(ts: datetime | None = None) -> bool:
     """
     Return True if the current time falls in the blocked session:
@@ -795,7 +812,12 @@ def run_live_loop(models_cache: dict, scalers_cache: dict, all_data: dict):
                     f"conf_thresh={_conf_thresh:.3f} → PASS | direction={_sig_dir_str}"
                 )
 
-                # Session time gate — block entries 20:30–01:00 UK time
+                # Christmas / New Year gate — Dec 24 to Jan 3 inclusive
+                if _is_christmas_blocked():
+                    log.info(f"[SESSION] {sid}: Christmas period — no new entries (Dec 24–Jan 3)")
+                    continue
+
+                # Session time gate — block entries 20:30–01:00 Our London Time
                 if _is_session_blocked():
                     log.debug(f"{sid}: blocked by session gate (20:30-01:00 UK)")
                     continue
