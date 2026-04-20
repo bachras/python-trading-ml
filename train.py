@@ -187,15 +187,25 @@ def _check_feature_parity(symbol: str, tf: int, train_df: pd.DataFrame) -> None:
         # noise, not a real pipeline divergence — exclude from the strict threshold.
         # Features excluded from strict parity threshold — all are boundary/path artifacts
         # of the 2000-row tail slice and compute correctly during live trading:
-        #   obv_norm       : cumsum over full history (float64 catastrophic cancellation on offset C~2e8)
-        #   hv20_pct       : rolling(252).rank(pct=True) — rank depends on local window distribution
-        #   is_swing_*/dist_swing_*/equal_*/stop_hunt_*/stop_hunt : swing-point detection
-        #                    uses N-bar symmetric lookback; boundary bars (first/last N rows of the
-        #                    slice) can't be confirmed, and rolling(100) over swing prices propagates
-        #                    the difference into distance/equal-level/stop-hunt features
+        #
+        #   obv_norm          : cumsum over full history (float64 catastrophic cancellation on C~2e8)
+        #
+        #   hv20_pct          : rolling(252).rank(pct=True) — rank shifts with window distribution
+        #   regime_high_vol   : hv20_pct > 0.75  (direct binary derivative)
+        #   regime            : labels 0/1 depend on is_high_vol/is_low_vol → hv20_pct
+        #   regime_sin/cos    : cyclical encoding of regime → also hv20_pct-dependent
+        #
+        #   is_swing_*/dist_swing_*/equal_*/stop_hunt_* : swing-point detection chain
+        #                       N-bar symmetric lookback; boundary bars at slice edges
+        #                       can't be confirmed, and rolling(100) over sparse swing
+        #                       prices propagates the difference into all derived features
         _PATH_DEPENDENT = {
             "obv_norm",
+            # hv20_pct and all features that encode it
             "hv20_pct",
+            "regime_high_vol",
+            "regime", "regime_sin", "regime_cos",
+            # swing-point detection chain
             "is_swing_high", "is_swing_low",
             "dist_swing_high", "dist_swing_low",
             "equal_high", "equal_low",
