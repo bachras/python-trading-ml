@@ -38,7 +38,7 @@ warnings.filterwarnings("ignore", message=".*Converting sparse.*", category=User
 
 import argparse
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -123,23 +123,58 @@ log.info(
 )
 
 _LONDON_TZ = ZoneInfo("Europe/London")
+_NY_TZ     = ZoneInfo("America/New_York")
+
+
+def _is_us_london_mismatch(dt_utc: datetime) -> bool:
+    """
+    True during the ~4 weeks/year when US and UK DST transitions don't align:
+      Spring: 2nd Sunday of March (US springs forward) → last Sunday of March (UK springs forward)
+      Autumn: last Sunday of October (UK falls back) → 1st Sunday of November (US falls back)
+
+    During these windows London is UTC+0 and NY is UTC-4, so the gap is 4 h
+    instead of the normal 5 h. NYSE events shift by 1 h on the raw London clock.
+    """
+    london_off = dt_utc.astimezone(_LONDON_TZ).utcoffset()
+    ny_off     = dt_utc.astimezone(_NY_TZ).utcoffset()
+    return (london_off - ny_off) == timedelta(hours=4)
+
+
+def _our_london_time(dt_utc: datetime) -> datetime:
+    """
+    'Our London Time' = London wall clock + mismatch bump.
+
+    Adds +1 h only when:
+      - the US/UK DST mismatch is active, AND
+      - the London wall-clock hour is between 12 and 20 inclusive
+
+    This keeps all US market events (NFP, FOMC, CPI …) at a consistent
+    'Our London Time' throughout the year regardless of the 4-week mismatch
+    windows. Use this for the session gate and any future event-time comparisons.
+
+    ML features (is_london, uk_hour, hour_sin …) intentionally use plain London
+    wall clock so training and live feature values remain identical.
+    """
+    london_wall = dt_utc.astimezone(_LONDON_TZ)
+    if _is_us_london_mismatch(dt_utc) and 12 <= london_wall.hour <= 20:
+        london_wall = london_wall + timedelta(hours=1)
+    return london_wall
 
 
 def _is_session_blocked(ts: datetime | None = None) -> bool:
     """
     Return True if the current time falls in the blocked session:
-    20:30 – 01:00 UK time (London timezone, DST-correct).
+    20:30 – 01:00 in 'Our London Time' (London wall + mismatch bump).
 
-    Covers illiquid post-NYSE-close overnight hours for US30.
-    No entries are placed in this window.
+    Using 'Our London Time' ensures the gate always fires at the same time
+    relative to NYSE close regardless of the US/UK DST mismatch weeks.
     """
     if ts is None:
-        ts = datetime.now(tz=_LONDON_TZ)
+        ts = datetime.now(tz=timezone.utc)
     elif getattr(ts, "tzinfo", None) is None:
-        ts = ts.replace(tzinfo=_LONDON_TZ)
-    else:
-        ts = ts.astimezone(_LONDON_TZ)
-    h, m = ts.hour, ts.minute
+        ts = ts.replace(tzinfo=timezone.utc)
+    olt   = _our_london_time(ts)
+    h, m  = olt.hour, olt.minute
     after_2030  = (h == 20 and m >= 30) or h >= 21
     before_0100 = (h == 0) or (h == 1 and m == 0)
     return after_2030 or before_0100

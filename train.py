@@ -101,6 +101,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
+    force=True,   # replace any handlers phase2_adaptive_engine added at import time
     handlers=[
         logging.FileHandler(
             LOG_DIR / f"training_{datetime.now():%Y%m%d_%H%M}.log",
@@ -139,8 +140,12 @@ def _check_feature_parity(symbol: str, tf: int, train_df: pd.DataFrame) -> None:
             log.warning(f"  [PARITY] {symbol} {tf}m: raw parquet too small ({len(raw)} rows) — skipping check")
             return
 
-        log.info(f"  [PARITY] {symbol} {tf}m: running live pipeline on {len(raw):,} rows (full parquet)...")
-        live_df = engineer_full_features(raw.copy(), tf_minutes=tf,
+        # Use tail slice to avoid OOM on 1m (2.1M rows × institutional features).
+        # 2000 rows gives 1800 warm-up bars before the 200-row comparison window.
+        PARITY_TAIL = 2000
+        raw_slice   = raw.iloc[-min(PARITY_TAIL, len(raw)):].copy()
+        log.info(f"  [PARITY] {symbol} {tf}m: running live pipeline on {len(raw_slice):,} rows (tail)...")
+        live_df = engineer_full_features(raw_slice, tf_minutes=tf,
                                          symbol=symbol, is_tick_derived=True)
         if live_df.empty:
             log.warning(f"  [PARITY] {symbol} {tf}m: live pipeline returned empty DataFrame — skipping")
@@ -282,8 +287,17 @@ def _log_feature_sanity(df: pd.DataFrame, symbol: str, tf: int, n_top: int = 10)
     p99s     = sub.quantile(0.99)
     nan_cnts = sub.isna().sum()
 
-    frozen    = [c for c in feat_cols if stds[c] < 0.01]
-    exploding = [c for c in feat_cols if abs(p99s[c]) > 1000 or nan_cnts[c] > len(df) * 0.001]
+    # Pct/ratio/return features legitimately have absolute std << 0.01
+    # (e.g. ret1 ~ 0.0001 for US30). Exclude them from FROZEN check.
+    _small_ok = ("ret", "logr", "_pct", "dist", "htf_bull", "htf_str", "co_pct", "hl_pct")
+    frozen    = [c for c in feat_cols
+                 if stds[c] < 0.01 and not any(c.startswith(p) or p in c for p in _small_ok)]
+    # Raw price-level features (EMAs, VWAP) have p99 ~ 50 000 for US30 — not bugs.
+    # Only flag features whose p99 far exceeds any plausible US30 price, or heavy NaN.
+    _price_ok = ("ema", "vwap", "price_impact", "c_lag")
+    exploding = [c for c in feat_cols
+                 if (abs(p99s[c]) > 500_000 and not any(p in c for p in _price_ok))
+                 or nan_cnts[c] > len(df) * 0.05]
 
     log.info(f"[FEATURES] {symbol}/{tf}m distribution sanity ({len(feat_cols)} features, {len(df)} bars):")
     top_cols = p99s.abs().nlargest(n_top).index

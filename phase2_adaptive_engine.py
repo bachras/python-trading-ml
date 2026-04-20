@@ -457,16 +457,29 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     obv = (np.sign(c.diff()) * v).fillna(0).cumsum()
     d["obv_norm"] = (obv - obv.rolling(50).mean()) / (obv.rolling(50).std() + 1e-10)
 
-    # Session flags
-    hr = d.index.hour
-    d["is_london"]  = ((hr >= 8)  & (hr < 16)).astype(int)
-    d["is_ny"]      = ((hr >= 13) & (hr < 21)).astype(int)
-    d["is_overlap"] = ((hr >= 13) & (hr < 16)).astype(int)
+    # Session flags — DST-aware, matches tick_pipeline.py exactly.
+    # Index is UTC (tick parquet) or tz-naive UTC (MT5 data).
+    hr  = d.index.hour   # UTC hour — used only for cyclical encoding
+    dow = d.index.dayofweek
+    try:
+        uk_idx = d.index.tz_convert("Europe/London")
+        us_idx = d.index.tz_convert("America/New_York")
+    except TypeError:
+        _utc   = d.index.tz_localize("UTC")
+        uk_idx = _utc.tz_convert("Europe/London")
+        us_idx = _utc.tz_convert("America/New_York")
+    uk_mins = uk_idx.hour * 60 + uk_idx.minute
+    us_mins = us_idx.hour * 60 + us_idx.minute
+    d["is_london"]  = ((uk_mins >= 480) & (uk_mins < 1020)).astype(int)  # 8 am–5 pm London
+    d["is_ny"]      = ((us_mins >= 570) & (us_mins < 960)).astype(int)   # 9:30 am–4 pm NY
+    d["is_overlap"] = (
+        ((uk_mins >= 480) & (uk_mins < 1020)) &
+        ((us_mins >= 570) & (us_mins < 960))
+    ).astype(int)
     d["hour_sin"] = np.sin(2 * np.pi * hr / 24)
     d["hour_cos"] = np.cos(2 * np.pi * hr / 24)
-    dow = d.index.dayofweek
-    d["dow_sin"] = np.sin(2 * np.pi * dow / 5)
-    d["dow_cos"] = np.cos(2 * np.pi * dow / 5)
+    d["dow_sin"]  = np.sin(2 * np.pi * dow / 5)
+    d["dow_cos"]  = np.cos(2 * np.pi * dow / 5)
 
     # Lags
     for lag in [1, 2, 3, 5, 8, 13]:

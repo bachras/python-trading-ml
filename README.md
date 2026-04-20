@@ -363,8 +363,46 @@ python train.py --force
 
 ---
 
+## "Our London Time" — Time Reference Standard
+
+The US and UK change their clocks on **different dates** each spring and autumn, creating two mismatch windows (~3 weeks in spring, ~1 week in autumn) where the London–NY gap is 4 h instead of the normal 5 h. During these windows US market events (NFP, FOMC, CPI) appear 1 h earlier on the raw London wall clock.
+
+**"Our London Time"** = London wall clock + **+1 h bump** applied when:
+- The mismatch is active: `(London UTC offset) − (NY UTC offset) == 4 h`, AND
+- The London wall hour is between **12 and 20 inclusive**
+
+### Where it is used
+
+| Location | Uses "Our London Time" | Reason |
+|----------|----------------------|--------|
+| `live.py _is_session_blocked()` | Yes — `_our_london_time()` | Gate always fires at same time relative to NYSE close |
+| Future event filter (NFP, FOMC, holidays) | Yes — call `_our_london_time()` | Event times will be stored in "Our London Time"; comparison must use the same reference |
+
+### Where it is NOT used (intentionally)
+
+| Feature | Uses plain London wall clock | Reason |
+|---------|------------------------------|--------|
+| `is_london`, `uk_hour`, `hour_sin/cos` | Yes — `tz_convert("Europe/London")` | ML features must be consistent between training history and live; changing the clock reference would break parity |
+| `is_ny`, `is_overlap`, `is_us_open` | NY timezone directly | Computed from `tz_convert("America/New_York")` — always correct regardless of mismatch |
+
+### Adding future event times
+
+When adding high-impact events or holidays, store all times in "Our London Time":
+- NFP always at **13:30** (not 12:30 during mismatch weeks)
+- FOMC always at **19:00** or **20:00** as applicable
+- In `live.py`, compare stored event times against `_our_london_time(datetime.now(tz=timezone.utc))`
+
+### Mismatch windows
+
+| Window | Start | End | Duration |
+|--------|-------|-----|----------|
+| Spring | 2nd Sunday of March (US springs forward) | Last Sunday of March (UK springs forward) | ~3 weeks |
+| Autumn | Last Sunday of October (UK falls back) | 1st Sunday of November (US falls back) | ~1 week |
+
+---
+
 ## Hardcoded Market Physics (never overridden by ML)
 
-- **Session gate:** 20:30 to 01:00 London time (DST-aware) — no new entries outside this window
+- **Session gate:** 20:30 to 01:00 in "Our London Time" — no new entries outside this window
 - **Max drawdown:** 35% of account (account survival limit)
 - **Fixed risk:** $100 per trade (ensures ER computation is accurate across all strategies)
