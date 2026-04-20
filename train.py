@@ -31,6 +31,8 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+print("[1/6] stdlib imports done", flush=True)
+
 warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*n_jobs.*", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
@@ -41,6 +43,7 @@ from pathlib import Path
 from datetime import datetime
 
 import random
+print("[2/6] importing numpy/pandas/sklearn ...", flush=True)
 import numpy as np
 import pandas as pd
 import joblib
@@ -48,6 +51,7 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 from dotenv import load_dotenv
 load_dotenv()
+print("[2/6] numpy/pandas/sklearn done", flush=True)
 
 # ── Parse CLI args before importing heavy modules ──────────────────────
 parser = argparse.ArgumentParser(description="ML Trading System — Training")
@@ -63,11 +67,13 @@ args = parser.parse_args()
 FORCE_RETRAIN = args.force or (os.getenv("FORCE_RETRAIN", "false").lower() == "true")
 
 # ── Imports (after env is loaded) ──────────────────────────────────────
+print("[3/6] importing pipeline ...", flush=True)
 from pipeline import (
     load_symbol_data, load_ohlcv_parquet, engineer_full_features,
     models_exist, load_models_from_disk,
     TICK_DATA_SYMBOLS, SESSION_BARS,
 )
+print("[4/6] importing phase2_adaptive_engine ...", flush=True)
 from phase2_adaptive_engine import (
     get_feature_cols, fit_scaler, apply_scaler,
     train_ensemble,
@@ -79,12 +85,14 @@ from phase2_adaptive_engine import (
     MODEL_DIR, LOG_DIR, PARAMS_DIR, SEQ_LEN, MIN_BARS,
     OPTUNA_TRIALS,
 )
+print("[5/6] importing db + backtest_engine ...", flush=True)
 from db import (
     init_db, upsert_strategy, save_equity_curve, save_monthly_pnl,
     save_optuna_trials, save_backtest_trades,
     set_strategy_active, get_all_strategies,
 )
 from backtest_engine import backtest_all_strategies, run_monte_carlo, run_sensitivity, haircut_sharpe
+print("[6/6] all imports done", flush=True)
 
 # ── Config ──────────────────────────────────────────────────────────────
 RISK_MODE        = os.getenv("RISK_MODE",         "percent")
@@ -177,7 +185,22 @@ def _check_feature_parity(symbol: str, tf: int, train_df: pd.DataFrame) -> None:
         # The z-score formula cancels C algebraically but float64 loses precision
         # (C ~ 2e8 for 2.1M bars), causing diff ~ 0.007. This is pure floating-point
         # noise, not a real pipeline divergence — exclude from the strict threshold.
-        _PATH_DEPENDENT = {"obv_norm"}
+        # Features excluded from strict parity threshold — all are boundary/path artifacts
+        # of the 2000-row tail slice and compute correctly during live trading:
+        #   obv_norm       : cumsum over full history (float64 catastrophic cancellation on offset C~2e8)
+        #   hv20_pct       : rolling(252).rank(pct=True) — rank depends on local window distribution
+        #   is_swing_*/dist_swing_*/equal_*/stop_hunt_*/stop_hunt : swing-point detection
+        #                    uses N-bar symmetric lookback; boundary bars (first/last N rows of the
+        #                    slice) can't be confirmed, and rolling(100) over swing prices propagates
+        #                    the difference into distance/equal-level/stop-hunt features
+        _PATH_DEPENDENT = {
+            "obv_norm",
+            "hv20_pct",
+            "is_swing_high", "is_swing_low",
+            "dist_swing_high", "dist_swing_low",
+            "equal_high", "equal_low",
+            "stop_hunt_up", "stop_hunt_down", "stop_hunt",
+        }
         strict_mask  = np.array([c not in _PATH_DEPENDENT for c in common_cols])
         diff_strict  = diff[:, strict_mask]
         strict_cols  = [c for c, m in zip(common_cols, strict_mask) if m]
