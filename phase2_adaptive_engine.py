@@ -822,10 +822,15 @@ def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
     )
     xgb_model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
 
+    # Cap bootstrap sample to 500K rows — RF generalises well with subsampling
+    # (each tree already bootstraps), and avoids joblib memory fragmentation on
+    # large final-fit datasets (~1.77M rows).  n_jobs=4 limits parallel forks.
+    _rf_max_samples = min(500_000, len(X_tr))
     rf_model = RandomForestClassifier(
         n_estimators=300, max_depth=8, min_samples_leaf=10,
-        n_jobs=-1, random_state=GLOBAL_SEED,
+        n_jobs=4, max_samples=_rf_max_samples, random_state=GLOBAL_SEED,
     )
+    log.info(f"  RF fit: {len(X_tr):,} rows → max_samples={_rf_max_samples:,}, n_jobs=4")
     rf_model.fit(X_tr, y_tr)
 
     xgb_val_acc = (xgb_model.predict(X_va) == y_va).mean()
