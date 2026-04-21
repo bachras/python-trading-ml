@@ -103,7 +103,7 @@ def engineer_full_features(df: pd.DataFrame,
         _estimate_microstructure(d)
     sb = SESSION_BARS.get(tf_minutes, 78)
     try:
-        d = add_institutional_features(d, session_bars=sb, verbose=False)
+        d = add_institutional_features(d, session_bars=sb, tf_minutes=tf_minutes, verbose=False)
     except Exception as e:
         log.warning(f"Institutional features partial failure on {symbol} {tf_minutes}m: {e}")
     d.dropna(inplace=True)
@@ -216,7 +216,7 @@ def load_symbol_data(symbol: str, save_featured: bool = False) -> dict:
             else:
                 try:
                     enhanced = add_institutional_features(
-                        raw, session_bars=SESSION_BARS.get(tf, 78), verbose=False)
+                        raw, session_bars=SESSION_BARS.get(tf, 78), tf_minutes=tf, verbose=False)
                     if len(enhanced) < MIN_BARS:
                         log.warning(f"  {symbol} {tf}m: institutional features produced "
                                     f"only {len(enhanced)} rows — using raw Parquet")

@@ -727,9 +727,23 @@ def add_session_open_range(df: pd.DataFrame,
 # 7. MASTER FUNCTION — adds all institutional features
 # ─────────────────────────────────────────────────────────────
 
+TICK_MICROSTRUCTURE_FEATURES = [
+    "vwap_slope5", "vwap_slope20",
+    "vp_poc_migration",
+    "quote_delta", "quote_delta_z",
+    "quote_cvd", "quote_cvd_z",
+    "quote_cvd_slope5", "quote_cvd_slope20",
+    "quote_delta_price_corr",
+    "buy_imbalance_count", "sell_imbalance_count",
+    "stacked_imbalance", "absorption_bull", "absorption_bear",
+]
+_TICK_MICROSTRUCTURE_SET = frozenset(TICK_MICROSTRUCTURE_FEATURES)
+
+
 def add_institutional_features(df: pd.DataFrame,
                                 session_bars: int = 390,
                                 open_range_bars: int = 5,
+                                tf_minutes: int = 1,
                                 verbose: bool = True) -> pd.DataFrame:
     """
     Master function — applies all 5 institutional feature groups
@@ -741,6 +755,10 @@ def add_institutional_features(df: pd.DataFrame,
 
     Call this AFTER tick_pipeline.engineer_tick_features() so ATR14,
     HV20, etc. are already present.
+
+    tf_minutes: bar timeframe in minutes.  Features in _TICK_ONLY_FEATURES
+    are dropped for tf_minutes > 1 — they collapse to near-zero std at coarser
+    bars and cause StandardScaler to produce arbitrarily large scaled values.
     """
     if verbose:
         before = len(df.columns)
@@ -803,6 +821,23 @@ def add_institutional_features(df: pd.DataFrame,
             f"({100*(rows_before-rows_after)/rows_before:.1f}%) — "
             f"{rows_after:,} remain"
         )
+
+    if tf_minutes > 1:
+        drop_cols = [c for c in _TICK_MICROSTRUCTURE_SET if c in d.columns]
+        if drop_cols:
+            d.drop(columns=drop_cols, inplace=True)
+
+    # Step 4 safety check — catch any remaining near-zero-std institutional columns
+    # (only checks columns added by this function, not raw OHLCV / return features)
+    _inst_cols = [c for c in d.columns if c not in before_cols]
+    if _inst_cols:
+        _low_std = [c for c in _inst_cols if d[c].std() < 0.01]
+        if _low_std:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"[FEATURE] Low-variance institutional columns detected "
+                f"(tf={tf_minutes}m): {_low_std}"
+            )
 
     if verbose:
         added = len(d.columns) - before

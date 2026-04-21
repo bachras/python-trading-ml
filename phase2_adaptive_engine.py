@@ -163,20 +163,20 @@ TF_MAP = {
 # ── Seed parameter space (ML discovers true values within these ranges) ──
 PARAM_SEEDS = {
     # Entry timeframe candidates (minutes) — ML picks best per instrument
-    # Includes 30m for wider exploration on slower-moving setups
-    "entry_tf_options":  [1, 3, 5, 10, 15, 30],
+    # 1m excluded: 2.1M bars → no institutional features, execution noise dominates
+    # 30m excluded: too few trades/day for kill switch and calibration reliability
+    "entry_tf_options":  [3, 5, 10, 15],
     "entry_tf_default":  5,
 
-    # HTF confirmation candidates — includes 0 = NONE (ML may skip HTF)
-    # Added 240m (4H) for stronger trend confirmation on longer entries
-    "htf_options":       [0, 15, 30, 60, 240],
+    # HTF confirmation candidates — 30m removed (not loaded as entry TF)
+    "htf_options":       [0, 15, 60, 240],
     "htf_default":       60,
 
     # Stop loss ATR multiplier — widened low end to allow tighter scalp SLs
     # and high end to allow wide SLs for volatile instruments
     "sl_atr_min":        0.3,
     "sl_atr_max":        5.0,
-    "sl_atr_seed":       1.5,
+    "sl_atr_seed":       2.0,
 
     # Take profit multiplier of SL distance — wider for runner strategies
     "tp_mult_min":       0.5,
@@ -733,7 +733,7 @@ def _check_leakage(symbol: str, tf: int, df: pd.DataFrame) -> None:
 
     # Baseline: run add_institutional_features on the unmodified df
     df_base = df.copy()
-    base_feat = add_institutional_features(df_base)
+    base_feat = add_institutional_features(df_base, tf_minutes=tf)
     base_vals = base_feat.iloc[check_slice].copy()
 
     # Permuted: shuffle all rows AFTER pivot (simulates future-data leakage)
@@ -741,7 +741,7 @@ def _check_leakage(symbol: str, tf: int, df: pd.DataFrame) -> None:
     future_idx = df_perm.index[pivot:]
     perm_order = np.random.default_rng(42).permutation(len(future_idx))
     df_perm.loc[future_idx] = df_perm.loc[future_idx].iloc[perm_order].values
-    perm_feat = add_institutional_features(df_perm)
+    perm_feat = add_institutional_features(df_perm, tf_minutes=tf)
     perm_vals = perm_feat.iloc[check_slice].copy()
 
     # Compare shared feature columns (exclude raw OHLCV and targets)
@@ -866,10 +866,10 @@ def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
 GA_BOUNDS = [
     (0, len(PARAM_SEEDS["entry_tf_options"]) - 1),   # entry TF index
     (0, len(PARAM_SEEDS["htf_options"]) - 1),         # HTF index (0 = NONE)
-    # sl_atr and tp_mult narrowed to match the 5×5 label grid.
-    # Genomes outside [1.0, 4.0] / [0.5, 6.0] would map to the nearest grid
-    # edge (sl=1.5 or sl=3.5) — wasting evaluations on poorly-labelled space.
-    (1.0, 4.0),    # sl_atr  (grid covers 1.5–3.5, allow 0.25 overhang)
+    # sl_atr lower bound raised to 2.0 to match the hard floor in ga_fitness.
+    # Sub-2.0 SL is not viable: spread+slippage cost (~3.5 pts) consumes > 15%
+    # of the SL distance on tight stops, making the edge disappear after friction.
+    (2.0, 4.0),    # sl_atr  (was 1.0; hard floor enforced inside ga_fitness too)
     (0.5, 6.0),    # tp_mult (grid covers 1–5, allow 0.5 overhang)
     (PARAM_SEEDS["confidence_min"],PARAM_SEEDS["confidence_max"]),
     (PARAM_SEEDS["htf_weight_min"],PARAM_SEEDS["htf_weight_max"]),
@@ -1004,20 +1004,18 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
             htf_dir_arr = htf_series.values.astype(np.float32)
 
     # Apply HTF nudge to signal probabilities
+    # Additive adjustment capped at ±0.05 so HTF can nudge borderline signals
+    # but cannot override a clear model output. Scale factor 0.2 (was 0.3).
     adjusted_prob = signal_prob.copy()
     if htf_w > 0:
         bear_htf = htf_dir_arr == -1
         bull_htf = htf_dir_arr == 1
-        # Bearish HTF reduces long confidence, bullish HTF boosts it
-        adjusted_prob = np.where(
-            bear_htf & (signal_prob > 0.5),
-            signal_prob * (1.0 - htf_w * 0.3),
-            np.where(
-                bull_htf & (signal_prob < 0.5),
-                signal_prob * (1.0 + htf_w * 0.3),
-                signal_prob,
-            )
+        raw_adj = np.where(
+            bear_htf & (signal_prob > 0.5), -htf_w * 0.2,
+            np.where(bull_htf & (signal_prob < 0.5),  htf_w * 0.2, 0.0)
         )
+        raw_adj       = np.clip(raw_adj, -0.05, 0.05)
+        adjusted_prob = np.clip(signal_prob + raw_adj, 0.0, 1.0)
 
     # S1: Per-genome deterministic RNG — reproducible fill/noise across evaluations
     genome_seed = abs(hash(tuple(round(float(g), 4) for g in genome))) % (2 ** 31)
@@ -1055,6 +1053,13 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
     tp_mult  = params["tp_mult"]
     conf_thr = params["confidence"]
     be_r     = params.get("be_r", 0)
+
+    # F2: Hard SL floor — sub-2.0 SL is not viable with the spread model.
+    # Cost (~3.5 pts) vs SL distance becomes > 15%, destroying edge after friction.
+    if sl_atr < 2.0:
+        return (-np.inf,)
+
+    cost_ratio_sum = 0.0   # F2: accumulated (spread+slip) / sl_dist per fill
 
     for i in range(SEQ_LEN, len(df) - 1):
         if i <= skip_until:
@@ -1095,6 +1100,10 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
             if gap_pts > MT5_DEVIATION_PTS:
                 _ts_gap_skip += 1
                 continue  # gap exceeds MT5 deviation limit — missed fill
+            # F1: reject delayed fill if price moved > 40% of ATR (fast-moving bar)
+            if gap_pts > 0.4 * atr[i]:
+                _ts_gap_skip += 1
+                continue
             fill_price = opens[i + 1]
         else:
             fill_price = closes[i]
@@ -1103,6 +1112,7 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
         _ts_spread.append(spread_cost * 2)   # full spread (cost was half-spread)
         _ts_slip.append(slip_cost)
         _ts_total_cost.append(spread_cost + slip_cost)
+        cost_ratio_sum += (spread_cost + slip_cost) / max(sl_dist, 1e-9)  # F2
 
         entry  = fill_price + direction * (spread_cost + slip_cost)
         sl     = entry - direction * sl_dist
@@ -1194,6 +1204,31 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
 
     # ── Final fitness ─────────────────────────────────────────────────
     fitness = sharpe * trade_penalty * max(0.5, 1.0 - cvar_penalty) * quality_penalty
+
+    # F3: Execution regime penalties — penalise strategies that live in a
+    # zero-friction world (fill_rate too high) or are untradeable (too low).
+    _fill_rate     = _ts_fills    / max(_ts_n_signals, 1)
+    _gap_skip_rate = _ts_gap_skip / max(_ts_delayed,   1)
+    if _fill_rate > 0.95:
+        fitness *= 0.80   # almost nothing rejected — unrealistic
+    if _fill_rate < 0.75:
+        fitness *= 0.85   # too selective — pathological SL/spread combo
+    if _gap_skip_rate < 0.01:
+        fitness *= 0.90   # ATR-move + gap filters not triggering
+
+    # F8: Trade frequency penalty — kill switch needs ≥ 1.5 trades/day;
+    # > 10/day suggests overtrading or low-quality confidence threshold.
+    _tpd = n_trades / max(n_days_span, 1)
+    if _tpd < 1.5 or _tpd > 10.0:
+        fitness *= 0.70
+    elif _tpd > 7.0:
+        fitness *= 0.90
+
+    # F2: Cost ratio penalty — avg execution cost > 15% of SL distance
+    # means edge disappears after friction regardless of backtest Sharpe.
+    _avg_cost_ratio = cost_ratio_sum / max(n_trades, 1)
+    if _avg_cost_ratio > 0.15:
+        fitness *= 0.70
 
     if not track_stats:
         return (fitness,)
@@ -1305,17 +1340,17 @@ def run_optuna(df_dict: dict, models_by_tf: dict,
         # Conservative: wide SL, modest TP, high confidence
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(5),
          "htf_idx": PARAM_SEEDS["htf_options"].index(60),
-         "sl_atr": 1.5, "tp_mult": 2.0,
+         "sl_atr": 2.0, "tp_mult": 2.0,
          "confidence": 0.65, "htf_weight": 0.6, "be_r_idx": 1},
         # Aggressive: tight SL, high TP, lower confidence
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(3),
-         "htf_idx": PARAM_SEEDS["htf_options"].index(30),
-         "sl_atr": 0.6, "tp_mult": 4.0,
-         "confidence": 0.55, "htf_weight": 0.4, "be_r_idx": 2},
-        # Scalp: very tight SL, 1:1 TP, very high confidence
-        {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(1),
          "htf_idx": PARAM_SEEDS["htf_options"].index(15),
-         "sl_atr": 0.4, "tp_mult": 1.0,
+         "sl_atr": 2.0, "tp_mult": 4.0,
+         "confidence": 0.55, "htf_weight": 0.4, "be_r_idx": 2},
+        # Scalp: wide SL, 1:1 TP, very high confidence (1m removed; use 3m)
+        {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(3),
+         "htf_idx": PARAM_SEEDS["htf_options"].index(15),
+         "sl_atr": 2.0, "tp_mult": 1.0,
          "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
         # Runner: wide SL, very high TP, no HTF
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(5),
@@ -1408,11 +1443,11 @@ def run_per_tf_optimization(
     _per_tf_warm_starts = [
         # Default seed
         {"htf_idx": PARAM_SEEDS["htf_options"].index(60),
-         "sl_atr": 1.5, "tp_mult": 2.0,
+         "sl_atr": 2.0, "tp_mult": 2.0,
          "confidence": 0.65, "htf_weight": 0.5, "be_r_idx": 1},
-        # Tight scalp
+        # Scalp (sl_atr floored to 2.0 per SL floor rule)
         {"htf_idx": PARAM_SEEDS["htf_options"].index(15),
-         "sl_atr": 0.4, "tp_mult": 1.0,
+         "sl_atr": 2.0, "tp_mult": 1.0,
          "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
         # Wide swing
         {"htf_idx": PARAM_SEEDS["htf_options"].index(240),
@@ -1420,10 +1455,10 @@ def run_per_tf_optimization(
          "confidence": 0.70, "htf_weight": 0.8, "be_r_idx": 2},
         # No HTF — pure entry signal
         {"htf_idx": PARAM_SEEDS["htf_options"].index(0),
-         "sl_atr": 1.0, "tp_mult": 3.0,
+         "sl_atr": 2.0, "tp_mult": 3.0,
          "confidence": 0.60, "htf_weight": 0.0, "be_r_idx": 3},
         # High conviction runner
-        {"htf_idx": PARAM_SEEDS["htf_options"].index(30),
+        {"htf_idx": PARAM_SEEDS["htf_options"].index(15),
          "sl_atr": 2.0, "tp_mult": 7.0,
          "confidence": 0.85, "htf_weight": 0.6, "be_r_idx": 2},
     ]
@@ -1546,14 +1581,19 @@ def get_signal(symbol: str, params: dict,
         prob_cal = float(calibrator.predict([prob_raw])[0])
     prob = prob_cal
 
-    # HTF filter: if HTF is bearish and signal is long, reduce confidence
+    # HTF filter: additive nudge capped at ±0.05 (matches ga_fitness logic).
+    # Scale 0.2 (was 0.3) — HTF provides context, not a decision override.
     htf_dir    = df["htf_bullish"].iloc[-1] if "htf_bullish" in df.columns else 0
     prob_before_htf = prob
     if htf_tf > 0 and htf_w > 0:
         if htf_dir == -1 and prob > 0.5:
-            prob *= (1 - htf_w * 0.3)
+            adj = -htf_w * 0.2
         elif htf_dir == 1 and prob < 0.5:
-            prob *= (1 + htf_w * 0.3)
+            adj =  htf_w * 0.2
+        else:
+            adj = 0.0
+        adj  = float(np.clip(adj, -0.05, 0.05))
+        prob = float(np.clip(prob + adj, 0.0, 1.0))
     htf_adj = round(prob - prob_before_htf, 4)
 
     # Determine direction

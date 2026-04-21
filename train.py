@@ -497,6 +497,147 @@ def _walk_forward_folds(df: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Label grid search — explicit sweep of all 75 SL×TP×BE combinations
+# ─────────────────────────────────────────────────────────────────────
+
+_SL_GRID = [1.5, 2.0, 2.5, 3.0, 3.5]
+_TP_GRID = [1,   2,   3,   4,   5  ]
+_BE_GRID = [0,   1,   2              ]
+
+def _run_label_grid_search(
+    symbol: str,
+    tf: int,
+    df: pd.DataFrame,
+    best_params: dict,
+) -> None:
+    """
+    Sweep all 75 SL×TP×BE label combinations for a given TF.
+
+    Uses the already-saved production model + scaler for this TF.
+    Keeps confidence, htf_tf, and htf_weight from best_params so only
+    the exit structure (SL/TP/BE) varies.
+
+    Caps the backtest data at GRID_MAX_BARS most-recent bars to keep
+    runtime reasonable on large TFs like 1m.
+
+    Logs:
+      1. TP-rate table for all 75 labels (from training data, no backtest)
+      2. Ranked backtest results (Sharpe, WR, trades, max-DD)
+    """
+    from backtest_engine import load_featured_df, run_backtest
+    import logging as _lg
+
+    GRID_MAX_BARS = 400_000
+
+    key     = f"{symbol}_{tf}m"
+    xgb_path = MODEL_DIR / f"xgb_{key}.pkl"
+    rf_path  = MODEL_DIR / f"rf_{key}.pkl"
+    sc_path  = MODEL_DIR / f"scaler_{key}.pkl"
+
+    if not (xgb_path.exists() and rf_path.exists() and sc_path.exists()):
+        log.warning(f"  [GRID] {symbol}/{tf}m: models missing — skipping grid search")
+        return
+
+    try:
+        xgb_m  = joblib.load(xgb_path)
+        rf_m   = joblib.load(rf_path)
+        scaler = joblib.load(sc_path)
+    except Exception as _e:
+        log.warning(f"  [GRID] {symbol}/{tf}m: could not load models ({_e}) — skipping")
+        return
+
+    bt_df = load_featured_df(symbol, tf)
+    if bt_df.empty:
+        log.warning(f"  [GRID] {symbol}/{tf}m: no featured data — skipping grid search")
+        return
+    if len(bt_df) > GRID_MAX_BARS:
+        bt_df = bt_df.iloc[-GRID_MAX_BARS:].copy()
+
+    conf       = best_params.get("confidence", 0.65)
+    htf_tf     = best_params.get("htf_tf",     0)
+    htf_weight = best_params.get("htf_weight", 0.0)
+
+    # ── 1. TP-rate table (no backtest needed) ────────────────────────
+    target_cols = [c for c in df.columns if c.startswith("target_sl") and "_tp" in c]
+    if target_cols:
+        log.info(f"\n  [GRID] {symbol}/{tf}m — label TP rates "
+                 f"(pos class %, balanced=50%; all {len(target_cols)} labels):")
+        header = f"  {'':5}" + "".join(f" tp={tv:>2}" for tv in _TP_GRID)
+        for be_v in _BE_GRID:
+            log.info(f"  BE={be_v}  {header}")
+            for sl_v in _SL_GRID:
+                row = f"  sl={sl_v:<3}"
+                for tp_v in _TP_GRID:
+                    col = f"target_sl{sl_v}_tp{tp_v}_be{be_v}"
+                    if col in df.columns and df[col].notna().any():
+                        rate = float(df[col].mean()) * 100
+                        row += f"  {rate:5.1f}%"
+                    else:
+                        row += f"  {'n/a':>6}"
+                log.info(row)
+
+    # ── 2. Backtest all 75 combinations ─────────────────────────────
+    combos = [
+        {"sl_atr": sl_v, "tp_mult": float(tp_v), "be_r": be_v,
+         "confidence": conf, "htf_tf": htf_tf, "htf_weight": htf_weight,
+         "entry_tf": tf}
+        for sl_v in _SL_GRID
+        for tp_v in _TP_GRID
+        for be_v in _BE_GRID
+    ]
+
+    grid_rows = []
+    _bt_log = _lg.getLogger("backtest_engine")
+    _orig_level = _bt_log.level
+    _bt_log.setLevel(_lg.WARNING)   # silence per-backtest INFO lines during sweep
+
+    log.info(f"  [GRID] {symbol}/{tf}m — running 75 backtest combos "
+             f"(conf={conf:.2f}, last {len(bt_df):,} bars)...")
+
+    for combo in combos:
+        try:
+            result = run_backtest(
+                bt_df, combo, scaler, xgb_m, rf_m,
+                risk_mode=RISK_MODE, risk_pct=RISK_PCT,
+                fixed_amt=FIXED_RISK_AMT, start_balance=10_000.0,
+            )
+            stats = result.get("stats")
+            if stats and stats.get("n_trades", 0) >= 10:
+                grid_rows.append({
+                    "label":   f"sl{combo['sl_atr']}_tp{combo['tp_mult']:.0f}_be{combo['be_r']}",
+                    "sl":      combo["sl_atr"],
+                    "tp":      combo["tp_mult"],
+                    "be":      combo["be_r"],
+                    "trades":  stats["n_trades"],
+                    "wr":      stats["win_rate"],
+                    "sharpe":  stats["sharpe"],
+                    "er":      stats["efficiency_ratio"],
+                    "dd":      stats["max_dd_pct"],
+                })
+        except Exception:
+            pass
+
+    _bt_log.setLevel(_orig_level)
+
+    if not grid_rows:
+        log.info(f"  [GRID] {symbol}/{tf}m: no combos produced ≥10 trades — skipping table")
+        return
+
+    grid_rows.sort(key=lambda r: r["sharpe"], reverse=True)
+
+    log.info(f"\n  ┌─ [GRID] {symbol}/{tf}m — all 75 SL×TP×BE combos ranked by Sharpe ({'─'*28}┐")
+    log.info(f"  │ {'Label':<22} {'Trades':>6} {'WR%':>5} {'Sharpe':>7} {'ER':>6} {'MaxDD%':>7} │")
+    log.info(f"  │ {'─'*22} {'─'*6} {'─'*5} {'─'*7} {'─'*6} {'─'*7} │")
+    for i, r in enumerate(grid_rows):
+        marker = " ◄ best" if i == 0 else ""
+        log.info(
+            f"  │ {r['label']:<22} {r['trades']:>6} {r['wr']:>5.1f} "
+            f"{r['sharpe']:>7.2f} {r['er']:>6.2f} {r['dd']:>7.1f}{marker} │"
+        )
+    log.info(f"  └{'─'*60}┘")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Core training pipeline
 # ─────────────────────────────────────────────────────────────────────
 
@@ -781,9 +922,20 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                              f"max bin delta={max_delta:.3f}"
                              + (" ← ALERT" if max_delta > 0.10 else ""))
                     if brier_after >= brier_before:
+                        # F6: Calibration guard — degraded calibrator harms live trading.
+                        # Remove the saved file so live.py uses raw model probabilities.
+                        _cal_path = MODEL_DIR / f"calibrator_{key}.pkl"
+                        if _cal_path.exists():
+                            _cal_path.unlink()
                         log.warning(
-                            f"  [CALIBRATION] Brier did not improve — OOS sample may be too "
-                            f"small ({len(oos_probs_all)} rows) for reliable isotonic fit"
+                            f"  [CALIBRATION] GUARD — calibrator degraded Brier "
+                            f"({brier_before:.4f} → {brier_after:.4f}). "
+                            f"Deleted calibrator_{key}.pkl — raw probabilities will be used live."
+                        )
+                    if len(oos_probs_all) < 10_000:
+                        log.warning(
+                            f"  [CALIBRATION] Small OOS pool ({len(oos_probs_all):,} samples) "
+                            f"— isotonic regression may be unstable. Consider 3+ folds."
                         )
                     # E2: calibration stability by ATR volatility tertile
                     if len(oos_atr_all) == len(oos_probs_all):
@@ -1038,8 +1190,7 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     # R1: expected_trades_per_day — used by kill switch signal frequency check
                     "expected_trades_per_day": round(
                         stats["n_trades"] / max(
-                            (bt["equity_df"].index[-1] - bt["equity_df"].index[0]).days
-                            * (252 / 365) if not bt["equity_df"].empty else 252,
+                            len(bt["equity_df"]) * (252 / 365) if not bt["equity_df"].empty else 252,
                             1
                         ), 2
                     ) if stats["n_trades"] > 0 and not bt["equity_df"].empty else None,
@@ -1048,8 +1199,7 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 # [BASELINES] — confirm what was saved to DB for kill switch
                 _etpd = (
                     round(stats["n_trades"] / max(
-                        (bt["equity_df"].index[-1] - bt["equity_df"].index[0]).days
-                        * (252 / 365) if not bt["equity_df"].empty else 252, 1
+                        len(bt["equity_df"]) * (252 / 365) if not bt["equity_df"].empty else 252, 1
                     ), 2) if stats["n_trades"] > 0 and not bt["equity_df"].empty else 0.0
                 )
                 log.info(
@@ -1123,6 +1273,23 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                             log.warning(
                                 f"  [EXECUTION] fill_rate={_es['fill_rate']:.1%} < 60% — "
                                 f"very selective; check spread vs SL distance"
+                            )
+                        # F9: Hard-fail validation — abort if execution model is not working.
+                        # A broken spread/slippage model silently trains on a zero-friction world.
+                        if _es["avg_spread"] < 1.0:
+                            raise RuntimeError(
+                                f"[EXECUTION] ABORT — avg_spread={_es['avg_spread']:.2f} pts. "
+                                f"Spread model not active. Check SPREAD_BASE_PTS in .env."
+                            )
+                        if _es["fill_rate"] > 0.97:
+                            raise RuntimeError(
+                                f"[EXECUTION] ABORT — fill_rate={_es['fill_rate']:.1%}. "
+                                f"Execution filter not working. Check EXEC_DELAY_PROB and MT5_DEVIATION_PTS."
+                            )
+                        if _es["avg_slip"] < 0.3:
+                            raise RuntimeError(
+                                f"[EXECUTION] ABORT — avg_slippage={_es['avg_slip']:.2f} pts. "
+                                f"Slippage model not active. Check SLIP_FACTOR in phase2_adaptive_engine.py."
                             )
                 except Exception as _ee:
                     log.warning(f"  [EXECUTION] Could not compute execution stats: {_ee}")
@@ -1330,6 +1497,17 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                         f"{r['sens']:>5.0f} {r['robust']:>3} {r['spa']:>6} │"
                     )
                 log.info(f"  └{'─'*104}┘")
+
+            # ── Label grid search: all 75 SL×TP×BE combinations ──────────────
+            if top_trials and tf_feat.get(tf) is not None:
+                try:
+                    _run_label_grid_search(
+                        symbol=symbol, tf=tf,
+                        df=tf_feat[tf],
+                        best_params=top_trials[0]["params"],
+                    )
+                except Exception as _ge:
+                    log.warning(f"  [GRID] {symbol}/{tf}m: grid search failed ({_ge})")
 
         _activate_best_strategy(symbol)
 
