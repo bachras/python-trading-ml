@@ -90,6 +90,7 @@ from db import (
     init_db, upsert_strategy, save_equity_curve, save_monthly_pnl,
     save_optuna_trials, save_backtest_trades,
     set_strategy_active, get_all_strategies,
+    delete_strategies_not_in_tfs,
 )
 from backtest_engine import backtest_all_strategies, run_monte_carlo, run_sensitivity, haircut_sharpe
 print("[6/6] all imports done", flush=True)
@@ -1032,13 +1033,16 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             log.info(f"\n  {symbol} OPTIMAL PARAMS:")
             log.info(f"    Entry TF   : {best['entry_tf']}m")
             log.info(f"    HTF        : {best['htf_tf']}m")
-            log.info(f"    SL ATR×    : {best['sl_atr']:.3f}")
+            log.info(f"    SL ATR×    : {best['sl_atr']:.2f}")
             log.info(f"    TP mult    : {best['tp_mult']:.2f}x")
             log.info(f"    Confidence : {best['confidence']:.2f}")
             be = best.get("be_r", 0)
             log.info(f"    Break-even : {'OFF' if be==0 else f'+{be}R → entry+1pt'}")
 
         # ── Per-TF optimisation (top-5 per TF) ────────────────────────
+        # Remove DB rows for TFs no longer being optimized (e.g. 1m, 30m after
+        # removing them from entry_tf_options).  Runs automatically every retrain.
+        delete_strategies_not_in_tfs(symbol, PARAM_SEEDS["entry_tf_options"])
         log.info(f"\n  Per-TF optimisation: {symbol} (top-{TOP_N_STRATEGIES} per TF)")
         for tf in PARAM_SEEDS["entry_tf_options"]:
             if tf not in tf_feat or not scalers_cache.get(f"{symbol}_{tf}m"):
@@ -1090,9 +1094,9 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 if n_trades == 0:
                     log.warning(f"  {strategy_id}: 0 trades — confidence threshold too high or no signal")
                 if stats["win_rate"] >= 99.0:
-                    log.warning(f"  {strategy_id}: WR={stats['win_rate']:.1f}% — likely overfitting (train data leak)")
+                    log.warning(f"  {strategy_id}: WR={stats['win_rate']:.2f}% — likely overfitting (train data leak)")
                 if stats["efficiency_ratio"] >= 500:
-                    log.warning(f"  {strategy_id}: ER={stats['efficiency_ratio']:.1f} — unrealistic, check data split")
+                    log.warning(f"  {strategy_id}: ER={stats['efficiency_ratio']:.2f} — unrealistic, check data split")
                 if stats["max_dd_pct"] < 0.05:
                     log.warning(f"  {strategy_id}: MaxDD={stats['max_dd_pct']:.3f}% near zero — Calmar will be extreme")
 
@@ -1480,17 +1484,17 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             # ── Post-TF summary table ──────────────────────────────────────────
             if tf_summary_rows:
                 log.info(f"\n  ┌─ {symbol} {tf}m — Strategy Summary ({'─'*42}┐")
-                log.info(f"  │ {'Strategy':<22} {'N':>5} {'WR%':>5} {'Sharpe':>7} "
+                log.info(f"  │ {'Strategy':<22} {'N':>5} {'WR%':>6} {'Sharpe':>7} "
                          f"{'Sortino':>7} {'Calmar':>6} {'HC_SR':>6} "
                          f"{'ER':>8} {'DD%':>5} {'MC':>4} {'MCp5':>6} {'MCdd95':>6} "
                          f"{'Sens':>5} {'Rob':>3} {'SPA-p':>6} │")
-                log.info(f"  │ {'─'*22} {'─'*5} {'─'*5} {'─'*7} "
+                log.info(f"  │ {'─'*22} {'─'*5} {'─'*6} {'─'*7} "
                          f"{'─'*7} {'─'*6} {'─'*6} "
                          f"{'─'*8} {'─'*5} {'─'*4} {'─'*6} {'─'*6} "
                          f"{'─'*5} {'─'*3} {'─'*6} │")
                 for r in tf_summary_rows:
                     log.info(
-                        f"  │ {r['id']:<22} {r['trades']:>5} {r['wr']:>5.1f} "
+                        f"  │ {r['id']:<22} {r['trades']:>5} {r['wr']:>6.2f} "
                         f"{r['sharpe']:>7.2f} {r['sortino']:>7.2f} {r['calmar']:>6.2f} "
                         f"{r['hc']:>6.2f} {r['er']:>8.2f} {r['dd']:>5.1f} "
                         f"{r['mc']:>4} {r['mc_p5']:>6.2f} {r['mc_dd95']:>6.1f} "
@@ -1540,7 +1544,7 @@ def _log_final_summary(symbols: list):
 
     # Column widths
     log.info(
-        f"  {'ID':<22} {'TF':>3} {'N':>5} {'WR%':>5} {'Sharpe':>7} "
+        f"  {'ID':<22} {'TF':>3} {'N':>5} {'WR%':>6} {'Sharpe':>7} "
         f"{'HC_SR':>6} {'ER':>8} {'DD%':>5} {'Calmar':>6} "
         f"{'MC':>4} {'MCp5':>6} {'Sens':>5} {'Rob':>3} {'Active':>6}"
     )
@@ -1563,8 +1567,8 @@ def _log_final_summary(symbols: list):
         active = "LIVE" if s.get("is_active") else "    "
 
         log.info(
-            f"  {sid:<22} {s.get('tf',0):>3} {n:>5} {wr:>5.1f} "
-            f"{sh:>7.2f} {hc:>6.2f} {er:>8.2f} {dd:>5.1f} {cal:>6.2f} "
+            f"  {sid:<22} {s.get('tf',0):>3} {n:>5} {wr:>6.2f} "
+            f"{sh:>7.2f} {hc:>6.2f} {er:>8.2f} {dd:>5.2f} {cal:>6.2f} "
             f"{mc:>4} {mc_p5:>6.2f} {sens:>5.0f} {rob:>3} {active:>6}"
         )
 
@@ -1672,7 +1676,7 @@ def _activate_best_strategy(symbol: str):
     b = valid[0]
     log.info(f"  Auto-activated: {best_id} [{tier_used}] "
              f"ER={b['efficiency_ratio']:.2f} "
-             f"WR={b.get('win_rate',0):.1f}% "
+             f"WR={b.get('win_rate',0):.2f}% "
              f"DSR={b.get('haircut_sharpe') or 0:.2f} "
              f"MC={'PASS' if b.get('mc_pass') else 'FAIL'} "
              f"Sens={b.get('sensitivity_score') or 0:.0f} "

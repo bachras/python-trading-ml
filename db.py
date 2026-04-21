@@ -197,6 +197,14 @@ def _add_column_if_missing(conn, table: str, column: str, col_type: str):
 
 def upsert_strategy(row: dict):
     """Insert or replace a strategy_params row."""
+    # Round floats to 2 dp for readability in logs, DB, and reports.
+    # Trading params (sl_atr, tp_mult, confidence, htf_weight) are kept at 4 dp
+    # since they feed live signal generation directly.
+    _4dp = {"sl_atr", "tp_mult", "confidence", "htf_weight"}
+    for k, v in row.items():
+        if isinstance(v, float):
+            row[k] = round(v, 4 if k in _4dp else 2)
+
     row.setdefault("updated_at", datetime.now().isoformat())
     row.setdefault("rr",                None)   # removed param — kept in DB for history
     # Default MC / sensitivity columns so old callers without them still work
@@ -311,6 +319,27 @@ def set_strategy_active(strategy_id: str, active: bool):
         c.execute(
             "UPDATE strategy_params SET is_active=? WHERE strategy_id=?",
             (1 if active else 0, strategy_id)
+        )
+
+
+def delete_strategies_not_in_tfs(symbol: str, active_tfs: list):
+    """
+    Remove DB rows for TFs no longer in PARAM_SEEDS entry_tf_options.
+    Called automatically at the start of each per-TF optimisation run so
+    stale rows (e.g. old 1m / 30m entries) never pollute strategy selection.
+    """
+    placeholders = ",".join("?" * len(active_tfs))
+    with _conn() as c:
+        deleted = c.execute(
+            f"DELETE FROM strategy_params "
+            f"WHERE symbol=? AND tf NOT IN ({placeholders})",
+            [symbol] + list(active_tfs)
+        ).rowcount
+    if deleted:
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            f"[DB] Removed {deleted} stale strategy row(s) for {symbol} "
+            f"(TFs not in {active_tfs})"
         )
 
 
