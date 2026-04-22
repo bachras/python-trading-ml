@@ -122,6 +122,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("train")
 
+# ── Mentor log — separate file for easy sharing ──────────────────────────
+_mentor_log_path = LOG_DIR / f"mentor_{datetime.now():%Y%m%d_%H%M}.log"
+_mentor_handler  = logging.FileHandler(_mentor_log_path, encoding="utf-8")
+_mentor_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+mentor_log = logging.getLogger("mentor")
+mentor_log.setLevel(logging.INFO)
+mentor_log.addHandler(_mentor_handler)
+mentor_log.propagate = False   # don't echo into the main training log
+
 # ── S3: Global random seed — reproducible training runs ─────────────────
 GLOBAL_SEED = int(os.getenv("GLOBAL_SEED", "42"))
 np.random.seed(GLOBAL_SEED)
@@ -777,6 +786,12 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             oos_labels_all  = []
             oos_atr_all     = []   # E2: ATR per OOS bar for calibration stability check
             fold_top10_sets = []   # [IMPORTANCE] cross-fold Jaccard tracking
+            # Mentor log accumulators — written during calibration/F9 blocks, read at end
+            _m_cal_brier_before = float("nan")
+            _m_cal_brier_after  = float("nan")
+            _m_cal_method       = "none"
+            _m_f9_fill_rate     = float("nan")
+            _m_f9_avg_slip      = float("nan")
             for fold_num, (train_df, val_df, oos_label) in enumerate(folds, 1):
                 log.info(f"    Fold {fold_num}/{len(folds)} | OOS={oos_label} | "
                          f"train={len(train_df):,} val={len(val_df):,}")
@@ -800,12 +815,15 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 val_s   = apply_scaler(val_df,   scaler, feat_cols)
 
                 xgb_fold, rf_fold = train_ensemble(train_s, val_s, feat_cols, symbol, tf)
-                X_val = val_s[feat_cols].values
                 y_val = val_df["target"].values
 
+                # Use each model's own feature list (set by fitting on DataFrame)
+                _xgb_fold_f = list(getattr(xgb_fold, "feature_names_in_", feat_cols))
+                _rf_fold_f  = list(getattr(rf_fold,  "feature_names_in_", feat_cols))
+
                 # Collect OOS ensemble probs for isotonic calibration
-                p_xgb_oos = xgb_fold.predict_proba(X_val)[:, 1]
-                p_rf_oos  = rf_fold.predict_proba(X_val)[:, 1]
+                p_xgb_oos = xgb_fold.predict_proba(val_s[_xgb_fold_f].values)[:, 1]
+                p_rf_oos  = rf_fold.predict_proba(val_s[_rf_fold_f].values)[:, 1]
                 oos_probs_all.extend(((p_xgb_oos + p_rf_oos) / 2.0).tolist())
                 oos_labels_all.extend(y_val.tolist())
 
@@ -859,8 +877,9 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 # [IMPORTANCE] per-fold XGB feature importance
                 try:
                     imp = xgb_fold.feature_importances_
+                    _xgb_fi_cols = list(getattr(xgb_fold, "feature_names_in_", feat_cols))
                     top10_idx  = np.argsort(imp)[::-1][:10]
-                    top10_cols = [feat_cols[i] for i in top10_idx]
+                    top10_cols = [_xgb_fi_cols[i] for i in top10_idx]
                     fold_top10_sets.append(set(top10_cols))
                     log.info(f"    [IMPORTANCE] {symbol}/{tf}m fold={fold_num} (XGB gain, top 10):")
                     for rank_i, (ci, col) in enumerate(zip(top10_idx, top10_cols), 1):
@@ -991,6 +1010,9 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                              f"→ after={brier_after:.4f} ({brier_tag}) | "
                              f"max bin delta={max_delta:.3f}"
                              + (" ← ALERT" if max_delta > 0.10 else ""))
+                    _m_cal_brier_before = brier_before
+                    _m_cal_brier_after  = brier_after
+                    _m_cal_method       = "isotonic"
                     if brier_after >= brier_before:
                         # F6: Calibration guard — degraded calibrator harms live trading.
                         # Remove the saved file so live.py uses raw model probabilities.
@@ -1015,6 +1037,7 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                             _cal_path_g9 = MODEL_DIR / f"calibrator_{key}.pkl"
                             if brier_platt < brier_after and brier_platt < brier_before:
                                 joblib.dump(PlattCalibrator(_lr), _cal_path_g9)
+                                _m_cal_method = "platt"
                                 log.info(
                                     f"  [CALIBRATION] G9 Platt wins: "
                                     f"isotonic={brier_after:.4f} Platt={brier_platt:.4f} — saved Platt"
@@ -1088,9 +1111,10 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             # ── Drift reference: feature histograms for top-10 features ──
             # Saved as drift_ref_{key}.pkl — loaded by live.py for PSI monitoring.
             try:
-                importances = xgb_m.feature_importances_
-                top10_idx   = np.argsort(importances)[::-1][:10]
-                top10_cols  = [feat_cols[i] for i in top10_idx]
+                importances    = xgb_m.feature_importances_
+                _xgb_prod_cols = list(getattr(xgb_m, "feature_names_in_", feat_cols))
+                top10_idx      = np.argsort(importances)[::-1][:10]
+                top10_cols     = [_xgb_prod_cols[i] for i in top10_idx]
                 ref_data    = apply_scaler(df, final_scaler, feat_cols)
                 drift_ref   = {}
                 for col in top10_cols:
@@ -1152,6 +1176,21 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             save_optuna_trials(symbol, tf, all_trials)
 
             if not top_trials:
+                _ml_corr = avg_corr_by_tf.get(tf, float("nan"))
+                _ml_jac  = avg_jaccard_by_tf.get(tf, float("nan"))
+                for _ml_line in [
+                    f"{'═'*58}",
+                    f"MENTOR LOG  {symbol} {tf}m  [NO VALID TRIALS]",
+                    f"[GA]          no valid trials — all optimization returned -999",
+                    f"[OPTUNA]      optimization failed — check fill_rate threshold and spread model",
+                    f"[CALIBRATION] n/a", f"[STABILITY]   n/a", f"[SPA]         n/a",
+                    f"[ROBUST]      n/a", f"[RETRAIN]     n/a", f"[BASELINES]   n/a",
+                    f"[EXECUTION]   n/a (F9 not reached)",
+                    f"[ENSEMBLE]    avg_fold_corr={_ml_corr:.3f} | avg_jaccard={_ml_jac:.3f}"
+                    if not (_ml_corr != _ml_corr) else "[ENSEMBLE]    n/a",
+                    f"{'═'*58}",
+                ]:
+                    mentor_log.info(_ml_line)
                 continue
 
             bt_results = backtest_all_strategies(
@@ -1196,6 +1235,8 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     )
                     if len(_pre_result) == 2:
                         _, _es_f9 = _pre_result
+                        _m_f9_fill_rate = _es_f9.get("fill_rate", float("nan"))
+                        _m_f9_avg_slip  = _es_f9.get("avg_slip", float("nan"))
                         if _es_f9["avg_spread"] < 1.0:
                             log.warning(
                                 f"  [EXECUTION] SKIPPED — {symbol} {tf}m not saved: "
@@ -1220,6 +1261,24 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 except Exception as _f9e:
                     log.warning(f"  [EXECUTION] F9 pre-check failed ({_f9e}) — proceeding with save")
             if _exec_skip_tf:
+                _ml_corr = avg_corr_by_tf.get(tf, float("nan"))
+                _ml_jac  = avg_jaccard_by_tf.get(tf, float("nan"))
+                _ml_r1   = top_trials[0] if top_trials else {}
+                _ml_p    = _ml_r1.get("params", {})
+                for _ml_line in [
+                    f"{'═'*58}",
+                    f"MENTOR LOG  {symbol} {tf}m  [SKIPPED — EXECUTION CHECK]",
+                    f"[GA]          best_fitness={_ml_r1.get('fitness', float('nan')):.3f} | n_valid_trials={len(top_trials)}",
+                    f"[OPTUNA]      rank-1 sharpe={_ml_r1.get('stats', {}).get('sharpe', float('nan')):.3f} | entry_tf={_ml_p.get('entry_tf','?')}m",
+                    f"[CALIBRATION] n/a (not reached)", f"[STABILITY]   n/a", f"[SPA]         n/a",
+                    f"[ROBUST]      n/a", f"[RETRAIN]     n/a", f"[BASELINES]   n/a",
+                    f"[EXECUTION]   SKIPPED — fill_rate={_m_f9_fill_rate:.1%} | avg_slip={_m_f9_avg_slip:.2f}pts"
+                    if not (_m_f9_fill_rate != _m_f9_fill_rate) else "[EXECUTION]   SKIPPED",
+                    f"[ENSEMBLE]    avg_fold_corr={_ml_corr:.3f} | avg_jaccard={_ml_jac:.3f}"
+                    if not (_ml_corr != _ml_corr) else "[ENSEMBLE]    n/a",
+                    f"{'═'*58}",
+                ]:
+                    mentor_log.info(_ml_line)
                 continue
 
             tf_summary_rows = []   # collect per-strategy rows for the post-TF table
@@ -1540,10 +1599,11 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
 
                         # 3F / R3: label col, OOS accuracy, and Brier before/after calibration
                         try:
-                            X_rt_log  = rt_val_s[rt_feat_cols].values
-                            y_rt_log  = df_rt.iloc[i_va:]["target"].values
-                            rt_xgb_p  = xgb_rt.predict_proba(X_rt_log)[:, 1]
-                            rt_rf_p   = rf_rt.predict_proba(X_rt_log)[:, 1]
+                            y_rt_log   = df_rt.iloc[i_va:]["target"].values
+                            _xgb_rt_f  = list(getattr(xgb_rt, "feature_names_in_", rt_feat_cols))
+                            _rf_rt_f   = list(getattr(rf_rt,  "feature_names_in_", rt_feat_cols))
+                            rt_xgb_p  = xgb_rt.predict_proba(rt_val_s[_xgb_rt_f].values)[:, 1]
+                            rt_rf_p   = rf_rt.predict_proba(rt_val_s[_rf_rt_f].values)[:, 1]
                             rt_ens_p  = (rt_xgb_p + rt_rf_p) / 2.0
                             rt_acc    = float(((rt_ens_p >= 0.5).astype(int) == y_rt_log).mean())
                             tp_rate   = float(y_rt_log.mean())
@@ -1647,6 +1707,52 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                         f"{r['sens']:>5.0f} {r['robust']:>3} {r['spa']:>6} │"
                     )
                 log.info(f"  └{'─'*104}┘")
+
+            # ── MENTOR LOG: per-TF training summary ───────────────────────────
+            _ml_best  = top_trials[0] if top_trials else {}
+            _ml_params = _ml_best.get("params", {})
+            _ml_stats  = _ml_best.get("stats", {})
+            _ml_n_strat = len(tf_summary_rows)
+            _ml_oos_sw  = oos_sharpe_by_tf.get(tf, float("nan"))
+            _ml_corr    = avg_corr_by_tf.get(tf, float("nan"))
+            _ml_jac     = avg_jaccard_by_tf.get(tf, float("nan"))
+            _ml_r1_sh   = _ml_stats.get("sharpe", float("nan"))
+            _ml_r1_wr   = _ml_stats.get("win_rate", float("nan"))
+            _ml_r1_n    = _ml_stats.get("n_trades", 0)
+            _ml_exec_line = (
+                f"[EXECUTION]   fill_rate={_m_f9_fill_rate:.1%} | avg_slip={_m_f9_avg_slip:.2f}pts"
+                if not (isinstance(_m_f9_fill_rate, float) and _m_f9_fill_rate != _m_f9_fill_rate)
+                else "[EXECUTION]   fill_rate=n/a (F9 not reached or no valid trials)"
+            )
+            _ml_ens_line = (
+                f"[ENSEMBLE]    avg_fold_corr={_ml_corr:.3f} "
+                f"{'DIVERSE' if _ml_corr < 0.90 else 'LOW-DIVERSITY'} "
+                f"| avg_jaccard={_ml_jac:.3f} "
+                f"{'STABLE' if _ml_jac >= 0.65 else 'UNSTABLE'}"
+                if not (isinstance(_ml_corr, float) and _ml_corr != _ml_corr)
+                else "[ENSEMBLE]    corr=n/a (walk-forward not completed)"
+            )
+            _ml_spa_tags = [r.get("spa", "—") for r in tf_summary_rows]
+            _ml_rob_tags = [r.get("robust", "N") for r in tf_summary_rows]
+            _mentor_lines = [
+                f"{'═'*58}",
+                f"MENTOR LOG  {symbol} {tf}m",
+                f"{'─'*58}",
+                f"[GA]          best_fitness={_ml_best.get('fitness', float('nan')):.3f} | n_valid_trials={len(top_trials)}",
+                f"[OPTUNA]      oos_sharpe={_ml_oos_sw:.3f} | rank-1 sharpe={_ml_r1_sh:.3f} | entry_tf={_ml_params.get('entry_tf','?')}m conf={_ml_params.get('confidence', float('nan')):.2f}",
+                f"[CALIBRATION] method={_m_cal_method} | brier: {_m_cal_brier_before:.4f} → {_m_cal_brier_after:.4f}",
+                f"[STABILITY]   see training log [STABILITY] block for confidence curve",
+                f"[SPA]         rank-1 spa={_ml_spa_tags[0] if _ml_spa_tags else '—'} | robust={_ml_rob_tags[0] if _ml_rob_tags else 'N'}",
+                f"[ROBUST]      n_strategies_saved={_ml_n_strat} | mc_pass={tf_summary_rows[0].get('mc','—') if tf_summary_rows else '—'}",
+                f"[RETRAIN]     best_label_col see training log [RETRAIN] entries",
+                f"[BASELINES]   n_trades={_ml_r1_n} | wr={_ml_r1_wr:.1%} | sharpe={_ml_r1_sh:.3f}",
+                _ml_exec_line,
+                _ml_ens_line,
+                f"{'═'*58}",
+            ]
+            for _ml_line in _mentor_lines:
+                log.info(f"  {_ml_line}")
+                mentor_log.info(_ml_line)
 
             # ── Label grid search: all 75 SL×TP×BE combinations ──────────────
             if top_trials and tf_feat.get(tf) is not None:

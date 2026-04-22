@@ -836,12 +836,52 @@ def apply_scaler(df: pd.DataFrame, scaler: StandardScaler,
 # 6. ENSEMBLE MODELS (XGBoost + Random Forest)
 # ─────────────────────────────────────────────────────────────
 
+# Hard feature partition for ensemble diversity.
+# XGB trains only on technical/price-action features.
+# RF  trains only on institutional/market-structure features,
+#     excluding tick-frozen microstructure cols (near-zero variance at 3m+).
+_INST_PREFIXES = (
+    "vwap_", "vp_", "quote_", "stacked_", "absorption",
+    "failed_", "is_swing", "dist_swing", "equal_", "stop_hunt",
+    "approaching_", "wick_", "pin_bar", "regime_", "session_vol",
+    "htf_", "cvd_", "buy_imbalance", "sell_imbalance",
+)
+_TICK_MICRO_FROZEN = frozenset([
+    "vwap_slope5", "vwap_slope20", "vp_poc_migration",
+    "quote_delta", "quote_delta_z", "quote_cvd", "quote_cvd_z",
+    "quote_cvd_slope5", "quote_cvd_slope20", "quote_delta_price_corr",
+    "buy_imbalance_count", "sell_imbalance_count",
+    "stacked_imbalance", "absorption_bull", "absorption_bear",
+    "vwap_dist_pct", "vwap_anch_dist_pct", "quote_delta_pct",
+])
+
+
+def _partition_features(feature_cols: list) -> tuple[list, list]:
+    """Split feature_cols into (xgb_technical, rf_institutional)."""
+    xgb_feats = [c for c in feature_cols if not c.startswith(_INST_PREFIXES)]
+    rf_feats  = [c for c in feature_cols
+                 if c.startswith(_INST_PREFIXES) and c not in _TICK_MICRO_FROZEN]
+    return xgb_feats, rf_feats
+
+
 def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
     log.info(f"  Training ensemble: {symbol} {tf_min}m")
-    X_tr = train_df[feature_cols].values
-    y_tr = train_df["target"].values
-    X_va = val_df[feature_cols].values
-    y_va = val_df["target"].values
+
+    xgb_feats, rf_feats = _partition_features(feature_cols)
+    if len(xgb_feats) < 5:
+        xgb_feats = feature_cols
+        log.warning("  Feature partition: XGB fallback to full set (too few technical features)")
+    if len(rf_feats) < 5:
+        rf_feats = feature_cols
+        log.warning("  Feature partition: RF fallback to full set (too few institutional features)")
+    log.info(f"  Feature partition: XGB={len(xgb_feats)} technical, RF={len(rf_feats)} institutional")
+
+    # Train with DataFrames so feature_names_in_ is stored for inference-time partitioning
+    xgb_tr = train_df[xgb_feats]
+    xgb_va = val_df[xgb_feats]
+    rf_tr  = train_df[rf_feats]
+    y_tr   = train_df["target"].values
+    y_va   = val_df["target"].values
 
     xgb_model = xgb.XGBClassifier(
         n_estimators=400, max_depth=4, learning_rate=0.05,
@@ -851,21 +891,19 @@ def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
         early_stopping_rounds=20, verbosity=0,
         seed=GLOBAL_SEED,
     )
-    xgb_model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+    xgb_model.fit(xgb_tr, y_tr, eval_set=[(xgb_va, y_va)], verbose=False)
 
     # Cap bootstrap sample to 500K rows — RF generalises well with subsampling
-    # (each tree already bootstraps), and avoids joblib memory fragmentation on
-    # large final-fit datasets (~1.77M rows).  n_jobs=4 limits parallel forks.
-    _rf_max_samples = min(500_000, len(X_tr))
+    _rf_max_samples = min(500_000, len(rf_tr))
     rf_model = RandomForestClassifier(
         n_estimators=300, max_depth=12, min_samples_leaf=50, max_features=0.3,
         n_jobs=4, max_samples=_rf_max_samples, random_state=GLOBAL_SEED,
     )
-    log.info(f"  RF fit: {len(X_tr):,} rows → max_samples={_rf_max_samples:,}, n_jobs=4")
-    rf_model.fit(X_tr, y_tr)
+    log.info(f"  RF fit: {len(rf_tr):,} rows → max_samples={_rf_max_samples:,}, n_jobs=4")
+    rf_model.fit(rf_tr, y_tr)
 
-    xgb_val_acc = (xgb_model.predict(X_va) == y_va).mean()
-    rf_val_acc  = (rf_model.predict(X_va)  == y_va).mean()
+    xgb_val_acc = (xgb_model.predict(xgb_va) == y_va).mean()
+    rf_val_acc  = (rf_model.predict(val_df[rf_feats]) == y_va).mean()
 
     path_xgb = MODEL_DIR / f"xgb_{symbol}_{tf_min}m.pkl"
     path_rf  = MODEL_DIR / f"rf_{symbol}_{tf_min}m.pkl"
@@ -999,15 +1037,16 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
 
     # ── Scale features and generate ensemble signal ────────────────────
     scaled      = apply_scaler(df, scaler, feature_cols)
-    feat        = scaled[feature_cols].values
     atr         = df["atr14"].values
     closes      = df["Close"].values
     highs       = df["High"].values
     lows        = df["Low"].values
     opens       = df["Open"].values
 
-    p_xgb = xgb_m.predict_proba(feat)[:, 1]
-    p_rf  = rf_m.predict_proba(feat)[:, 1]
+    _xgb_f = list(getattr(xgb_m, "feature_names_in_", feature_cols))
+    _rf_f  = list(getattr(rf_m,  "feature_names_in_", feature_cols))
+    p_xgb = xgb_m.predict_proba(scaled[_xgb_f].values)[:, 1]
+    p_rf  = rf_m.predict_proba(scaled[_rf_f].values)[:, 1]
     signal_prob = (p_xgb + p_rf) / 2.0
 
     # ── HTF nudge: apply same probability adjustment as get_signal() ──
@@ -1238,7 +1277,7 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
     # zero-friction world (fill_rate too high) or are untradeable (too low).
     _fill_rate     = _ts_fills    / max(_ts_n_signals, 1)
     _gap_skip_rate = _ts_gap_skip / max(_ts_delayed,   1)
-    if _fill_rate > 0.92:
+    if _fill_rate > 0.96:
         return (-999.0,)  # G1: hard abort — execution filter clearly not working
     if _fill_rate < 0.75:
         fitness *= 0.85   # too selective — pathological SL/spread combo
@@ -1373,12 +1412,12 @@ def run_optuna(df_dict: dict, models_by_tf: dict,
          "confidence": 0.65, "htf_weight": 0.6, "be_r_idx": 1},
         # Aggressive: tight SL, high TP, lower confidence
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(3),
-         "htf_idx": PARAM_SEEDS["htf_options"].index(15),
+         "htf_idx": PARAM_SEEDS["htf_options"].index(60),
          "sl_atr": 2.0, "tp_mult": 4.0,
          "confidence": 0.55, "htf_weight": 0.4, "be_r_idx": 2},
         # Scalp: wide SL, 1.5:1 TP floor, very high confidence (1m removed; use 3m)
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(3),
-         "htf_idx": PARAM_SEEDS["htf_options"].index(15),
+         "htf_idx": PARAM_SEEDS["htf_options"].index(60),
          "sl_atr": 2.0, "tp_mult": 1.5,
          "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
         # Runner: wide SL, high TP, no HTF (capped at 5.0 per GA_BOUNDS)
@@ -1475,7 +1514,7 @@ def run_per_tf_optimization(
          "sl_atr": 2.0, "tp_mult": 2.0,
          "confidence": 0.65, "htf_weight": 0.5, "be_r_idx": 1},
         # Scalp (sl_atr floored to 2.0; tp_mult floored to 1.5 per G2)
-        {"htf_idx": PARAM_SEEDS["htf_options"].index(15),
+        {"htf_idx": PARAM_SEEDS["htf_options"].index(60),
          "sl_atr": 2.0, "tp_mult": 1.5,
          "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
         # Wide swing
@@ -1487,7 +1526,7 @@ def run_per_tf_optimization(
          "sl_atr": 2.0, "tp_mult": 3.0,
          "confidence": 0.60, "htf_weight": 0.0, "be_r_idx": 3},
         # High conviction runner (capped at 5.0 per GA_BOUNDS upper bound)
-        {"htf_idx": PARAM_SEEDS["htf_options"].index(15),
+        {"htf_idx": PARAM_SEEDS["htf_options"].index(60),
          "sl_atr": 2.0, "tp_mult": 5.0,
          "confidence": 0.85, "htf_weight": 0.6, "be_r_idx": 2},
     ]
@@ -1591,14 +1630,16 @@ def get_signal(symbol: str, params: dict,
     scaled = apply_scaler(df.tail(SEQ_LEN + 5), scaler, feature_cols)
 
     # XGBoost + Random Forest signal (equal-weight average)
-    last_feat = scaled[feature_cols].iloc[-1:].values
+    # Use feature_names_in_ so each model receives its own partitioned feature set
     p_xgb, p_rf = 0.5, 0.5
     xgb_m = models_cache.get(f"xgb_{key}")
     rf_m  = models_cache.get(f"rf_{key}")
     if xgb_m is not None:
-        p_xgb = float(xgb_m.predict_proba(last_feat)[0][1])
+        _xgb_f = list(getattr(xgb_m, "feature_names_in_", feature_cols))
+        p_xgb = float(xgb_m.predict_proba(scaled[_xgb_f].iloc[-1:].values)[0][1])
     if rf_m is not None:
-        p_rf  = float(rf_m.predict_proba(last_feat)[0][1])
+        _rf_f = list(getattr(rf_m, "feature_names_in_", feature_cols))
+        p_rf  = float(rf_m.predict_proba(scaled[_rf_f].iloc[-1:].values)[0][1])
 
     prob_raw = (p_xgb + p_rf) / 2.0
 
