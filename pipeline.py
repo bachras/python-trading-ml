@@ -96,7 +96,7 @@ def engineer_full_features(df: pd.DataFrame,
     """Standard technical + institutional features."""
     if df.empty or len(df) < MIN_BARS:
         return df
-    d = p2.engineer_features(df)
+    d = p2.engineer_features(df, tf_min=tf_minutes)
     if d.empty:
         return d
     if not is_tick_derived:

@@ -59,6 +59,16 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import f1_score
 import joblib
 
+
+class PlattCalibrator:
+    """Thin wrapper around LogisticRegression giving the same .predict() API as IsotonicRegression.
+    Serialised as part of calibrator_{key}.pkl and loaded by pipeline.py into scalers_cache."""
+    def __init__(self, lr):
+        self.lr = lr
+
+    def predict(self, X):
+        return self.lr.predict_proba(np.array(X).reshape(-1, 1))[:, 1]
+
 import xgboost as xgb
 from deap import base, creator, tools, algorithms
 
@@ -399,10 +409,11 @@ def fetch_all_timeframes(symbol: str) -> dict:
 # 3. FEATURE ENGINEERING
 # ─────────────────────────────────────────────────────────────
 
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+def engineer_features(df: pd.DataFrame, tf_min: int | None = None) -> pd.DataFrame:
     """
     Full feature set: returns, trend EMAs, momentum, volatility,
     volume, session flags, cyclical time encoding, lag features.
+    tf_min: entry timeframe in minutes — used to restrict TP grid for 15m (no tp=4,5).
     """
     d = df.copy()
     c, h, l, v = d["Close"], d["High"], d["Low"], d["Volume"]
@@ -525,8 +536,9 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # ga_fitness() selects the closest column in 3D (sl_atr, tp_mult, be_r)
     # via _select_label_col(sl_atr, tp_mult, be_r).
     MAX_HOLD   = 50
-    TB_SL_GRID = [1.5, 2.0, 2.5, 3.0, 3.5]
-    TB_TP_GRID = [1,   2,   3,   4,   5  ]
+    TB_SL_GRID = [2.0, 2.5, 3.0, 3.5]   # sl=1.5 removed: cost/SL ratio too high after friction
+    # G5: 15m bars are slower-moving; tp=4,5 is an unreachable target within 50 bars.
+    TB_TP_GRID = [1, 2, 3] if tf_min == 15 else [1, 2, 3, 4, 5]
     TB_BE_GRID = [0,   1,   2]
     BE_OFFSET  = 1.0   # SL moves to entry + 1 price unit when BE triggers
 
@@ -539,6 +551,14 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
         bad_atr = np.isnan(atr_arr) | (atr_arr <= 0)
 
+        # F5: spread-aware labels — entry fills at ask = close + half_spread (long).
+        # TP is harder to reach (higher target); SL is easier to hit (higher floor).
+        if "spread_mean" in d.columns:
+            _spread_raw = d["spread_mean"].values.astype(np.float64)
+            _half_spread = np.where(np.isnan(_spread_raw), 0.0, _spread_raw * 0.5)
+        else:
+            _half_spread = np.zeros(n, dtype=np.float64)
+
         # ── be=0: vectorized (no state change, same as before) ──────────
         # Label encoding: 1.0 = TP hit (win), 0.0 = SL hit or timeout (not-win).
         # Binary encoding for XGBoost/RF: predict_proba gives P(TP hit).
@@ -547,8 +567,8 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
                 col     = f"target_sl{sl_v}_tp{tp_v}_be0"
                 labels  = np.full(n, np.nan, dtype=np.float32)
                 sl_dist = atr_arr * sl_v
-                long_tp = closes_arr + sl_dist * tp_v
-                long_sl = closes_arr - sl_dist
+                long_tp = closes_arr + _half_spread + sl_dist * tp_v
+                long_sl = closes_arr + _half_spread - sl_dist
 
                 unlabelled = np.ones(n, dtype=bool)
                 unlabelled[bad_atr] = False
@@ -589,7 +609,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
                     for i in range(n):
                         if bad_atr[i]:
                             continue
-                        entry   = closes_arr[i]
+                        entry   = closes_arr[i] + _half_spread[i]  # F5: spread-adjusted entry
                         sl_dist = sl_dist_arr[i]
                         tp_lvl  = entry + sl_dist * tp_v    # TP level (long)
                         sl_lvl  = entry - sl_dist           # initial SL (long)
@@ -624,15 +644,15 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
                     d[col] = labels
 
-        # Default `target` = be=0 mid-grid column (sl=1.5, tp=2, be=0).
+        # Default `target` = be=0 mid-grid column (sl=2.0, tp=2, be=0).
         # Used by walk-forward fold training (search phase — acceptable approximation).
         # train.py overwrites this with the rank-1 best-matching label before
         # saving the final production model, fixing model calibration.
-        d["target"]        = d["target_sl1.5_tp2_be0"]
+        d["target"]        = d["target_sl2.0_tp2_be0"]
         d["target_return"] = d["logr1"].shift(-1)
     else:
         # Fallback if ATR not yet computed (should not happen in normal flow)
-        for sl_v in [1.5, 2.0, 2.5, 3.0, 3.5]:
+        for sl_v in [2.0, 2.5, 3.0, 3.5]:
             for tp_v in [1, 2, 3, 4, 5]:
                 for be_v in [0, 1, 2]:
                     d[f"target_sl{sl_v}_tp{tp_v}_be{be_v}"] = (c.shift(-1) > c).astype(int)
@@ -679,7 +699,7 @@ def add_htf_alignment(entry_df: pd.DataFrame,
     if htf_df.empty or htf_weight == 0:
         return entry_df
 
-    htf_feat = engineer_features(htf_df.copy())
+    htf_feat = engineer_features(htf_df.copy(), tf_min=htf_tf if htf_tf else None)
     if htf_feat.empty:
         return entry_df
 
@@ -824,8 +844,9 @@ def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
     y_va = val_df["target"].values
 
     xgb_model = xgb.XGBClassifier(
-        n_estimators=400, max_depth=6, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8,
+        n_estimators=400, max_depth=4, learning_rate=0.05,
+        subsample=0.7, colsample_bytree=0.6,
+        reg_lambda=2.0, min_child_weight=30,
         use_label_encoder=False, eval_metric="logloss",
         early_stopping_rounds=20, verbosity=0,
         seed=GLOBAL_SEED,
@@ -837,7 +858,7 @@ def train_ensemble(train_df, val_df, feature_cols, symbol, tf_min):
     # large final-fit datasets (~1.77M rows).  n_jobs=4 limits parallel forks.
     _rf_max_samples = min(500_000, len(X_tr))
     rf_model = RandomForestClassifier(
-        n_estimators=300, max_depth=8, min_samples_leaf=10,
+        n_estimators=300, max_depth=12, min_samples_leaf=50, max_features=0.3,
         n_jobs=4, max_samples=_rf_max_samples, random_state=GLOBAL_SEED,
     )
     log.info(f"  RF fit: {len(X_tr):,} rows → max_samples={_rf_max_samples:,}, n_jobs=4")
@@ -870,7 +891,7 @@ GA_BOUNDS = [
     # Sub-2.0 SL is not viable: spread+slippage cost (~3.5 pts) consumes > 15%
     # of the SL distance on tight stops, making the edge disappear after friction.
     (2.0, 4.0),    # sl_atr  (was 1.0; hard floor enforced inside ga_fitness too)
-    (0.5, 6.0),    # tp_mult (grid covers 1–5, allow 0.5 overhang)
+    (1.5, 5.0),    # tp_mult — hard floor matches ga_fitness guard; G2 fix for TP collapse
     (PARAM_SEEDS["confidence_min"],PARAM_SEEDS["confidence_max"]),
     (PARAM_SEEDS["htf_weight_min"],PARAM_SEEDS["htf_weight_max"]),
     (0, len(PARAM_SEEDS["be_r_options"]) - 1),        # BE trigger index (0/1/2/3R)
@@ -910,14 +931,14 @@ def _select_label_col(sl_atr: float, tp_mult: float, be_r: int = 0) -> str:
       tp_mult ∈ [1, 2, 3, 4, 5]
       be      ∈ [0, 1, 2]  (be_r=3 maps to be=2 — same label, see D2b)
     """
-    _SL_GRID = [1.5, 2.0, 2.5, 3.0, 3.5]
+    _SL_GRID = [2.0, 2.5, 3.0, 3.5]
     _TP_GRID = [1,   2,   3,   4,   5  ]
 
     # Genome be_r=3 shares the be=2 label (both trigger at 2R or beyond;
     # practically indistinguishable in the triple-barrier scan).
     be_label = min(be_r, 2)
 
-    best_col  = "target_sl1.5_tp2_be0"
+    best_col  = "target_sl2.0_tp2_be0"
     best_dist = float("inf")
     for sv in _SL_GRID:
         for tv in _TP_GRID:
@@ -972,7 +993,7 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
         params["sl_atr"], params["tp_mult"], params.get("be_r", 0)
     )
     if label_col not in df.columns or df[label_col].dropna().empty:
-        label_col = "target_sl1.5_tp2_be0"   # fallback to default mid-grid be=0 column
+        label_col = "target_sl2.0_tp2_be0"   # fallback to default mid-grid be=0 column
     if label_col not in df.columns:
         label_col = "target"   # final fallback if even the default is missing
 
@@ -994,6 +1015,9 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
     # htf_tf=0 or htf_weight=0 means HTF is skipped — optimizer can discover this.
     htf_tf  = params.get("htf_tf", 0)
     htf_w   = params.get("htf_weight", 0.0)
+    # G7: HTF must be strictly higher TF than entry — same or lower defeats the purpose.
+    if htf_tf > 0 and htf_tf <= entry_tf:
+        return (-999.0,)
     htf_dir_arr = np.zeros(len(df), dtype=np.float32)
     if htf_tf > 0 and htf_w > 0 and htf_tf in df_dict:
         htf_full   = df_dict[htf_tf]
@@ -1059,6 +1083,11 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
     if sl_atr < 2.0:
         return (-np.inf,)
 
+    # G2: Hard TP floor — sub-1.5 TP creates fake high win rate from noise wins.
+    # Optimizer escapes to tp≈0.5 where almost every move is a "win" — meaningless.
+    if tp_mult < 1.5:
+        return (-999.0,)
+
     cost_ratio_sum = 0.0   # F2: accumulated (spread+slip) / sl_dist per fill
 
     for i in range(SEQ_LEN, len(df) - 1):
@@ -1100,8 +1129,8 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
             if gap_pts > MT5_DEVIATION_PTS:
                 _ts_gap_skip += 1
                 continue  # gap exceeds MT5 deviation limit — missed fill
-            # F1: reject delayed fill if price moved > 40% of ATR (fast-moving bar)
-            if gap_pts > 0.4 * atr[i]:
+            # F1: reject delayed fill if price moved > 35% of ATR (tightened from 40%)
+            if gap_pts > 0.35 * atr[i]:
                 _ts_gap_skip += 1
                 continue
             fill_price = opens[i + 1]
@@ -1209,8 +1238,8 @@ def ga_fitness(genome, df_dict: dict, models_by_tf: dict, scalers_by_tf: dict, s
     # zero-friction world (fill_rate too high) or are untradeable (too low).
     _fill_rate     = _ts_fills    / max(_ts_n_signals, 1)
     _gap_skip_rate = _ts_gap_skip / max(_ts_delayed,   1)
-    if _fill_rate > 0.95:
-        fitness *= 0.80   # almost nothing rejected — unrealistic
+    if _fill_rate > 0.92:
+        return (-999.0,)  # G1: hard abort — execution filter clearly not working
     if _fill_rate < 0.75:
         fitness *= 0.85   # too selective — pathological SL/spread combo
     if _gap_skip_rate < 0.01:
@@ -1347,15 +1376,15 @@ def run_optuna(df_dict: dict, models_by_tf: dict,
          "htf_idx": PARAM_SEEDS["htf_options"].index(15),
          "sl_atr": 2.0, "tp_mult": 4.0,
          "confidence": 0.55, "htf_weight": 0.4, "be_r_idx": 2},
-        # Scalp: wide SL, 1:1 TP, very high confidence (1m removed; use 3m)
+        # Scalp: wide SL, 1.5:1 TP floor, very high confidence (1m removed; use 3m)
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(3),
          "htf_idx": PARAM_SEEDS["htf_options"].index(15),
-         "sl_atr": 2.0, "tp_mult": 1.0,
+         "sl_atr": 2.0, "tp_mult": 1.5,
          "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
-        # Runner: wide SL, very high TP, no HTF
+        # Runner: wide SL, high TP, no HTF (capped at 5.0 per GA_BOUNDS)
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(5),
          "htf_idx": PARAM_SEEDS["htf_options"].index(0),
-         "sl_atr": 2.5, "tp_mult": 6.0,
+         "sl_atr": 2.5, "tp_mult": 5.0,
          "confidence": 0.70, "htf_weight": 0.0, "be_r_idx": 3},
         # Swing: 15m entry, 4H HTF, medium params
         {"entry_tf_idx": PARAM_SEEDS["entry_tf_options"].index(15),
@@ -1445,9 +1474,9 @@ def run_per_tf_optimization(
         {"htf_idx": PARAM_SEEDS["htf_options"].index(60),
          "sl_atr": 2.0, "tp_mult": 2.0,
          "confidence": 0.65, "htf_weight": 0.5, "be_r_idx": 1},
-        # Scalp (sl_atr floored to 2.0 per SL floor rule)
+        # Scalp (sl_atr floored to 2.0; tp_mult floored to 1.5 per G2)
         {"htf_idx": PARAM_SEEDS["htf_options"].index(15),
-         "sl_atr": 2.0, "tp_mult": 1.0,
+         "sl_atr": 2.0, "tp_mult": 1.5,
          "confidence": 0.80, "htf_weight": 0.3, "be_r_idx": 0},
         # Wide swing
         {"htf_idx": PARAM_SEEDS["htf_options"].index(240),
@@ -1457,9 +1486,9 @@ def run_per_tf_optimization(
         {"htf_idx": PARAM_SEEDS["htf_options"].index(0),
          "sl_atr": 2.0, "tp_mult": 3.0,
          "confidence": 0.60, "htf_weight": 0.0, "be_r_idx": 3},
-        # High conviction runner
+        # High conviction runner (capped at 5.0 per GA_BOUNDS upper bound)
         {"htf_idx": PARAM_SEEDS["htf_options"].index(15),
-         "sl_atr": 2.0, "tp_mult": 7.0,
+         "sl_atr": 2.0, "tp_mult": 5.0,
          "confidence": 0.85, "htf_weight": 0.6, "be_r_idx": 2},
     ]
     for ws in _per_tf_warm_starts:
@@ -1853,7 +1882,7 @@ def run_historical_training() -> tuple:
         # Engineer features for each TF
         tf_feat = {}
         for tf, raw_df in tf_raw.items():
-            feat_df = engineer_features(raw_df)
+            feat_df = engineer_features(raw_df, tf_min=tf)
             if len(feat_df) >= MIN_BARS:
                 tf_feat[tf] = feat_df
 
@@ -1987,7 +2016,7 @@ def run_live_loop(models_cache: dict, scalers_cache: dict,
                 # Refresh entry TF data (last 200 bars is enough for live)
                 fresh_entry = fetch_bars(symbol, entry_tf, n_bars=300)
                 if not fresh_entry.empty:
-                    fresh_entry = engineer_features(fresh_entry)
+                    fresh_entry = engineer_features(fresh_entry, tf_min=entry_tf)
                     live_data[f"{symbol}_{entry_tf}m"] = fresh_entry
 
                 # Refresh HTF data if active

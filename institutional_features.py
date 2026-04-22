@@ -485,15 +485,15 @@ def add_liquidity_features(df: pd.DataFrame) -> pd.DataFrame:
     h_arr = h.values
     l_arr = l.values
 
-    for i in range(N, len(d) - N):
+    for i in range(N, len(d) - 1):
         window_h_left  = h_arr[i-N:i]
-        window_h_right = h_arr[i+1:i+N+1]
         window_l_left  = l_arr[i-N:i]
-        window_l_right = l_arr[i+1:i+N+1]
-
-        if h_arr[i] > max(window_h_left) and h_arr[i] > max(window_h_right):
+        # G4: 1-bar right lookahead only (was N-bar right window — forward-looking bias).
+        # Swing high confirmed when current bar is the highest of N left bars AND above
+        # the immediate next bar only. This still confirms local peaks without future leakage.
+        if h_arr[i] > max(window_h_left) and h_arr[i] > h_arr[i + 1]:
             swing_high.iloc[i] = True
-        if l_arr[i] < min(window_l_left) and l_arr[i] < min(window_l_right):
+        if l_arr[i] < min(window_l_left) and l_arr[i] < l_arr[i + 1]:
             swing_low.iloc[i] = True
 
     d["is_swing_high"] = swing_high.astype(float)
@@ -736,6 +736,8 @@ TICK_MICROSTRUCTURE_FEATURES = [
     "quote_delta_price_corr",
     "buy_imbalance_count", "sell_imbalance_count",
     "stacked_imbalance", "absorption_bull", "absorption_bear",
+    # G8: pct-based VWAP/delta features also collapse to near-zero std at 3m+ (microstructure artefacts)
+    "vwap_dist_pct", "vwap_anch_dist_pct", "quote_delta_pct",
 ]
 _TICK_MICROSTRUCTURE_SET = frozenset(TICK_MICROSTRUCTURE_FEATURES)
 

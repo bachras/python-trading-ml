@@ -48,6 +48,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression as _LR
 from sklearn.metrics import roc_auc_score
 from dotenv import load_dotenv
 load_dotenv()
@@ -501,7 +502,7 @@ def _walk_forward_folds(df: pd.DataFrame):
 # Label grid search — explicit sweep of all 75 SL×TP×BE combinations
 # ─────────────────────────────────────────────────────────────────────
 
-_SL_GRID = [1.5, 2.0, 2.5, 3.0, 3.5]
+_SL_GRID = [2.0, 2.5, 3.0, 3.5]
 _TP_GRID = [1,   2,   3,   4,   5  ]
 _BE_GRID = [0,   1,   2              ]
 
@@ -512,7 +513,9 @@ def _run_label_grid_search(
     best_params: dict,
 ) -> None:
     """
-    Sweep all 75 SL×TP×BE label combinations for a given TF.
+    Sweep all SL×TP×BE label combinations for a given TF.
+    Grid size: 60 combos for 3m/5m/10m (4 SL × 5 TP × 3 BE),
+               36 combos for 15m        (4 SL × 3 TP × 3 BE — tp=4,5 unreachable).
 
     Uses the already-saved production model + scaler for this TF.
     Keeps confidence, htf_tf, and htf_weight from best_params so only
@@ -577,13 +580,16 @@ def _run_label_grid_search(
                         row += f"  {'n/a':>6}"
                 log.info(row)
 
-    # ── 2. Backtest all 75 combinations ─────────────────────────────
+    # ── 2. Backtest all combinations ─────────────────────────────────
+    # G5: 15m restricts TP grid to [1,2,3] — tp=4,5 labels were never generated
+    # because those targets are unreachable within MAX_HOLD=50 bars at 15m ATR scale.
+    _tp_grid_local = [1, 2, 3] if tf == 15 else _TP_GRID
     combos = [
         {"sl_atr": sl_v, "tp_mult": float(tp_v), "be_r": be_v,
          "confidence": conf, "htf_tf": htf_tf, "htf_weight": htf_weight,
          "entry_tf": tf}
         for sl_v in _SL_GRID
-        for tp_v in _TP_GRID
+        for tp_v in _tp_grid_local
         for be_v in _BE_GRID
     ]
 
@@ -592,7 +598,7 @@ def _run_label_grid_search(
     _orig_level = _bt_log.level
     _bt_log.setLevel(_lg.WARNING)   # silence per-backtest INFO lines during sweep
 
-    log.info(f"  [GRID] {symbol}/{tf}m — running 75 backtest combos "
+    log.info(f"  [GRID] {symbol}/{tf}m — running {len(combos)} backtest combos "
              f"(conf={conf:.2f}, last {len(bt_df):,} bars)...")
 
     for combo in combos:
@@ -678,6 +684,11 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             continue
         all_data[symbol] = tf_feat
 
+        # G3/G6/G10: per-TF stats carried from walk-forward loop to per-TF optimization loop
+        avg_jaccard_by_tf   = {}   # G6: cross-fold Jaccard stability
+        oos_sharpe_by_tf    = {}   # G10: recency-weighted OOS pseudo-Sharpe
+        avg_corr_by_tf      = {}   # G3: avg XGB/RF corr for diversity discount
+
         # ── Train / resume per entry TF ────────────────────────────────
         for tf in PARAM_SEEDS["entry_tf_options"]:
             if tf not in tf_feat:
@@ -760,6 +771,8 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
 
             fold_xgb_scores = []
             fold_rf_scores  = []
+            fold_sharpes    = []   # G10: per-fold OOS pseudo-Sharpe for recency weighting
+            fold_corrs      = []   # G3: per-fold XGB/RF correlation for diversity discount
             oos_probs_all   = []   # stacked OOS ensemble probs for calibration
             oos_labels_all  = []
             oos_atr_all     = []   # E2: ATR per OOS bar for calibration stability check
@@ -795,6 +808,34 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 p_rf_oos  = rf_fold.predict_proba(X_val)[:, 1]
                 oos_probs_all.extend(((p_xgb_oos + p_rf_oos) / 2.0).tolist())
                 oos_labels_all.extend(y_val.tolist())
+
+                # G10: per-fold pseudo-Sharpe for recency-weighted OOS Sharpe
+                try:
+                    _ens_p = (p_xgb_oos + p_rf_oos) / 2.0
+                    _conf = PARAM_SEEDS.get("confidence_seed", 0.65)
+                    _long_mask = _ens_p >= _conf
+                    _y_fold = y_val[_long_mask]
+                    if len(_y_fold) >= 10:
+                        _pnls_fold = np.where(_y_fold == 1, 2.0, -1.0)  # fixed tp=2R, sl=1R approx
+                        _dates_fold = val_df.index[_long_mask]
+                        _day_ints_f = (
+                            np.array(_dates_fold, dtype="datetime64[D]") -
+                            np.array(_dates_fold[0], dtype="datetime64[D]")
+                        ).astype(int)
+                        _n_days_f = int(_day_ints_f[-1]) + 1
+                        _dpnl_f = np.zeros(_n_days_f)
+                        np.add.at(_dpnl_f, _day_ints_f, _pnls_fold)
+                        _eq_f = 10000.0 + np.cumsum(_dpnl_f)
+                        _ret_f = np.diff(_eq_f) / (_eq_f[:-1] + 1e-10)
+                        if len(_ret_f) >= 2:
+                            _fs = float(_ret_f.mean() / (_ret_f.std() + 1e-10) * np.sqrt(252))
+                            fold_sharpes.append(_fs)
+                        else:
+                            fold_sharpes.append(0.0)
+                    else:
+                        fold_sharpes.append(0.0)
+                except Exception:
+                    fold_sharpes.append(0.0)
 
                 # [FOLD] AUC per fold
                 try:
@@ -836,13 +877,15 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 if "atr14" in val_df.columns:
                     oos_atr_all.extend(val_df["atr14"].tolist())
 
-                # A8: ensemble diversity check — verify XGB and RF are not duplicating each other.
+                # A8/G3: ensemble diversity check — verify XGB and RF are not duplicating each other.
                 # Low diversity (corr > 0.90) means averaging adds noise without signal.
+                # G3: 20% discount applied to expected_sharpe when avg fold corr > 0.90.
                 if len(p_xgb_oos) >= 10:
                     std_x = float(np.std(p_xgb_oos))
                     std_r = float(np.std(p_rf_oos))
                     corr  = (float(np.corrcoef(p_xgb_oos, p_rf_oos)[0, 1])
                              if std_x > 0 and std_r > 0 else 1.0)
+                    fold_corrs.append(corr)
                     disagree = float(np.mean(np.abs(p_xgb_oos - p_rf_oos) > 0.10))
                     div_tag  = "ADEQUATE" if corr < 0.90 and disagree > 0.15 else "LOW"
                     if div_tag == "LOW":
@@ -872,11 +915,12 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     jaccards.append(j)
                     jaccard_parts.append(f"fold{i}↔{i+1}={j:.2f}")
                 avg_j = float(np.mean(jaccards))
-                j_tag = "OK" if avg_j >= 0.60 else "LOW — model uses different features per fold"
+                j_tag = "OK" if avg_j >= 0.65 else "LOW — model uses different features per fold"
                 log.info(
                     f"  [IMPORTANCE] {symbol}/{tf}m cross-fold Jaccard: "
                     f"{', '.join(jaccard_parts)}, avg={avg_j:.2f} ({j_tag})"
                 )
+                avg_jaccard_by_tf[tf] = avg_j   # G6: carried to strategy-saving loop
                 # Log consistent top-3 across all folds
                 consistent = fold_top10_sets[0].copy()
                 for s in fold_top10_sets[1:]:
@@ -885,6 +929,31 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     log.info(
                         f"  [IMPORTANCE] Consistent across all folds: {sorted(consistent)}"
                     )
+
+            # G3: store avg fold corr for diversity discount
+            if fold_corrs:
+                avg_corr_by_tf[tf] = float(np.mean(fold_corrs))
+                if avg_corr_by_tf[tf] > 0.90:
+                    log.warning(
+                        f"  [ENSEMBLE] {symbol} {tf}m avg fold corr={avg_corr_by_tf[tf]:.3f} > 0.90 "
+                        f"— G3: 20% expected_sharpe discount will be applied"
+                    )
+
+            # G10: recency-weighted OOS pseudo-Sharpe (most recent folds weighted higher)
+            if fold_sharpes:
+                _fw = [0.20, 0.35, 0.45]
+                if len(fold_sharpes) == 3:
+                    _oos_sw = sum(w * s for w, s in zip(_fw, fold_sharpes))
+                elif len(fold_sharpes) == 2:
+                    _oos_sw = 0.40 * fold_sharpes[0] + 0.60 * fold_sharpes[1]
+                else:
+                    _oos_sw = float(fold_sharpes[0])
+                oos_sharpe_by_tf[tf] = _oos_sw
+                log.info(
+                    f"  [G10] {symbol} {tf}m recency-weighted OOS Sharpe: "
+                    + " | ".join(f"fold{i+1}={s:.3f}" for i, s in enumerate(fold_sharpes))
+                    + f" | weighted={_oos_sw:.3f}"
+                )
 
             # Fit isotonic calibrator on all stacked OOS predictions
             # Makes confidence threshold meaningful: calibrated prob ≈ actual win rate
@@ -933,6 +1002,31 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                             f"({brier_before:.4f} → {brier_after:.4f}). "
                             f"Deleted calibrator_{key}.pkl — raw probabilities will be used live."
                         )
+
+                    # G9: if max bin delta > 0.10, try Platt scaling as alternative.
+                    # Isotonic can overfit on small OOS pools; Platt (logistic) is smoother.
+                    if max_delta > 0.10:
+                        try:
+                            from phase2_adaptive_engine import PlattCalibrator
+                            _lr = _LR(C=1.0, max_iter=1000, solver="lbfgs")
+                            _lr.fit(np.array(oos_probs_all).reshape(-1, 1), oos_labels_all)
+                            _platt_p = _lr.predict_proba(np.array(oos_probs_all).reshape(-1, 1))[:, 1]
+                            brier_platt = float(np.mean((_platt_p - np.array(oos_labels_all)) ** 2))
+                            _cal_path_g9 = MODEL_DIR / f"calibrator_{key}.pkl"
+                            if brier_platt < brier_after and brier_platt < brier_before:
+                                joblib.dump(PlattCalibrator(_lr), _cal_path_g9)
+                                log.info(
+                                    f"  [CALIBRATION] G9 Platt wins: "
+                                    f"isotonic={brier_after:.4f} Platt={brier_platt:.4f} — saved Platt"
+                                )
+                            else:
+                                log.info(
+                                    f"  [CALIBRATION] G9 Platt tried: "
+                                    f"isotonic={brier_after:.4f} Platt={brier_platt:.4f} — kept isotonic"
+                                )
+                        except Exception as _g9e:
+                            log.warning(f"  [CALIBRATION] G9 Platt fallback failed: {_g9e}")
+
                     if len(oos_probs_all) < 10_000:
                         log.warning(
                             f"  [CALIBRATION] Small OOS pool ({len(oos_probs_all):,} samples) "
@@ -1080,6 +1174,54 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
             except Exception:
                 _sens_models_ok = False
 
+            # F9: Execution model pre-check — validate spread/slip/fill before committing
+            # any strategies to DB. If the execution model is broken (zero-friction world),
+            # don't save — log SKIPPED and move on to next TF.
+            _exec_skip_tf = False
+            if top_trials and _sens_models_ok:
+                try:
+                    _r1p_f9 = top_trials[0]["params"]
+                    _tf_idx_f9  = PARAM_SEEDS["entry_tf_options"].index(_r1p_f9["entry_tf"])
+                    _htf_idx_f9 = PARAM_SEEDS["htf_options"].index(_r1p_f9["htf_tf"])
+                    _be_idx_f9  = PARAM_SEEDS["be_r_options"].index(_r1p_f9.get("be_r", 0))
+                    _genome_f9  = [
+                        _tf_idx_f9, _htf_idx_f9,
+                        _r1p_f9["sl_atr"], _r1p_f9["tp_mult"],
+                        _r1p_f9["confidence"], _r1p_f9["htf_weight"],
+                        _be_idx_f9,
+                    ]
+                    _pre_result = ga_fitness(
+                        _genome_f9, tf_feat, models_cache, scalers_cache,
+                        symbol, track_stats=True,
+                    )
+                    if len(_pre_result) == 2:
+                        _, _es_f9 = _pre_result
+                        if _es_f9["avg_spread"] < 1.0:
+                            log.warning(
+                                f"  [EXECUTION] SKIPPED — {symbol} {tf}m not saved: "
+                                f"avg_spread={_es_f9['avg_spread']:.2f} pts < 1.0. "
+                                f"Spread model inactive — check SPREAD_BASE_PTS in .env."
+                            )
+                            _exec_skip_tf = True
+                        elif _es_f9["fill_rate"] > 0.97:
+                            log.warning(
+                                f"  [EXECUTION] SKIPPED — {symbol} {tf}m not saved: "
+                                f"fill_rate={_es_f9['fill_rate']:.1%} > 97%. "
+                                f"Execution filter inactive — check EXEC_DELAY_PROB and MT5_DEVIATION_PTS."
+                            )
+                            _exec_skip_tf = True
+                        elif _es_f9["avg_slip"] < 0.3:
+                            log.warning(
+                                f"  [EXECUTION] SKIPPED — {symbol} {tf}m not saved: "
+                                f"avg_slip={_es_f9['avg_slip']:.2f} pts < 0.3. "
+                                f"Slippage model inactive — check SLIP_FACTOR."
+                            )
+                            _exec_skip_tf = True
+                except Exception as _f9e:
+                    log.warning(f"  [EXECUTION] F9 pre-check failed ({_f9e}) — proceeding with save")
+            if _exec_skip_tf:
+                continue
+
             tf_summary_rows = []   # collect per-strategy rows for the post-TF table
 
             for rank, (trial, bt) in enumerate(zip(top_trials, bt_results), 1):
@@ -1188,8 +1330,16 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     "sensitivity_score": sens.get("sensitivity_score"),
                     "robust":           int(sens.get("robust", False)),
                     "spa_p_value":      spa_p,
-                    # G4 / R1: store performance baselines for kill switch strategy-specific thresholds
-                    "expected_sharpe":         trial["sharpe"],
+                    # G10/G6/G3: expected_sharpe = recency-weighted OOS Sharpe × discounts
+                    # G10: recency-weighted pseudo-Sharpe from walk-forward folds (most recent = 45%)
+                    # G6: 10% discount when cross-fold Jaccard < 0.65 (unstable features)
+                    # G3: 20% discount when avg XGB/RF correlation > 0.90 (low ensemble diversity)
+                    "expected_sharpe": round(
+                        oos_sharpe_by_tf.get(tf, trial["sharpe"]) *
+                        (0.90 if avg_jaccard_by_tf.get(tf, 1.0) < 0.65 else 1.0) *
+                        (0.80 if avg_corr_by_tf.get(tf, 0.0) > 0.90 else 1.0),
+                        4
+                    ),
                     "expected_win_rate":       stats["win_rate"] / 100.0,  # convert % to decimal
                     # R1: expected_trades_per_day — used by kill switch signal frequency check
                     "expected_trades_per_day": round(
@@ -1206,9 +1356,22 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                         len(bt["equity_df"]) * (252 / 365) if not bt["equity_df"].empty else 252, 1
                     ), 2) if stats["n_trades"] > 0 and not bt["equity_df"].empty else 0.0
                 )
+                _raw_sharpe  = trial["sharpe"]
+                _oos_sw_log  = oos_sharpe_by_tf.get(tf, _raw_sharpe)
+                _jd_log      = avg_jaccard_by_tf.get(tf, 1.0)
+                _cr_log      = avg_corr_by_tf.get(tf, 0.0)
+                _exp_sharpe  = round(
+                    _oos_sw_log *
+                    (0.90 if _jd_log < 0.65 else 1.0) *
+                    (0.80 if _cr_log > 0.90 else 1.0),
+                    4
+                )
                 log.info(
                     f"  [BASELINES] {strategy_id} saved to DB: "
-                    f"expected_sharpe={trial['sharpe']:.3f} "
+                    f"raw_sharpe={_raw_sharpe:.3f} "
+                    f"oos_weighted={_oos_sw_log:.3f} "
+                    f"jaccard={_jd_log:.2f} corr={_cr_log:.2f} "
+                    f"expected_sharpe={_exp_sharpe:.3f} "
                     f"expected_win_rate={stats['win_rate']/100:.3f} "
                     f"expected_trades_per_day={_etpd:.2f}"
                 )
@@ -1278,25 +1441,8 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                                 f"  [EXECUTION] fill_rate={_es['fill_rate']:.1%} < 60% — "
                                 f"very selective; check spread vs SL distance"
                             )
-                        # F9: Hard-fail validation — abort if execution model is not working.
-                        # A broken spread/slippage model silently trains on a zero-friction world.
-                        if _es["avg_spread"] < 1.0:
-                            raise RuntimeError(
-                                f"[EXECUTION] ABORT — avg_spread={_es['avg_spread']:.2f} pts. "
-                                f"Spread model not active. Check SPREAD_BASE_PTS in .env."
-                            )
-                        if _es["fill_rate"] > 0.97:
-                            raise RuntimeError(
-                                f"[EXECUTION] ABORT — fill_rate={_es['fill_rate']:.1%}. "
-                                f"Execution filter not working. Check EXEC_DELAY_PROB and MT5_DEVIATION_PTS."
-                            )
-                        if _es["avg_slip"] < 0.3:
-                            raise RuntimeError(
-                                f"[EXECUTION] ABORT — avg_slippage={_es['avg_slip']:.2f} pts. "
-                                f"Slippage model not active. Check SLIP_FACTOR in phase2_adaptive_engine.py."
-                            )
                 except Exception as _ee:
-                    log.warning(f"  [EXECUTION] Could not compute execution stats: {_ee}")
+                    log.warning(f"  [EXECUTION] Could not compute post-run execution stats: {_ee}")
 
             # [CLASS] — class balance of selected label, logged right before retrain
             if top_trials and tf_feat.get(tf) is not None:
@@ -1373,7 +1519,7 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                 scaler_key    = f"{symbol}_{tf}m"
                 retrain_scaler = scalers_cache.get(scaler_key)
 
-                if best_label_col in df_full.columns and best_label_col != "target_sl1.5_tp2_be0":
+                if best_label_col in df_full.columns and best_label_col != "target_sl2.0_tp2_be0":
                     log.info(f"  {symbol} {tf}m: retraining final model on label "
                              f"'{best_label_col}' (rank-1 params: "
                              f"sl={rank1_params['sl_atr']} tp={rank1_params['tp_mult']} "
@@ -1512,6 +1658,15 @@ def run_training(symbols=None) -> tuple[dict, dict, dict]:
                     )
                 except Exception as _ge:
                     log.warning(f"  [GRID] {symbol}/{tf}m: grid search failed ({_ge})")
+
+        # F9: emit warning if ALL timeframes were skipped due to execution model failure
+        _n_saved = len([r for r in get_all_strategies(symbol) if r])
+        if _n_saved == 0:
+            log.error(
+                f"  [EXECUTION] WARNING — {symbol}: zero strategies saved. "
+                f"All TFs failed F9 execution check or had no valid trials. "
+                f"Check spread model and execution params before going live."
+            )
 
         _activate_best_strategy(symbol)
 
